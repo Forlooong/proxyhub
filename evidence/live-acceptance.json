@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "website_https": true,
+  "subscription_get_head": true,
+  "unknown_token_rejected": true,
+  "mihomo_config_import": true,
+  "reality_real_proxy_request": true,
+  "client_overrides_preserved": true,
+  "gui_import": "pending"
+}

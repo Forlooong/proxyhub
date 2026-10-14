@@ -1,0 +1,517 @@
+{
+  "schema_version": 1,
+  "project": "ProxyHub",
+  "verified_on": "2026-10-14",
+  "scope": "Public upstream commit/license/source capability and release metadata audit; runtime acceptance is recorded separately.",
+  "status_vocabulary": [
+    "verified",
+    "not_verified"
+  ],
+  "repositories": [
+    {
+      "id": "233boy/sing-box",
+      "repository_url": "https://github.com/233boy/sing-box",
+      "selected_ref": "main",
+      "commit": "2d78583b5aecccb0da0148a816bc1495a284509f",
+      "commit_url": "https://github.com/233boy/sing-box/commit/2d78583b5aecccb0da0148a816bc1495a284509f",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "basis": "Locked LICENSE file; GPLv3 text, -only/or-later suffix not inferred",
+        "url": "https://github.com/233boy/sing-box/blob/2d78583b5aecccb0da0148a816bc1495a284509f/LICENSE"
+      },
+      "selection": {
+        "mode": "reference_only",
+        "scope": [
+          "protocol and CLI operation coverage"
+        ],
+        "exclude": [
+          "legacy installers",
+          "sb entry point",
+          "global paths"
+        ],
+        "note": "Reimplement operations under proxyhub; no script execution or import."
+      },
+      "code_imported_by_this_audit": false
+    },
+    {
+      "id": "Forlooong/sing-box",
+      "repository_url": "https://github.com/Forlooong/sing-box",
+      "selected_ref": "main",
+      "commit": "c5f001681939c23a9c69f80ee86363a8f6adba39",
+      "commit_url": "https://github.com/Forlooong/sing-box/commit/c5f001681939c23a9c69f80ee86363a8f6adba39",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "basis": "Locked LICENSE file; GPLv3 text, -only/or-later suffix not inferred",
+        "url": "https://github.com/Forlooong/sing-box/blob/c5f001681939c23a9c69f80ee86363a8f6adba39/LICENSE"
+      },
+      "selection": {
+        "mode": "selective_reuse_candidate",
+        "scope": [
+          "sbmanager/render.py",
+          "sbmanager/subscription.py",
+          "sbmanager/publication.py",
+          "sbmanager/transaction.py",
+          "sbmanager/certificates.py",
+          "sbmanager/certsync.py"
+        ],
+        "exclude": [
+          "legacy sb command",
+          "migration",
+          "vendor duplication",
+          "private deployment records"
+        ],
+        "note": "Review individual pure helpers before copying; dirty local worktree is not this locked commit."
+      },
+      "code_imported_by_this_audit": false
+    },
+    {
+      "id": "Forlooong/clash-rules-mrs",
+      "repository_url": "https://github.com/Forlooong/clash-rules-mrs",
+      "selected_ref": "main",
+      "commit": "e8cbc99509e561435eba521d7b02616f2be722e1",
+      "commit_url": "https://github.com/Forlooong/clash-rules-mrs/commit/e8cbc99509e561435eba521d7b02616f2be722e1",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "basis": "Locked LICENSE file; GPLv3 text, -only/or-later suffix not inferred",
+        "url": "https://github.com/Forlooong/clash-rules-mrs/blob/e8cbc99509e561435eba521d7b02616f2be722e1/LICENSE"
+      },
+      "selection": {
+        "mode": "selective_reuse_candidate",
+        "scope": [
+          "runtime/snapshot.py",
+          "runtime/dns.py",
+          "scripts/publish_snapshot.py",
+          "scripts/verify_audit_evidence.py"
+        ],
+        "exclude": [
+          "personal rules",
+          "duplicate vendored runtime",
+          "old release hosting"
+        ],
+        "note": "Rule inputs have their own licenses and attribution in NOTICE.md; code license is not a blanket data license."
+      },
+      "code_imported_by_this_audit": false
+    },
+    {
+      "id": "CRThu/clash-rules-mrs",
+      "repository_url": "https://github.com/CRThu/clash-rules-mrs",
+      "selected_ref": "main",
+      "commit": "c03eb704a9c237d65f114d1b2a6f7fe428a935c6",
+      "commit_url": "https://github.com/CRThu/clash-rules-mrs/commit/c03eb704a9c237d65f114d1b2a6f7fe428a935c6",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "not_verified",
+        "identifier": null,
+        "basis": "No license file found in complete recursive tree; repository API license is null.",
+        "url": "https://api.github.com/repos/CRThu/clash-rules-mrs/git/trees/c03eb704a9c237d65f114d1b2a6f7fe428a935c6?recursive=1"
+      },
+      "selection": {
+        "mode": "reference_only_no_license",
+        "scope": [
+          "MRS category and build requirements"
+        ],
+        "exclude": [
+          "all source copying"
+        ],
+        "note": "Complete locked recursive tree has no LICENSE/COPYING/NOTICE file. Independently implement requirements."
+      },
+      "code_imported_by_this_audit": false
+    },
+    {
+      "id": "yuju520/YujuToolBox",
+      "repository_url": "https://github.com/yuju520/YujuToolBox",
+      "selected_ref": "main",
+      "commit": "d04baec205772ecd14820c36b98108f0596f1100",
+      "commit_url": "https://github.com/yuju520/YujuToolBox/commit/d04baec205772ecd14820c36b98108f0596f1100",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "basis": "Locked LICENSE file; GPLv3 text, -only/or-later suffix not inferred",
+        "url": "https://github.com/yuju520/YujuToolBox/blob/d04baec205772ecd14820c36b98108f0596f1100/LICENSE"
+      },
+      "selection": {
+        "mode": "reference_only",
+        "scope": [
+          "host initialization checklist",
+          "optional diagnostics inventory"
+        ],
+        "exclude": [
+          "yuju entry point",
+          "destructive cleanup",
+          "blind SSH changes",
+          "dynamic remote shell execution"
+        ],
+        "note": "Do not execute or vendor monolithic shell script."
+      },
+      "code_imported_by_this_audit": false
+    },
+    {
+      "id": "SubBoost/subboost",
+      "repository_url": "https://github.com/SubBoost/subboost",
+      "selected_ref": "main",
+      "commit": "a7177d7bb704998bfb9f51116441506729fc43c0",
+      "commit_url": "https://github.com/SubBoost/subboost/commit/a7177d7bb704998bfb9f51116441506729fc43c0",
+      "commit_status": "verified",
+      "verified_on": "2026-10-14",
+      "verification_method": "GitHub REST commit resolution and complete recursive tree; files read at full commit",
+      "license": {
+        "status": "verified",
+        "identifier": "AGPL-3.0-only",
+        "basis": "Locked LICENSE file and package.json explicit AGPL-3.0-only",
+        "url": "https://github.com/SubBoost/subboost/blob/a7177d7bb704998bfb9f51116441506729fc43c0/LICENSE"
+      },
+      "selection": {
+        "mode": "selective_reuse_candidate",
+        "scope": [
+          "packages/core/src/parser",
+          "packages/core/src/generator"
+        ],
+        "exclude": [
+          "Next.js app",
+          "PostgreSQL/Prisma",
+          "mandatory Docker",
+          "generator defaults and silent dropping"
+        ],
+        "note": "Selected parser/normalizer helpers require attribution and AGPL compliance; one strict ProxyHub renderer owns final configuration."
+      },
+      "code_imported_by_this_audit": false
+    }
+  ],
+  "components": [
+    {
+      "id": "SagerNet/sing-box",
+      "tag": "v1.14.3",
+      "commit": "7054cac5124465ffdb145870d7c01885566711b1",
+      "commit_status": "verified",
+      "commit_url": "https://github.com/SagerNet/sing-box/commit/7054cac5124465ffdb145870d7c01885566711b1",
+      "verified_on": "2026-10-14",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0-or-later with additional naming restriction",
+        "url": "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/LICENSE",
+        "notes": "License additionally prohibits derivative works using the name or implying association without prior consent."
+      },
+      "release_status": "verified",
+      "release_url": "https://github.com/SagerNet/sing-box/releases/tag/v1.14.3",
+      "verification_method": "Resolve tag to commit; inspect fixed source and official release metadata.",
+      "binary_execution_status": "not_verified",
+      "capabilities": [
+        {
+          "id": "reality_single_server_name",
+          "status": "verified",
+          "level": "source",
+          "statement": "REALITY server constructs a singleton ServerNames map from options.ServerName; one inbound supports one configured SNI.",
+          "evidence": [
+            "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/common/tls/reality_server.go"
+          ],
+          "runtime_status": "not_verified"
+        },
+        {
+          "id": "reality_target_no_local_certificate",
+          "status": "verified",
+          "level": "source",
+          "statement": "REALITY dials options.Reality.Handshake; direct certificate_provider/acme/certificate/key options are rejected for REALITY itself.",
+          "evidence": [
+            "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/common/tls/reality_server.go"
+          ],
+          "runtime_status": "not_verified"
+        },
+        {
+          "id": "default_build_without_v2ray_api",
+          "status": "verified",
+          "level": "source",
+          "statement": "DEFAULT_BUILD_TAGS contains with_utls and with_quic but omits with_v2ray_api; missing capability stub rejects V2Ray API.",
+          "evidence": [
+            "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/release/DEFAULT_BUILD_TAGS",
+            "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/include/v2rayapi_stub.go"
+          ],
+          "runtime_status": "not_verified"
+        },
+        {
+          "id": "locked_utls_dependency",
+          "status": "verified",
+          "level": "source",
+          "statement": "go.mod requires github.com/metacubex/utls v1.8.7.",
+          "evidence": [
+            "https://github.com/SagerNet/sing-box/blob/7054cac5124465ffdb145870d7c01885566711b1/go.mod"
+          ],
+          "runtime_status": "not_verified"
+        }
+      ],
+      "default_build_tags": [
+        "with_gvisor",
+        "with_quic",
+        "with_dhcp",
+        "with_wireguard",
+        "with_utls",
+        "with_acme",
+        "with_clash_api",
+        "with_tailscale",
+        "with_ccm",
+        "with_ocm",
+        "with_cloudflared",
+        "with_naive_outbound",
+        "with_usbip",
+        "with_openvpn",
+        "with_openconnect",
+        "badlinkname",
+        "tfogo_checklinkname0"
+      ]
+    },
+    {
+      "id": "nginx/nginx",
+      "tag": "release-1.30.5",
+      "commit": "4556c714d1cfa587f92c7c0365c09209d42d148b",
+      "commit_status": "verified",
+      "commit_url": "https://github.com/nginx/nginx/commit/4556c714d1cfa587f92c7c0365c09209d42d148b",
+      "verified_on": "2026-10-14",
+      "license": {
+        "status": "verified",
+        "identifier": "BSD-2-Clause",
+        "url": "https://github.com/nginx/nginx/blob/4556c714d1cfa587f92c7c0365c09209d42d148b/LICENSE",
+        "notes": "Read the fixed-commit license; retain notices for any redistribution."
+      },
+      "release_status": "verified",
+      "release_url": "https://nginx.org/en/download.html",
+      "verification_method": "Resolve tag to commit; inspect fixed source and official release metadata.",
+      "binary_execution_status": "not_verified",
+      "capabilities": [
+        {
+          "id": "ssl_preread",
+          "status": "verified",
+          "level": "source",
+          "statement": "stream ssl_preread reads ClientHello SNI; same SNI does not distinguish ordinary HTTPS and authenticated REALITY. Installed package module support must be probed.",
+          "evidence": [
+            "https://github.com/nginx/nginx/blob/4556c714d1cfa587f92c7c0365c09209d42d148b/src/stream/ngx_stream_ssl_preread_module.c"
+          ],
+          "runtime_status": "not_verified"
+        },
+        {
+          "id": "declared_version",
+          "status": "verified",
+          "level": "source",
+          "statement": "Source defines nginx_version 1030005 and NGINX_VERSION 1.30.5.",
+          "evidence": [
+            "https://github.com/nginx/nginx/blob/4556c714d1cfa587f92c7c0365c09209d42d148b/src/core/nginx.h"
+          ],
+          "runtime_status": "not_verified"
+        }
+      ]
+    },
+    {
+      "id": "MetaCubeX/mihomo",
+      "tag": "v1.19.32",
+      "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+      "commit_status": "verified",
+      "commit_url": "https://github.com/MetaCubeX/mihomo/commit/88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+      "verified_on": "2026-10-14",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "url": "https://github.com/MetaCubeX/mihomo/blob/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE",
+        "notes": "Fixed-tag LICENSE is GPLv3 even though current repository metadata reports MIT. Use the locked file."
+      },
+      "release_status": "verified",
+      "release_url": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.32",
+      "verification_method": "Resolve tag to commit; inspect fixed source and official release metadata.",
+      "binary_execution_status": "not_verified",
+      "capabilities": [
+        {
+          "id": "vless_reality_client",
+          "status": "verified",
+          "level": "source",
+          "statement": "VLESS outbound accepts reality-opts, servername, client-fingerprint and flow; actual generated YAML and proxy connection remain runtime tests.",
+          "evidence": [
+            "https://github.com/MetaCubeX/mihomo/blob/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/adapter/outbound/vless.go"
+          ],
+          "runtime_status": "not_verified"
+        }
+      ]
+    },
+    {
+      "id": "clash-verge-rev/clash-verge-rev",
+      "tag": "v2.5.8",
+      "commit": "4337bd85758d54d7b9044b2da3c9ac1176eae1f3",
+      "commit_status": "verified",
+      "commit_url": "https://github.com/clash-verge-rev/clash-verge-rev/commit/4337bd85758d54d7b9044b2da3c9ac1176eae1f3",
+      "verified_on": "2026-10-14",
+      "license": {
+        "status": "verified",
+        "identifier": "GPL-3.0",
+        "url": "https://github.com/clash-verge-rev/clash-verge-rev/blob/4337bd85758d54d7b9044b2da3c9ac1176eae1f3/LICENSE",
+        "notes": "Read the fixed-commit license; retain notices for any redistribution."
+      },
+      "release_status": "verified",
+      "release_url": "https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/v2.5.8",
+      "verification_method": "Resolve tag to commit; inspect fixed source and official release metadata.",
+      "binary_execution_status": "not_verified",
+      "capabilities": [
+        {
+          "id": "subscription_headers",
+          "status": "verified",
+          "level": "source",
+          "statement": "Remote profile parser reads upload/download/total/expire, Content-Disposition filename*, profile-update-interval as hours, and HTTP/HTTPS profile-web-page-url. Profile-Title is not the name source in this parser.",
+          "evidence": [
+            "https://github.com/clash-verge-rev/clash-verge-rev/blob/4337bd85758d54d7b9044b2da3c9ac1176eae1f3/src-tauri/src/config/prfitem.rs"
+          ],
+          "runtime_status": "not_verified"
+        }
+      ]
+    },
+    {
+      "id": "MetaCubeX/utls",
+      "tag": "v1.8.7",
+      "commit": "f7d52c22f3a8d2f510ad1470f75cb6c3fe26aa37",
+      "commit_status": "verified",
+      "commit_url": "https://github.com/MetaCubeX/utls/commit/f7d52c22f3a8d2f510ad1470f75cb6c3fe26aa37",
+      "verified_on": "2026-10-14",
+      "license": {
+        "status": "verified",
+        "identifier": "BSD-3-Clause",
+        "url": "https://github.com/MetaCubeX/utls/blob/f7d52c22f3a8d2f510ad1470f75cb6c3fe26aa37/LICENSE",
+        "notes": "Read the fixed-commit license; retain notices for any redistribution."
+      },
+      "release_status": "not_verified",
+      "release_url": null,
+      "verification_method": "Resolve tag to commit, verify sing-box go.mod dependency and fixed source.",
+      "binary_execution_status": "not_verified",
+      "capabilities": [
+        {
+          "id": "reality_target_and_fallback",
+          "status": "verified",
+          "level": "source",
+          "statement": "RealityServer dials configured target, validates TLS 1.3/SNI and forwards non-authenticated traffic; suitability of local target must be tested with real requests.",
+          "evidence": [
+            "https://github.com/MetaCubeX/utls/blob/f7d52c22f3a8d2f510ad1470f75cb6c3fe26aa37/reality.go"
+          ],
+          "runtime_status": "not_verified"
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "component": "SagerNet/sing-box",
+      "name": "sing-box-1.14.3-linux-amd64.tar.gz",
+      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz",
+      "sha256": "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee",
+      "size": 31678266,
+      "status": "verified",
+      "verification_level": "official_release_asset_metadata",
+      "verified_on": "2026-10-14",
+      "evidence": "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.3",
+      "downloaded_file_hash_status": "not_verified",
+      "execution_status": "not_verified"
+    },
+    {
+      "component": "SagerNet/sing-box",
+      "name": "sing-box-1.14.3-linux-arm64.tar.gz",
+      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-arm64.tar.gz",
+      "sha256": "29dae24d76bea3bc62d07dd3e60cfc12003de7debbd6b768df9be9c68360174e",
+      "size": 29110944,
+      "status": "verified",
+      "verification_level": "official_release_asset_metadata",
+      "verified_on": "2026-10-14",
+      "evidence": "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.3",
+      "downloaded_file_hash_status": "not_verified",
+      "execution_status": "not_verified"
+    },
+    {
+      "component": "MetaCubeX/mihomo",
+      "name": "mihomo-linux-amd64-compatible-v1.19.32.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-compatible-v1.19.32.gz",
+      "sha256": "ba3ce607747a07f948fc35780e108a4a7c7f552a38b9bd4d115f313ebcb89c20",
+      "size": 22877876,
+      "status": "verified",
+      "verification_level": "official_release_asset_metadata",
+      "verified_on": "2026-10-14",
+      "evidence": "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v1.19.32",
+      "downloaded_file_hash_status": "not_verified",
+      "execution_status": "not_verified"
+    },
+    {
+      "component": "MetaCubeX/mihomo",
+      "name": "mihomo-linux-arm64-v1.19.32.gz",
+      "url": "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-arm64-v1.19.32.gz",
+      "sha256": "9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
+      "size": 20809592,
+      "status": "verified",
+      "verification_level": "official_release_asset_metadata",
+      "verified_on": "2026-10-14",
+      "evidence": "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v1.19.32",
+      "downloaded_file_hash_status": "not_verified",
+      "execution_status": "not_verified"
+    },
+    {
+      "component": "clash-verge-rev/clash-verge-rev",
+      "name": "Clash.Verge_2.5.8_x64-setup.exe",
+      "url": "https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.5.8/Clash.Verge_2.5.8_x64-setup.exe",
+      "sha256": "821c0f5957f84c8f7d14532044840e8280d708af24a6a143db360b49bd1e7302",
+      "size": 60230483,
+      "status": "verified",
+      "verification_level": "official_release_asset_metadata",
+      "verified_on": "2026-10-14",
+      "evidence": "https://api.github.com/repos/clash-verge-rev/clash-verge-rev/releases/tags/v2.5.8",
+      "downloaded_file_hash_status": "not_verified",
+      "execution_status": "not_verified"
+    },
+    {
+      "component": "nginx/nginx",
+      "name": "nginx-1.30.5.tar.gz",
+      "url": "https://nginx.org/download/nginx-1.30.5.tar.gz",
+      "signature_url": "https://nginx.org/download/nginx-1.30.5.tar.gz.asc",
+      "sha256": null,
+      "status": "not_verified",
+      "verification_level": "download_link_only",
+      "verified_on": "2026-10-14",
+      "evidence": "https://nginx.org/en/download.html",
+      "downloaded_file_hash_status": "not_verified",
+      "signature_status": "not_verified",
+      "execution_status": "not_verified"
+    }
+  ],
+  "remaining_gates": [
+    {
+      "id": "binary-probes",
+      "status": "not_verified",
+      "detail": "Download pinned assets, verify actual SHA256, execute version/configuration probes for the target OS and architecture."
+    },
+    {
+      "id": "nginx-package",
+      "status": "not_verified",
+      "detail": "Lock distribution package/build and verify stream plus ssl_preread; upstream tag existence is not a package proof."
+    },
+    {
+      "id": "openssh-acme",
+      "status": "not_verified",
+      "detail": "Lock actual target distribution OpenSSH and ACME client packages; verify sshd -t/-T/-C, HTTP-01 and renewal reload."
+    },
+    {
+      "id": "metering-build",
+      "status": "not_verified",
+      "detail": "Optional ProxyHub metering build needs with_v2ray_api, provenance, license/naming review and protocol counter tests; do not label official default as metering capable."
+    },
+    {
+      "id": "real-client-acceptance",
+      "status": "not_verified",
+      "detail": "Run browser HTTPS plus authenticated REALITY through shared SNI, SSH second-login, and CVR GUI import against actual client core; record GUI and core separately."
+    }
+  ]
+}

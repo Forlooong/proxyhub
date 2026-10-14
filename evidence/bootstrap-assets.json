@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "checked_at": "2026-10-14",
+  "assets": [
+    {
+      "name": "nginx-bookworm-amd64",
+      "version": "1.30.5-1~bookworm",
+      "url": "https://nginx.org/packages/debian/pool/nginx/n/nginx/nginx_1.30.5-1~bookworm_amd64.deb",
+      "sha256": "ab248710dbd9c93dcd2eeb2df0544f3612011ec9fe96c396076a73d2421304bd",
+      "source": "https://nginx.org/packages/debian/dists/bookworm/nginx/binary-amd64/Packages.gz",
+      "verification": "official HTTPS package metadata; detached repository signature pending"
+    },
+    {
+      "name": "node-linux-x64",
+      "version": "24.21.0",
+      "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz",
+      "sha256": "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6",
+      "source": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt",
+      "verification": "official HTTPS SHA256 manifest; signature pending"
+    }
+  ]
+}

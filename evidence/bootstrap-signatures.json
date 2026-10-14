@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-10-14T09:35:28.148130+00:00",
+  "scope": "Independent local verification of bootstrap metadata signature chains; no VPS operations.",
+  "trust_boundary": "Signing public keys obtained from official HTTPS origins and pinned Node release-keys commit. No independent Web of Trust or timestamp service claimed.",
+  "nginx": {
+    "status": "passed",
+    "version": "1.30.5-1~bookworm",
+    "architecture": "amd64",
+    "chain": "official signing key -> InRelease -> SHA256(Packages.gz) -> Package SHA256 -> downloaded DEB",
+    "key_url": "https://nginx.org/keys/nginx_signing.key",
+    "documented_primary_fingerprint": "573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62",
+    "key_file_sha256": "55385da31d198fa6a5012d40ae98ecb272a6c4e8fffffba94719ffd3e87de37a",
+    "signatures": [
+      {
+        "signing_fingerprint": "8540A6F18833A80E9C1653A42FD21310B49F6B46",
+        "primary_fingerprint": "8540A6F18833A80E9C1653A42FD21310B49F6B46",
+        "signature_date": "2026-09-15"
+      }
+    ],
+    "inrelease": {
+      "url": "https://nginx.org/packages/debian/dists/bookworm/InRelease",
+      "sha256": "ea48c5166def8697a2ad20ff8b2ce8035d316e18fa1fc613ea347f9af2edf22e",
+      "repository_dates": {
+        "Date": "Tue, 15 Sep 2026 15:59:55 UTC"
+      },
+      "valid_until_present": false
+    },
+    "packages": {
+      "url": "https://nginx.org/packages/debian/dists/bookworm/nginx/binary-amd64/Packages.gz",
+      "sha256": "d16e7feb2f45f15c6d4577afa6d631dd43a39c9ce43520e0ce7e2a19b5287cba",
+      "size": 47962
+    },
+    "asset": {
+      "url": "https://nginx.org/packages/debian/pool/nginx/n/nginx/nginx_1.30.5-1~bookworm_amd64.deb",
+      "sha256": "ab248710dbd9c93dcd2eeb2df0544f3612011ec9fe96c396076a73d2421304bd",
+      "size": 1085720,
+      "matched_bootstrap_lock": true,
+      "downloaded_independently": true
+    }
+  },
+  "node": {
+    "status": "passed",
+    "version": "24.21.0",
+    "chain": "official Node release-keys pinned commit -> detached signature -> SHASUMS256.txt -> locked archive SHA256",
+    "release_keys_repository": "https://github.com/nodejs/release-keys",
+    "release_keys_commit": "481637f813e912c4aa3622d7964ab426c97b8e8d",
+    "signatures": [
+      {
+        "signing_fingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+        "primary_fingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+        "signature_date": "2026-09-08"
+      }
+    ],
+    "checksums": {
+      "url": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt",
+      "sha256": "f410428039e2c922a14058df067a4482691c9304a5c01a75847f9f3f2d3307f6"
+    },
+    "signature": {
+      "url": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt.sig",
+      "sha256": "865f22b026e4080554e10d247553fd770573893dac8fc7affc7d58b72de35a89"
+    },
+    "asset": {
+      "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz",
+      "sha256": "fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6",
+      "matched_bootstrap_lock": true,
+      "downloaded_independently": false,
+      "archive_hash_verification": "Performed separately on the acceptance VPS by the parent task; this record independently authenticates that expected hash."
+    },
+    "authorized_primary_fingerprints": [
+      "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+      "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
+      "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+      "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+      "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+      "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+      "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+      "A363A499291CBBC940DD62E41F10027AF002F8B0"
+    ]
+  }
+}

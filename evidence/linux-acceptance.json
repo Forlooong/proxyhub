@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "verified_on": "2026-10-14",
+  "environment": {"distribution": "Debian 12", "architecture": "amd64", "dedicated_test_host": true, "memory_gib_approximately": 4},
+  "versions": {"python": "3.11.2", "sing_box": "1.14.3", "mihomo": "1.19.32", "nginx": "1.30.5", "node": "24.21.0", "certbot": "2.1.0", "openssh": "9.2p1", "openssl_runtime": "3.0.15"},
+  "runtime_asset_hashes_verified": true,
+  "nginx_modules": {"stream": true, "stream_ssl_preread": true, "http_ssl": true},
+  "linux_python_tests": {"passed": 176, "failed": 0, "scope": "All Python test modules except converter; converter built and tested on Windows, actual Node worker also executed during VPS deployment."},
+  "ssh": {"append": "passed", "independent_key_only_session": "passed", "repeat_append": "noop", "existing_password_and_port_policy_retained": true, "public_key_authentication_explicitly_enabled": true},
+  "certificate": {"http01_initial_issue": "passed", "controlled_reissue": "passed", "fingerprint_changed": true, "both_tls_consumers_loaded_new_certificate": true, "repeat_renewal": "unchanged", "renewal_timer": "active"},
+  "recovery": {"failed_activation_restored_previous": true, "crash_after_link_switch_recovered": true, "repeat_recover": "nothing_to_recover", "restored_runtime_health": "passed"},
+  "services": {"proxy": "active", "publisher": "active", "nginx": "active", "internal_ports_loopback_only": true},
+  "resource_observation": {"proxy_memory_current_bytes": 20135936, "publisher_memory_current_bytes": 12378112, "nginx_memory_current_bytes": 3006464, "scope": "One idle sample on a roughly 4 GiB test host; not a 1-core/1-GiB load acceptance."},
+  "compatibility_fix": "OpenSSL 3.0 x509 -checkhost may exit 0 on mismatch. Validation now requires the affirmative hostname result; Linux and Windows regression checks pass.",
+  "not_verified": ["Clash Verge Rev GUI import/display", "Ubuntu and arm64 installation", "1 core 1 GiB workload", "automatic traffic collection/reset", "full SSH hardening"]
+}
