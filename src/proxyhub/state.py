@@ -36,6 +36,8 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS journal (
                 id INTEGER PRIMARY KEY, plan_id TEXT NOT NULL, stage TEXT NOT NULL,
                 details TEXT NOT NULL, at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS renewal_deployments (
+                parent_id TEXT PRIMARY KEY, child_id TEXT NOT NULL UNIQUE);
         """)
 
     @property
@@ -74,6 +76,34 @@ class StateStore:
         if record['status'] != 'prepared' or record['revision'] != self.revision:
             raise OperationError('Plan is stale or already applied; prepare a new plan')
 
+    def renewal_child(self, identity: str) -> str | None:
+        row = self.db.execute('SELECT child_id FROM renewal_deployments WHERE parent_id=?', (identity,)).fetchone()
+        return row[0] if row else None
+
+    def link_renewal(self, parent: str, child: str) -> None:
+        """Bind one approved renewal to its candidate before service activation."""
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            self._idle()
+            parent_record, child_record = self.inspect(parent), self.inspect(child)
+            self._prepared(parent_record)
+            self._prepared(child_record)
+            if parent_record['kind'] != 'panel-renew' or child_record['kind'] != 'deployment':
+                raise OperationError('Renewal linkage requires a renewal plan and deployment candidate')
+            if self.renewal_child(parent) is not None:
+                raise OperationError('Renewal already has a deployment candidate')
+            self.db.execute('INSERT INTO renewal_deployments(parent_id,child_id) VALUES (?,?)', (parent, child))
+
+    def _renewal_parent(self, child: str) -> str | None:
+        row = self.db.execute('SELECT parent_id FROM renewal_deployments WHERE child_id=?', (child,)).fetchone()
+        if row:
+            record = self.inspect(row[0])
+            self._prepared(record)
+            if record['kind'] != 'panel-renew':
+                raise OperationError('Invalid parent renewal plan')
+            return row[0]
+        return None
+
     def pending(self) -> list[dict]:
         rows = self.db.execute("""SELECT a.plan_id, a.details FROM journal a
             WHERE a.stage='activating' AND NOT EXISTS
@@ -107,10 +137,17 @@ class StateStore:
             self._prepared(record)
             if record['kind'] == 'deployment' and not any(item['plan_id'] == identity for item in self.pending()):
                 raise OperationError('Deployment commit requires a pending activation')
+            if record['kind'] == 'panel-renew' and self.renewal_child(identity) is not None:
+                raise OperationError('Renewal must commit through its linked deployment')
+            parent = self._renewal_parent(identity)
             self.db.execute("UPDATE plans SET status='applied' WHERE id=?", (identity,))
             self.db.execute("UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
             self.db.execute("INSERT INTO journal(plan_id,stage,details,at) VALUES (?,'committed','{}',?)",
                             (identity, int(time.time())))
+            if parent is not None:
+                self.db.execute("UPDATE plans SET status='applied' WHERE id=?", (parent,))
+                self.db.execute("INSERT INTO journal(plan_id,stage,details,at) VALUES (?,'committed',?,?)",
+                                (parent, canonical({'deployment_plan': identity}).decode(), int(time.time())))
 
     def abort(self, identity: str, details: dict) -> None:
         """Close an activation only after all rollback actions succeeded."""
@@ -119,9 +156,14 @@ class StateStore:
             self._prepared(self.inspect(identity))
             if not any(item['plan_id'] == identity for item in self.pending()):
                 raise OperationError('Plan has no pending activation to roll back')
+            parent = self._renewal_parent(identity)
             self.db.execute("UPDATE plans SET status='failed' WHERE id=?", (identity,))
             self.db.execute("INSERT INTO journal(plan_id,stage,details,at) VALUES (?,'rolled_back',?,?)",
                             (identity, canonical(details).decode(), int(time.time())))
+            if parent is not None:
+                self.db.execute("UPDATE plans SET status='failed' WHERE id=?", (parent,))
+                self.db.execute("INSERT INTO journal(plan_id,stage,details,at) VALUES (?,'rolled_back',?,?)",
+                                (parent, canonical({'deployment_plan': identity}).decode(), int(time.time())))
 
     @contextmanager
     def exclusive(self):

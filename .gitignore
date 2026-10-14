@@ -10,6 +10,8 @@ node_modules/
 dist/
 *.egg-info/
 coverage/
+.playwright-cli/
+output/playwright/
 .coverage
 .env
 *.key

@@ -1,8 +1,8 @@
 # ProxyHub
 
-独立、模块化的 VPS 与代理服务管理项目。先建立可验证的单节点闭环，再逐步加入规则管理、更多协议和可视化面板。
+独立、模块化的 VPS 与代理服务管理项目。提供单节点命令行和管理面板，再逐步加入规则管理与更多协议。
 
-当前版本为 `0.1.0a1`，交付阶段 0–1 的命令行基础：SSH 公钥追加、自有 HTTPS 网站与 VLESS REALITY 共存、Mihomo YAML 和原始订阅发布。完整产品范围见[已批准设计](docs/superpowers/specs/2026-10-14-proxyhub-design.md)。
+当前版本为 `0.2.0a1`：SSH 公钥追加、自有 HTTPS 网站与 VLESS REALITY 共存、Mihomo YAML 和原始订阅发布，并通过私有管理面板进行预览、应用与任务追踪。完整产品范围见[已批准设计](docs/superpowers/specs/2026-10-14-proxyhub-design.md)。
 
 ## 当前能力
 
@@ -11,6 +11,7 @@
 - **订阅**：由唯一 TypeScript 生成器输出一个 REALITY 节点的 YAML 和 URI/Base64；正文、响应头和访问路径作为同一发布版本。手工流量信息与重置字段分别保存。
 - **变更**：准备不可变候选、执行核心配置检查、显式 `apply`；保留激活日志和失败恢复入口。独立发布进程提供最后一份有效订阅。
 - **命令**：仅新增 `proxyhub` 和 `proxyhub-*` 服务；不覆盖 `sb`、`sing-box`、`yuju`、`subboost` 或 shell 内置 `help`，端口及资源冲突会停止操作。
+- **面板**：经 SSH 隧道访问，低权限网关与 root 管理器分离；支持网站标题、证书导入/续期、节点名称/地址、订阅元数据与配置覆盖、公钥追加。变更需先预览，旧版本计划不可覆盖新配置，见[面板手册](docs/panel.md)。
 
 当前安装脚本只面向 **Debian 12 amd64、systemd、root** 的专用验收环境。帮助与纯配置测试可在 Windows/Linux 运行。Ubuntu、其他发行版和 arm64 的完整安装验收尚未完成。
 
@@ -22,6 +23,7 @@
 | sing-box 1.14.3 / Mihomo 1.19.32 官方资产 | 六份 Linux/Windows 资产的哈希与大小通过；Windows 可执行能力检查通过，[运行时核验](docs/phase0-runtime.md) |
 | Nginx 1.30.5 / Node 24.21.0 | 官方签名和哈希链通过，[启动运行时核验](docs/bootstrap-verification.md) |
 | SSH 第二会话、网站与真实 REALITY 请求、下载订阅使用 | 专用 VPS 实测通过，[阶段 1 验收](docs/phase1-acceptance.md) |
+| 管理面板与四类操作、订阅独立发布、管理服务停止后的公网闭环 | 专用 VPS 与真实浏览器实测通过，[面板阶段验收](docs/phase2-panel-acceptance.md) |
 
 配置检查不代表真实客户端请求通过。Clash Verge Rev 2.5.8 的 GUI 导入与显示、1 核 1GB 资源指标仍待专门验收。
 
@@ -38,6 +40,7 @@ proxyhub deployment plan --help
 npm ci
 npm run build
 python -m pip install pytest
+python -m pip install -r requirements-panel.lock httpx==0.28.1
 python -m pytest -q
 ```
 
@@ -58,6 +61,6 @@ TCP 80 用于 HTTP-01 和 HTTPS 跳转。安装目录为 `/opt/proxyhub`，私�
 
 ## 后续阶段
 
-管理面板、HY2 生命周期、外部 REALITY 目标、网站内容上传与恢复、多订阅、MRS 规则流水线、共享流量账户、自动采集与周期重置仍按设计分阶段实施。当前默认 sing-box 包不含 V2Ray API，因此没有把手工额度显示标为自动计量；当前 `reset_day/reset_at` 也不会触发自动重置。
+HY2 生命周期、外部 REALITY 目标、网站内容上传与恢复、多订阅、MRS 规则流水线、共享流量账户、自动采集与周期重置仍按设计分阶段实施。当前默认 sing-box 包不含 V2Ray API，因此没有把手工额度显示标为自动计量；当前 `reset_day/reset_at` 也不会触发自动重置。
 
 ProxyHub 原创代码采用 [AGPL-3.0-only](LICENSE)。参考来源、独立运行时和依赖的归属见 [NOTICE](NOTICE.md)。公开仓库不保存真实服务器身份、SSH 私钥、节点凭据或完整订阅链接。

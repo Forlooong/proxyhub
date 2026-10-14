@@ -30,7 +30,7 @@ LockPersonality=yes
             'Environment=PYTHONPATH=/opt/proxyhub/app/src\n'
             'ExecStart=/usr/bin/python3 -m proxyhub.publisher --bundle /var/lib/proxyhub/publish/bundle.json --listen 127.0.0.1 --port 18890\n'
             'ExecReload=/bin/kill -HUP $MAINPID\n' + common + '\n[Install]\nWantedBy=multi-user.target\n',
-        'proxyhub-nginx.service': header + 'RuntimeDirectory=proxyhub\nRuntimeDirectoryMode=0755\n'
+        'proxyhub-nginx.service': header + 'RuntimeDirectory=proxyhub\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes\n'
             'ExecStart=/opt/proxyhub/bin/nginx -e stderr -p /var/lib/proxyhub/nginx/ -c /var/lib/proxyhub/current/nginx.conf -g "daemon off;"\n'
             'ExecReload=/bin/kill -HUP $MAINPID\n'
             'KillSignal=SIGQUIT\nTimeoutStopSec=10\n'

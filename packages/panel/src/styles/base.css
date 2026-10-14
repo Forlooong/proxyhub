@@ -1,0 +1,63 @@
+:root {
+  font-family: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-synthesis: none; text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased;
+  color-scheme: light; --mist: #f5f7fa; --paper: #fff; --ink: #182536; --slate: #536477;
+  --blue: #215ac8; --blue-hover: #18499f; --blue-soft: #edf3ff; --line: #dde4ed;
+  --green: #246746; --green-soft: #eaf5ee; --warning: #8e4f09; --warning-soft: #fff5e5;
+  --error: #ae303c; --error-soft: #fff0f1; --subtle: #607187; --shadow: 0 20px 70px #18253622;
+  background: var(--mist); color: var(--ink); font-size: 14px; line-height: 1.55;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark; --mist: #101b2b; --paper: #162438; --ink: #e7edf5; --slate: #acbacd;
+  --blue: #84acff; --blue-hover: #a7c3ff; --blue-soft: #203b61; --line: #31445d;
+  --green: #8ecfa8; --green-soft: #1d3b31; --warning: #efb56c; --warning-soft: #3b3022;
+  --error: #ff9ba8; --error-soft: #442b37; --subtle: #91a3bb; --shadow: 0 20px 70px #0006;
+}
+* {box-sizing: border-box;}
+body {margin: 0; min-width: 320px;}
+button, input, textarea, select {font: inherit;}
+button, a, input, textarea, select, summary {-webkit-tap-highlight-color: transparent;}
+button {cursor: pointer; color: inherit;}
+button:disabled {opacity: .5; cursor: not-allowed;}
+a {color: var(--blue); text-decoration: none;}
+a:hover {text-decoration: underline;}
+button, a, input, textarea, select, summary, [tabindex] {outline-offset: 4px;}
+:focus-visible {outline: 3px solid var(--blue);}
+::selection {background: var(--blue-soft); color: var(--ink);}
+h1, h2, h3, h4, p {margin: 0;}
+h1 {font-size: 30px; font-weight: 600; line-height: 1.25; letter-spacing: -.6px;}
+h2 {font-size: 18px; font-weight: 600; line-height: 1.5;}
+h3 {font-size: 16px; font-weight: 600;}
+h4 {font-size: 14px; font-weight: 600;}
+p {max-width: 75ch;}
+code, pre, .code-input, kbd {font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace; font-size: 12px;}
+pre {margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;}
+code {overflow-wrap: anywhere;}
+ul {padding-left: 20px;}
+li + li {margin-top: 7px;}
+small {font-size: 12px;}
+kbd {border: 1px solid var(--line); padding: 1px 5px; border-radius: 4px; font-size: 11px; white-space: nowrap;}
+.icon {width: 20px; height: 20px; flex: 0 0 auto;}
+.muted {color: var(--slate); font-size: 13px;}
+.stacked-values {display: grid; gap: 4px;}
+.fingerprint {font-size: 11px; word-break: break-all;}
+.separated {border-top: 1px solid var(--line); margin-top: 24px; padding-top: 24px;}
+.empty {padding: 24px 0; color: var(--slate); font-size: 13px;}
+.revision {border: 1px solid var(--line); color: var(--slate); border-radius: 5px; padding: 4px 9px; font-size: 12px; white-space: nowrap;}
+.text-button {background: none; border: 0; padding: 5px 0; color: var(--blue); font-size: 13px; display: inline-flex; align-items: center; gap: 7px; text-align: left;}
+.text-button:hover {text-decoration: underline;}
+.text-button .icon {width: 16px; height: 16px;}
+.icon-button {display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid transparent; border-radius: 6px; width: 36px; height: 36px; padding: 7px; color: var(--slate);}
+.icon-button:hover:not(:disabled) {background: var(--blue-soft); color: var(--blue);}
+.button {min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 9px 17px; border: 1px solid transparent; border-radius: 6px; font-size: 13px; font-weight: 500; text-align: center;}
+.button.primary {background: var(--blue); color: #fff; border-color: var(--blue);}
+:root[data-theme="dark"] .button.primary {color: #101b2b;}
+.button.primary:hover:not(:disabled) {background: var(--blue-hover);}
+.button.secondary {background: var(--paper); border-color: var(--line);}
+.button.secondary:hover:not(:disabled) {border-color: var(--blue); color: var(--blue);}
+.button .icon {width: 17px; height: 17px;}
+.skip-link {position: fixed; top: -100px; left: 16px; z-index: 100; padding: 12px 20px; background: var(--paper); border: 2px solid var(--blue);}
+.skip-link:focus {top: 10px;}
+.spinner {width: 17px; height: 17px; border: 2px solid var(--line); border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; flex: 0 0 auto;}
+@keyframes spin {to {transform: rotate(360deg);}}
+@media (prefers-reduced-motion: reduce) {*, *::before, *::after {animation: none !important; transition: none !important; scroll-behavior: auto !important;}}

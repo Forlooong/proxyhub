@@ -1,10 +1,30 @@
 {
-  "name": "proxyhub-converter",
-  "version": "0.1.0",
+  "name": "proxyhub",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=24 <25" },
-  "scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit" },
-  "dependencies": { "yaml": "2.9.1" },
-  "devDependencies": { "@types/node": "24.10.0", "typescript": "5.9.3" }
+  "scripts": {
+    "build": "npm run build:converter && npm run build:panel",
+    "build:converter": "tsc -p tsconfig.json",
+    "build:panel": "tsc -p packages/panel/tsconfig.json && vite build --config packages/panel/vite.config.ts",
+    "dev:panel": "vite --config packages/panel/vite.config.ts",
+    "test:panel": "node --test packages/panel/tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/panel/tsconfig.json"
+  },
+  "dependencies": {
+    "yaml": "2.9.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "@fontsource/ibm-plex-sans": "5.3.0",
+    "@fontsource/ibm-plex-mono": "5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "vite": "8.3.4",
+    "@vitejs/plugin-react": "6.1.2"
+  }
 }

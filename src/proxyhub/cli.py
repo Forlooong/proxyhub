@@ -51,6 +51,13 @@ def parser() -> argparse.ArgumentParser:
     sub = modules.add_parser('sub', help='Subscription access').add_subparsers(dest='operation')
     urls = sub.add_parser('urls', help='Show SECRET client links from active config (root only)')
     urls.add_argument('--output', type=Path, help='Write links to a private file instead of stdout')
+    panel = modules.add_parser('panel', help='Private management panel over an SSH tunnel').add_subparsers(dest='operation')
+    panel.add_parser('install', help='Install and start the loopback gateway and privileged manager')
+    access = panel.add_parser('access', help='Show SECRET panel credential and tunnel instructions (root only)')
+    access.add_argument('--output', type=Path, help='Write access details to a private file instead of stdout')
+    request = panel.add_parser('request', help='Call a typed manager operation through its local socket')
+    request.add_argument('--operation', dest='rpc_operation', required=True)
+    request.add_argument('--payload-file', type=Path, help='JSON object file; omitted means an empty object')
     return root
 
 
@@ -87,6 +94,20 @@ def execute(args) -> dict:
     if args.module == 'install-services':
         from .installer import install
         return install()
+    if args.module == 'panel':
+        if args.operation == 'install':
+            from .panel_install import install
+            return install()
+        if args.operation == 'access':
+            from .panel_install import access
+            result = access()
+            if args.output:
+                atomic_write(args.output, canonical(result))
+                return {'status': 'written', 'private_access': str(args.output)}
+            return result
+        from .rpc import call
+        payload = json.loads(args.payload_file.read_text(encoding='utf-8')) if args.payload_file else {}
+        return call(args.rpc_operation, payload)
     if args.module == 'host' and args.operation == 'enable-key-auth':
         from .host.policy import enable_key_auth
         return enable_key_auth(apply=args.apply)
@@ -166,7 +187,7 @@ def main(argv=None) -> int:
     if args.module is None:
         root.print_help()
         return 0
-    if args.module in {'host','site','deployment','sub'} and args.operation is None:
+    if args.module in {'host','site','deployment','sub','panel'} and args.operation is None:
         _help(root,[args.module])
         return 0
     if args.module == 'site' and args.action is None:

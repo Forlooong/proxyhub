@@ -3,7 +3,7 @@ import pytest
 from proxyhub.cli import main
 
 
-@pytest.mark.parametrize('arguments', [[], ['help'], ['help','host'], ['help','host','append-key'], ['help','deployment','plan'], ['site']])
+@pytest.mark.parametrize('arguments', [[], ['help'], ['help','host'], ['help','host','append-key'], ['help','deployment','plan'], ['site'], ['panel'], ['help','panel','request']])
 def test_help_is_available_without_root_or_state(arguments, capsys, monkeypatch):
     monkeypatch.setattr('proxyhub.cli.require_root', lambda: pytest.fail('help must not require root'))
     assert main(arguments) == 0

@@ -1,6 +1,6 @@
 # 阶段 0–1 操作手册
 
-本手册对应 `0.1.0a1`：单 VPS、单 REALITY 节点、单网站、单订阅。专用 Debian 12 amd64 VPS 已通过[最小闭环实测](phase1-acceptance.md)。图形管理面板、HY2、自动计量和通用生产安装器不属于本阶段。
+本手册说明阶段 0–1 的 CLI 基础：单 VPS、单 REALITY 节点、单网站、单订阅。专用 Debian 12 amd64 VPS 已通过[最小闭环实测](phase1-acceptance.md)。`0.2.0a1` 的管理面板安装和访问另见[面板手册](panel.md)；HY2、自动计量和通用生产安装器仍待后续阶段。
 
 下文的 `www.example.test`、`sub.example.test`、文档网段地址、账号和路径均为占位示例。执行前替换为自己的真实值；`.test` 示例域名不能申请公网证书。服务器操作在 Linux root 会话执行，客户端操作在持有 SSH 私钥的本机执行。
 
@@ -14,6 +14,7 @@ npm ci
 npm run typecheck
 npm run build
 python -m pip install pytest
+python -m pip install -r requirements-panel.lock httpx==0.28.1
 python -m pytest -q
 python scripts/verify_runtime.py
 python scripts/package_app.py
