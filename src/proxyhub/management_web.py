@@ -136,6 +136,7 @@ def _change(config, kind, values, root):
     result = deepcopy(config)
     web = normalize_web(result)
     server = result['server']
+    reality = result.get('reality')
     result['web'] = web
     changes, warnings = [], []
 
@@ -163,7 +164,9 @@ def _change(config, kind, values, root):
         _shape(values, ('site_id',))
         site = get_site(web, _identity(values['site_id']))
         if kind != 'website.enable':
-            _dependencies(site_dependencies(web, server, site['id']))
+            _dependencies(site_dependencies(web, server, site['id'], reality))
+            if site['id'] == 'default':
+                _dependencies(['默认网站为原配置兼容资源，须保持启用并保留'])
         if kind == 'website.delete':
             if site['enabled']:
                 _dependencies([site['title'] + ' HTTPS（网站启用中，请先停用）'])
@@ -197,8 +200,9 @@ def _change(config, kind, values, root):
         else:
             if domain not in before:
                 raise ManagementError('VALIDATION', '该域名未绑定到此网站。')
+            _dependencies(site_dependencies(web, server, site['id'], reality, domain))
             if site['id'] == 'default' and domain == server['site_domain']:
-                _dependencies(site_dependencies(web, server, site['id']))
+                _dependencies(['默认网站首域名 ' + domain + ' 为原配置兼容字段，须保留'])
             if site['enabled'] and len(before) == 1:
                 _dependencies([site['title'] + ' HTTPS（解绑最后域名前请先停用网站）'])
             site['domains'].remove(domain)
@@ -229,7 +233,7 @@ def _change(config, kind, values, root):
         identity = _identity(values.get('certificate_id', get_site(web, 'default')['certificate_id']))
         certificate = get_certificate(web, identity)
         required = list(dict.fromkeys(certificate['domains'] + [consumer['domain']
-                        for consumer in consumers(web, server, identity) if consumer['domain'] is not None]))
+                        for consumer in consumers(web, server, identity, reality) if consumer['domain'] is not None]))
         imported = _import(values, required, root)
         certificate.update(certificate_path=imported['certificate_path'], key_path=imported['key_path'])
         changes = [{'label': '替换证书绑定', 'before': certificate['name'], 'after': certificate['name']},
@@ -242,7 +246,7 @@ def _change(config, kind, values, root):
     elif kind == 'certificate.delete':
         _shape(values, ('certificate_id',))
         certificate = get_certificate(web, _identity(values['certificate_id']))
-        _dependencies([consumer['label'] for consumer in consumers(web, server, certificate['id'])])
+        _dependencies([consumer['label'] for consumer in consumers(web, server, certificate['id'], reality)])
         web['certificates'].remove(certificate)
         changes = [{'label': '删除证书绑定', 'before': certificate['name'], 'after': None}]
     return {'config': sync_default(result), 'changes': changes, 'warnings': warnings}

@@ -61,6 +61,63 @@ def test_reality_references_block_destructive_default_changes(configured, tmp_pa
     assert caught.value.code == 'DEPENDENCY'
 
 
+@pytest.fixture
+def migrating(configured):
+    get_site(configured['web'], SITE)['domains'].append('alias.example.test')
+    configured['reality'] = {
+        'targets': [
+            {'id': 'default', 'type': 'site', 'site_id': 'default', 'server_name': 'site.example.test'},
+            {'id': '1' * 32, 'type': 'site', 'site_id': SITE, 'server_name': 'second.example.test'},
+        ],
+        'endpoints': [
+            {'id': 'default', 'listener_id': 'reality-default', 'listen_port': 2443, 'target_id': 'default'},
+            {'id': '2' * 32, 'listener_id': 'reality-' + '2' * 32,
+             'listen_port': 2444, 'target_id': '1' * 32},
+        ],
+        'primary_endpoint_id': 'default',
+    }
+    return configured
+
+
+@pytest.mark.parametrize('kind,values', [
+    ('website.disable', {'site_id': SITE}),
+    ('website.delete', {'site_id': SITE}),
+    ('website.domain.unbind', {'site_id': SITE, 'domain': 'second.example.test'}),
+])
+def test_retained_nonprimary_reality_target_protects_its_site_and_sni(migrating, tmp_path, kind, values):
+    with pytest.raises(ManagementError) as caught:
+        change(migrating, kind, values, tmp_path)
+    assert caught.value.code == 'DEPENDENCY'
+    assert '2' * 32 in str(caught.value) and 'second.example.test' in str(caught.value)
+
+
+def test_reality_reference_allows_unrelated_alias_changes_and_ends_on_explicit_retirement(migrating, tmp_path):
+    unbound = change(migrating, 'website.domain.unbind', {'site_id': SITE, 'domain': 'alias.example.test'}, tmp_path)['config']
+    assert get_site(unbound['web'], SITE)['domains'] == ['second.example.test']
+    rebound = change(unbound, 'website.domain.bind', {'site_id': SITE, 'domain': 'alias.example.test'}, tmp_path)['config']
+    assert get_site(rebound['web'], SITE)['domains'] == ['second.example.test', 'alias.example.test']
+    rebound['reality']['targets'] = rebound['reality']['targets'][:1]
+    rebound['reality']['endpoints'] = rebound['reality']['endpoints'][:1]
+    disabled = change(rebound, 'website.disable', {'site_id': SITE}, tmp_path)['config']
+    assert get_site(disabled['web'], SITE)['enabled'] is False
+
+
+@pytest.mark.parametrize('kind,values', [
+    ('website.disable', {'site_id': 'default'}),
+    ('website.delete', {'site_id': 'default'}),
+    ('website.domain.unbind', {'site_id': 'default', 'domain': 'site.example.test'}),
+])
+def test_unreferenced_default_preserves_compatibility_without_claiming_reality_dependency(migrating, tmp_path, kind, values):
+    reality = migrating['reality']
+    reality['targets'] = reality['targets'][1:]
+    reality['endpoints'] = reality['endpoints'][1:]
+    reality['primary_endpoint_id'] = '2' * 32
+    with pytest.raises(ManagementError) as caught:
+        change(migrating, kind, values, tmp_path)
+    assert caught.value.code == 'DEPENDENCY'
+    assert '兼容' in str(caught.value) and 'REALITY' not in str(caught.value)
+
+
 def test_enabled_site_delete_and_last_domain_unbind_require_disabling(configured, tmp_path):
     for kind, values in [('website.delete', {'site_id': SITE}),
                          ('website.domain.unbind', {'site_id': SITE, 'domain': 'second.example.test'})]:

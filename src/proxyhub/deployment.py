@@ -19,6 +19,7 @@ from .site import render_nginx, render_site, validate_certificate
 from .publication import build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, consumers, site_directory, sync_default
+from . import reality
 
 ROOT = Path('/var/lib/proxyhub')
 BIN = Path('/opt/proxyhub/bin')
@@ -119,8 +120,18 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
         part = _site_manifest(payload,site['id'])
         _read_site(directory,part,site['id'])
         allowed.update(part)
-    if set(manifest) != allowed:
-        raise OperationError('Candidate file manifest contains an unmanaged site')
+    expected = {'reality/'+entry['id']+'.json' for entry in reality.normalize_reality(config)['endpoints']
+                if entry['id'] != 'default'} if 'reality' in config else set()
+    for name in expected:
+        file = directory/name
+        if (directory/'reality').is_symlink() or file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != manifest.get(name):
+            raise OperationError('REALITY candidate file changed after validation')
+    if set(manifest) != allowed | expected:
+        raise OperationError('Candidate file manifest contains an unmanaged site or REALITY entry')
+    runtime = directory/'reality'
+    if runtime.exists() or runtime.is_symlink():
+        if runtime.is_symlink() or not runtime.is_dir() or {path.relative_to(directory).as_posix() for path in runtime.iterdir()} != expected:
+            raise OperationError('Candidate contains an unmanaged REALITY configuration')
     parent = directory/'sites'
     if parent.exists() or parent.is_symlink():
         if parent.is_symlink() or not parent.is_dir():
@@ -130,10 +141,10 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
             raise OperationError('Candidate contains an unmanaged website tree')
 
 
-def client_config(server: dict, overrides: dict) -> dict:
+def client_config(server: dict, overrides: dict, sni: str | None = None) -> dict:
     node = {key: server[key] for key in ('uuid', 'public_key', 'short_id')}
     node.update(id='local-reality', name=server['node_name'], server=server['public_address'],
-                port=server['public_port'], server_name=server['site_domain'])
+                port=server['public_port'], server_name=sni or server['site_domain'])
     text = run([str(BIN/'node'), str(APP/'packages/converter/dist/worker.js')], input=json.dumps({'node':node,'overrides':overrides}), timeout=20)
     return json.loads(text)
 
@@ -142,7 +153,7 @@ def _certificate_bindings(config: dict) -> dict:
     web = normalize_web(config)
     result = {}
     for binding in web['certificates']:
-        active = [item['domain'] for item in consumers(web,config['server'],binding['id'])
+        active = [item['domain'] for item in consumers(web,config['server'],binding['id'],config.get('reality'))
                   if item.get('enabled',True) and item['domain']]
         details = validate_certificate(binding['certificate_path'],binding['key_path'],
                                        list(dict.fromkeys(active))) if active else {'sha256':None}
@@ -150,10 +161,13 @@ def _certificate_bindings(config: dict) -> dict:
     return result
 
 
-def _preserve_endpoints(config: dict, previous: Path | None) -> None:
+def _preserve_endpoints(config: dict, previous: Path | None, *, reality_operation: dict | None = None) -> None:
     if previous is None:
         return
     old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+    if (reality_operation is None and ('reality' in config or 'reality' in old)
+            and reality.normalize_reality(config) != reality.normalize_reality(old)):
+        raise OperationError('REALITY targets and entries require an explicit migration, selection or retirement plan')
     fields = ('site_domain','subscription_domain','http_port','public_port','reality_port',
               'site_tls_port','subscription_tls_port','publisher_port')
     # The normalized server shape owns the complete listener contract.
@@ -168,12 +182,78 @@ def _preserve_endpoints(config: dict, previous: Path | None) -> None:
             raise OperationError('An enabled website must be disabled before deletion')
         for binding in old_web['certificates']:
             if (not any(item['id']==binding['id'] for item in new_web['certificates'])
-                    and consumers(old_web,old['server'],binding['id'])):
+                    and consumers(old_web,old['server'],binding['id'],old.get('reality'))):
                 raise OperationError('A referenced certificate binding cannot be deleted')
         for site in new_web['sites']:
             previous_site = before.get(site['id'])
             if previous_site and any(previous_site[key] != site[key] for key in ('listener_id','tls_port')):
                 raise OperationError('An existing website listener identity and port cannot change')
+
+
+def _reality_transition(config: dict, previous: Path | None, operation: dict) -> None:
+    """Only the approved resource delta can unlock the migration boundary."""
+    if previous is None or not isinstance(operation,dict) or set(operation)!={'kind','endpoint_id'}:
+        raise OperationError('REALITY activation requires an existing deployment and a typed transition')
+    old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+    old = sync_default(old)
+    old['server'] = validate_spec(old['server'])
+    if ({key:value for key,value in config.items() if key!='reality'}
+            != {key:value for key,value in old.items() if key!='reality'}):
+        raise OperationError('REALITY activation cannot change websites, node credentials or subscription settings')
+    before, after = reality.normalize_reality(old), reality.normalize_reality(config)
+    old_entries = {entry['id']:entry for entry in before['endpoints']}
+    new_entries = {entry['id']:entry for entry in after['endpoints']}
+    old_targets = {target['id']:target for target in before['targets']}
+    new_targets = {target['id']:target for target in after['targets']}
+    identity, kind = operation['endpoint_id'], operation['kind']
+    if kind == 'migrate':
+        entry = reality.get_endpoint(after,identity)
+        valid = (identity not in old_entries and set(new_entries)==set(old_entries)|{identity}
+                 and all(new_entries[key]==value for key,value in old_entries.items())
+                 and entry['target_id'] not in old_targets
+                 and set(new_targets)==set(old_targets)|{entry['target_id']}
+                 and all(new_targets[key]==value for key,value in old_targets.items())
+                 and after['primary_endpoint_id']==identity)
+    elif kind == 'select':
+        valid = (identity in old_entries and old_entries==new_entries and old_targets==new_targets
+                 and after['primary_endpoint_id']==identity)
+    elif kind == 'retire':
+        entry = reality.get_endpoint(before,identity)
+        valid = (identity!=before['primary_endpoint_id'] and identity not in new_entries
+                 and new_entries=={key:value for key,value in old_entries.items() if key!=identity}
+                 and new_targets=={key:value for key,value in old_targets.items() if key!=entry['target_id']}
+                 and after['primary_endpoint_id']==before['primary_endpoint_id'])
+    else:
+        valid = False
+    if not valid:
+        raise OperationError('REALITY transition differs from its approved resource operation')
+    _preserve_endpoints(config,previous,reality_operation=operation)
+
+
+def _render_reality(config: dict, entry: dict) -> dict:
+    rendered = render_sing_box(config['server'])
+    inbound = rendered['inbounds'][0]
+    target = reality.endpoint_target(config,entry)
+    inbound.update(tag='proxyhub-reality-'+entry['id'],listen_port=entry['listen_port'])
+    inbound['tls']['server_name'] = target['server_name']
+    inbound['tls']['reality']['handshake'] = {key:target[key] for key in ('server','server_port')}
+    return rendered
+
+
+def _reality_scope(config: dict, scope: str) -> dict | None:
+    """Probe changed paths without making recovery depend on an old remote outage."""
+    resources = reality.normalize_reality(config)
+    targets = {target['id']:target for target in resources['targets']}
+    entries = [entry for entry in resources['endpoints'] if
+               (entry['id']==resources['primary_endpoint_id'] if scope=='primary'
+                else targets[entry['target_id']]['type']=='site')]
+    if not entries:
+        return None
+    identities = {entry['id'] for entry in entries}
+    primary = resources['primary_endpoint_id']
+    return {**config,'reality':{'endpoints':entries,
+            'targets':[targets[entry['target_id']] for entry in entries],
+            'primary_endpoint_id':primary if primary in identities else entries[0]['id']}}
 
 
 def _web_server(config: dict, previous: Path | None) -> None:
@@ -190,16 +270,18 @@ def _web_server(config: dict, previous: Path | None) -> None:
 
 def prepare(store: StateStore, config: dict, *, expected_revision: int | None = None,
             publish_only: bool = False, site_files: dict[str, bytes] | None = None,
-            website_change: bool = False, site_id: str = 'default', web_only: bool = False) -> dict:
+            website_change: bool = False, site_id: str = 'default', web_only: bool = False,
+            reality_operation: dict | None = None) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
     if store.pending():
         raise OperationError('Recover the interrupted activation before preparing a deployment')
     if (not {'server','subscription','overrides'} <= set(config)
-            or set(config) - {'server','subscription','overrides','website_content','web'}):
+            or set(config) - {'server','subscription','overrides','website_content','web','reality'}):
         raise OperationError('Deployment contains unknown or missing objects')
-    if type(publish_only) is not bool or type(web_only) is not bool or (publish_only and web_only):
+    if (type(publish_only) is not bool or type(web_only) is not bool
+            or sum((publish_only,web_only,reality_operation is not None))>1):
         raise OperationError('Activation mode selection must be unambiguous')
     original = config
     config = sync_default(config)
@@ -216,14 +298,22 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         _publication_server(server,previous,config)
         if site_files is not None:
             raise OperationError('Publication-only activation cannot change website content')
-    if web_only:
+    if reality_operation is not None:
+        _reality_transition(config,previous,reality_operation)
+    elif web_only:
         _web_server(config,previous)
     elif not publish_only:
         _preserve_endpoints(config,previous)
     if not publish_only:
         _check_new_domains(config,previous)
+    if reality_operation is not None:
+        reality.probe_targets(_reality_scope(config,'primary'))
     bindings = _certificate_bindings(config)
-    generated = client_config(server,config['overrides'])
+    if 'reality' in config:
+        primary = next(entry for entry in reality.public_resources(config)['endpoints'] if entry['primary'])
+        generated = client_config(server,config['overrides'],primary['sni'])
+    else:
+        generated = client_config(server,config['overrides'])
     revision = secrets.token_hex(16)
     selected = get_site(config['web'],site_id)
     from .site_content import validate_files
@@ -240,7 +330,18 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         singbox = directory/'sing-box.json'
         atomic_write(singbox,canonical(render_sing_box(server)),0o640)
         os.chown(singbox,0,proxy_gid)
-        atomic_write(directory/'nginx.conf',render_nginx(server,str(directory),config['web']).encode(),0o600)
+        if 'reality' in config:
+            for entry in reality.normalize_reality(config)['endpoints']:
+                if entry['id']=='default':
+                    continue
+                path = directory/'reality'/(entry['id']+'.json')
+                atomic_write(path,canonical(_render_reality(config,entry)),0o640)
+                path.parent.chmod(0o711)
+                os.chown(path,0,proxy_gid)
+                run([str(BIN/'sing-box'),'check','-c',str(path)])
+        nginx = (render_nginx(server,str(directory),config['web'],config['reality']) if 'reality' in config
+                 else render_nginx(server,str(directory),config['web']))
+        atomic_write(directory/'nginx.conf',nginx.encode(),0o600)
         summaries = {}
         for site in config['web']['sites']:
             identity = site['id']
@@ -267,6 +368,8 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         run([str(BIN/'nginx'),'-e','stderr','-p',str(ROOT/'nginx')+'/','-t','-c',str(directory/'nginx.conf')])
         run([str(BIN/'mihomo'),'-t','-d',str(ROOT/'client-check'),'-f',str(directory/'client.yaml')])
         _check_new_ports(config,previous)
+        if 'reality' in config:
+            _check_reality_ports(config,previous)
         files = {path.relative_to(directory).as_posix():digest(path.read_bytes())
                  for path in directory.rglob('*') if path.is_file()}
         default_binding = get_site(config['web'],'default')['certificate_id']
@@ -277,7 +380,10 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
                    'content_versions':{site['id']:site['content_version'] for site in config['web']['sites']
                                        if site['content_version']},
                    'website_summaries':summaries,
-                   'activation':'publication' if publish_only else ('web' if web_only else 'full')}
+                   'activation':('reality' if reality_operation is not None else
+                                 'publication' if publish_only else 'web' if web_only else 'full')}
+        if reality_operation is not None:
+            payload['reality_operation'] = reality_operation
         if config.get('website_content'):
             payload['content_version'] = config['website_content']
         if 'default' in summaries:
@@ -286,6 +392,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             payload.update(website_change=True,website_id=site_id)
         plan_id = store.plan('deployment',payload,expected_revision=base_revision)
         changes = (['subscription bundle','publisher reload'] if publish_only else
+                   ['new or retained REALITY entries','Nginx reload','subscription SNI publication'] if reality_operation is not None else
                    ['website resources','Nginx reload','publisher reload'] if web_only else
                    ['managed websites','REALITY listener','subscription bundle','ProxyHub service activation'])
         return {'plan_id':plan_id,'revision':revision,'site_domain':server['site_domain'],
@@ -300,7 +407,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
 def _activation(payload: dict) -> str:
     """Missing mode identifies a phase-1 full-deployment record."""
     mode = payload.get('activation', 'full')
-    if mode not in ('full', 'publication', 'web'):
+    if mode not in ('full', 'publication', 'web', 'reality'):
         raise OperationError('Unsupported activation mode')
     return mode
 
@@ -319,6 +426,9 @@ def _publication_server(server: dict, previous: Path | None, config: dict | None
         raise OperationError('Publication-only activation cannot change website content')
     if config is not None and normalize_web(config) != normalize_web(current):
         raise OperationError('Publication-only activation cannot change website resources')
+    if (config is not None and ('reality' in config or 'reality' in current)
+            and reality.normalize_reality(config) != reality.normalize_reality(current)):
+        raise OperationError('Publication-only activation cannot change REALITY targets or entries')
 
 
 def _link(directory: Path) -> None:
@@ -343,6 +453,19 @@ def _publish(directory: Path) -> None:
 def _units() -> tuple[str, ...]:
     from .installer import UNITS
     return UNITS
+
+
+def _reality_units(config: dict) -> dict[str,str]:
+    return {entry['id']:('proxyhub-proxy.service' if entry['id']=='default' else
+                         'proxyhub-reality@'+entry['id']+'.service')
+            for entry in reality.normalize_reality(config)['endpoints']}
+
+
+def _core_units(config: dict) -> tuple[str,...]:
+    if 'reality' not in config:
+        return _units()
+    entries = _reality_units(config)
+    return (*entries.values(),*(unit for unit in _units() if unit!='proxyhub-proxy.service'))
 
 
 def _managed_revision(path: str | Path) -> Path:
@@ -407,6 +530,9 @@ def _check_runtime_permissions(directory: Path) -> None:
     identities = [site['id'] for site in normalize_web(config)['sites']] if 'web' in config else ['default']
     trees = [directory/site_directory(identity) for identity in identities]
     parents = [directory/'sites'] if len(trees)>1 else []
+    extra = list((directory/'reality').glob('*.json')) if 'reality' in config else []
+    if extra:
+        parents.append(directory/'reality')
     for path in (ROOT, ROOT/'revisions', directory, *parents, *trees,
                  *(path for tree in trees for path in tree.rglob('*') if path.is_dir())):
         info = path.lstat()
@@ -414,6 +540,7 @@ def _check_runtime_permissions(directory: Path) -> None:
                 or info.st_mode & 0o022):
             raise OperationError('Managed runtime directory permissions do not allow safe service access')
     for path, required in ((directory/'sing-box.json', stat.S_IRGRP),
+                           *((path,stat.S_IRGRP) for path in extra),
                            *((path, stat.S_IROTH) for tree in trees for path in tree.rglob('*') if path.is_file())):
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or not info.st_mode & required
@@ -465,7 +592,26 @@ def _check_new_domains(config: dict, previous: Path | None) -> None:
         check_domain(config['server'],domain)
 
 
-def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -> None:
+def _check_reality_ports(config: dict, previous: Path | None) -> None:
+    old = (reality.normalize_reality(json.loads((previous/'config.json').read_text(encoding='utf-8')))
+           if previous is not None else {'endpoints':[]})
+    owned = {entry['listen_port'] for entry in old['endpoints']}
+    for entry in reality.normalize_reality(config)['endpoints']:
+        port = entry['listen_port']
+        if port in owned:
+            continue
+        for family,address in ((socket.AF_INET,'0.0.0.0'),(socket.AF_INET6,'::')):
+            try:
+                with socket.socket(family) as checked:
+                    if family==socket.AF_INET6:
+                        checked.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1)
+                    checked.bind((address,port))
+            except OSError:
+                raise OperationError(f'New REALITY TCP port {port} is unavailable; no service was replaced') from None
+
+
+def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
+             reality_operation: dict | None = None) -> None:
     current = _current_revision()
     if current not in (None, previous, candidate):
         raise OperationError('Refusing to overwrite an unexpected current revision')
@@ -488,7 +634,30 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -
         run(['systemctl','reload','proxyhub-nginx.service'])
         run(['systemctl','reload','proxyhub-publisher.service'])
         _wait_web_health(restored,previous)
+        if 'reality' in restored:
+            _wait_local_reality_health(restored,previous)
         _wait_publication(previous)
+        return
+    if activation == 'reality':
+        config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+        _reality_transition(config,previous,reality_operation)
+        restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        _link(previous)
+        _publish(previous)
+        old_units, new_units = _reality_units(restored), _reality_units(config)
+        for unit in old_units.values():
+            run(['systemctl','start',unit])
+        run(['systemctl','reload','proxyhub-nginx.service'])
+        run(['systemctl','reload','proxyhub-publisher.service'])
+        _wait_web_health(restored,previous)
+        _wait_local_reality_health(restored,previous)
+        _wait_publication(previous)
+        for identity,unit in new_units.items():
+            if identity not in old_units:
+                run(['systemctl','stop',unit])
+                run(['systemctl','disable',unit])
+        for unit in old_units.values():
+            run(['systemctl','enable',unit])
         return
     if activation != 'full':
         raise OperationError('Unsupported activation mode')
@@ -496,13 +665,16 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -
         config = json.loads((previous / 'config.json').read_text(encoding='utf-8'))
         _link(previous)
         _publish(previous)
-        for service in _units():
+        for service in _core_units(config):
             run(['systemctl', 'restart', service])
         # systemctl restart acknowledges process startup, not HTTPS readiness.
         # Keep the activation pending until every restored consumer is healthy.
-        _wait_health(config['server'])
+        if 'reality' not in config:
+            _wait_health(config['server'])
         if 'web' in config:
             _wait_web_health(config,previous)
+        if 'reality' in config:
+            _wait_local_reality_health(config,previous)
     else:
         # Every service is attempted even if one stop fails. The journal is left
         # pending when any action fails, so a later recover can safely retry.
@@ -551,7 +723,11 @@ def recover(store: StateStore) -> dict:
         if candidate.name != record['payload']['revision']:
             raise OperationError('Recovery candidate differs from its plan')
         previous = _managed_revision(details['previous']) if details['previous'] else None
-        _restore(previous, candidate, activation)
+        if activation=='reality':
+            _verify_candidate(candidate,record['payload'])
+            _restore(previous,candidate,activation,record['payload'].get('reality_operation'))
+        else:
+            _restore(previous, candidate, activation)
         store.abort(item['plan_id'], {'recovered': True, 'previous_available': previous is not None})
         return {'status': 'recovered', 'previous_available': previous is not None}
 
@@ -637,6 +813,52 @@ def _wait_web_health(config: dict, directory: Path) -> None:
             time.sleep(.2)
 
 
+def _reality_health(config: dict, directory: Path) -> None:
+    """Follow every retained SNI through the actual public stream mapping."""
+    web = normalize_web(config)
+    context = ssl.create_default_context()
+    context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+    for entry in reality.normalize_reality(config)['endpoints']:
+        target = reality.endpoint_target(config,entry)
+        expected, fingerprint = None, None
+        if 'site_id' in target:
+            site = get_site(web,target['site_id'])
+            binding = get_certificate(web,site['certificate_id'])
+            fingerprint = validate_certificate(binding['certificate_path'],binding['key_path'],
+                                               [target['server_name']])['sha256']
+            expected = (directory/site_directory(site['id'])/'index.html').read_bytes()
+        with socket.create_connection(('127.0.0.1',config['server']['public_port']),timeout=3) as raw:
+            with context.wrap_socket(raw,server_hostname=target['server_name']) as stream:
+                if fingerprint is not None and digest(stream.getpeercert(binary_form=True))!=fingerprint:
+                    raise OperationError('A REALITY SNI route has not loaded the selected target certificate')
+                if expected is not None:
+                    stream.sendall(f"GET / HTTP/1.1\r\nHost: {target['server_name']}\r\nConnection: close\r\n\r\n".encode())
+                    response = http.client.HTTPResponse(stream)
+                    try:
+                        response.begin()
+                        if response.status!=200 or response.read(len(expected)+1)!=expected:
+                            raise OperationError('A REALITY SNI route has not loaded the selected website')
+                    finally:
+                        response.close()
+
+
+def _wait_reality_health(config: dict, directory: Path) -> None:
+    for attempt in range(15):
+        try:
+            _reality_health(config,directory)
+            return
+        except (OSError,OperationError,http.client.HTTPException):
+            if attempt==14:
+                raise
+            time.sleep(.2)
+
+
+def _wait_local_reality_health(config: dict, directory: Path) -> None:
+    local = _reality_scope(config,'local')
+    if local is not None:
+        _wait_reality_health(local,directory)
+
+
 def _publication_health(directory: Path) -> None:
     """Check the loaded generation, exact bodies and headers through real GETs.
 
@@ -708,6 +930,8 @@ def apply(store: StateStore, identity: str) -> dict:
         previous = _current_revision()
         if activation == 'publication':
             _publication_server(server, previous, config)
+        elif activation == 'reality':
+            _reality_transition(config,previous,payload.get('reality_operation'))
         elif activation == 'web':
             _web_server(config,previous)
         else:
@@ -717,6 +941,10 @@ def apply(store: StateStore, identity: str) -> dict:
             if activation != 'publication':
                 _check_new_domains(config,previous)
         _check_runtime_permissions(directory)
+        if 'reality' in config:
+            _check_reality_ports(config,previous)
+        if activation=='reality':
+            reality.probe_targets(_reality_scope(config,'primary'))
         if previous is None:
             _check_ports(server)
         store.record(identity,'activating',{'previous':str(previous) if previous else None,
@@ -731,22 +959,48 @@ def apply(store: StateStore, identity: str) -> dict:
                 run(['systemctl','reload','proxyhub-nginx.service'])
                 run(['systemctl','reload','proxyhub-publisher.service'])
                 _wait_web_health(config,directory)
+                if 'reality' in config:
+                    _wait_local_reality_health(config,directory)
                 _wait_publication(directory)
+            elif activation == 'reality':
+                old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+                before, after = _reality_units(old), _reality_units(config)
+                for entry_id,unit in after.items():
+                    if entry_id not in before:
+                        run(['systemctl','start',unit])
+                run(['systemctl','reload','proxyhub-nginx.service'])
+                _wait_web_health(config,directory)
+                _wait_reality_health(_reality_scope(config,'primary'),directory)
+                run(['systemctl','reload','proxyhub-publisher.service'])
+                _wait_publication(directory)
+                for entry_id,unit in before.items():
+                    if entry_id not in after:
+                        run(['systemctl','stop',unit])
+                        run(['systemctl','disable',unit])
+                for entry_id,unit in after.items():
+                    if entry_id not in before:
+                        run(['systemctl','enable',unit])
             else:
-                for service in _units():
+                for service in _core_units(config):
                     run(['systemctl','restart',service])
-                _wait_health(server)
+                if 'reality' not in config:
+                    _wait_health(server)
                 if 'web' in config:
                     _wait_web_health(config,directory)
                 elif payload.get('website_change') or config.get('website_content'):
                     _website_health(server, directory)
-                run(['systemctl','enable',*_units()])
+                if 'reality' in config:
+                    _wait_local_reality_health(config,directory)
+                run(['systemctl','enable',*_core_units(config)])
             store.commit(identity)
         except Exception:
             # A successful database COMMIT is the boundary. Never undo it if a
             # later Python exception occurs; recovery sees no pending activation.
             if store.inspect(identity)['status'] != 'applied':
-                _restore(previous, directory, activation)
+                if activation=='reality':
+                    _restore(previous,directory,activation,payload.get('reality_operation'))
+                else:
+                    _restore(previous, directory, activation)
                 store.abort(identity, {'previous_available': previous is not None})
             raise
         return {'status':'applied','revision':payload['revision'],'activation':activation,

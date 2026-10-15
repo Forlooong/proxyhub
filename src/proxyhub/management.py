@@ -15,6 +15,7 @@ from .management_read import overview, ssh_details
 from .management_read import web_resources
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, sync_default
+from . import reality
 
 ROOT = Path('/var/lib/proxyhub')
 
@@ -99,6 +100,11 @@ class OperationService:
             with self.state() as store:
                 _, config, revision, _ = self.snapshot(store,reject_pending=True)
                 return {'revision':revision,**web_resources(config)}
+        if operation == 'reality.resources':
+            shape(payload,())
+            with self.state() as store:
+                _, config, revision, _ = self.snapshot(store,reject_pending=True)
+                return {'revision':revision,**reality.public_resources(config)}
         if operation == 'website.content.preview':
             shape(payload,('plan_id',))
             with self.state() as store:
@@ -131,7 +137,7 @@ class OperationService:
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in management_web.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
+            if payload['kind'] not in management_web.KINDS | reality.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -152,6 +158,32 @@ class OperationService:
                     directory, config = self.active()
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
+            if kind in reality.KINDS:
+                before = reality.public_resources(config)
+                candidate = reality.change(config,kind,values)
+                after = reality.public_resources(candidate)
+                identity = (after['primary_endpoint_id'] if kind=='reality.migrate' else values['endpoint_id'])
+                operation = {'kind':kind.removeprefix('reality.'),'endpoint_id':identity}
+                prepared = deployment.prepare(store,candidate,expected_revision=base_revision,reality_operation=operation)
+                old_primary = next(entry for entry in before['endpoints'] if entry['primary'])
+                new_primary = next(entry for entry in after['endpoints'] if entry['primary'])
+                changes = [
+                    {'label':'订阅使用的 SNI','before':old_primary['sni'],'after':new_primary['sni']},
+                    {'label':'当前握手目标','before':old_primary['address']+':'+str(old_primary['port']),
+                     'after':new_primary['address']+':'+str(new_primary['port'])},
+                    {'label':'继续保留的旧 SNI','before':None,
+                     'after':[entry['sni'] for entry in after['endpoints'] if not entry['primary']]},
+                ]
+                if kind=='reality.retire':
+                    retired = next(entry for entry in before['endpoints'] if entry['id']==identity)
+                    changes.insert(0,{'label':'退役 SNI','before':retired['sni'],'after':None})
+                return self.preview(prepared['plan_id'],kind,base_revision,
+                    changes,
+                    ['关联订阅将发布当前入口 SNI；保留的旧入口继续接受原客户端。',
+                     '新增入口使用独立核心；Nginx 和发布器重载，现有核心不重启。'],
+                    ['退役是独立的显式操作，旧客户端不会自动迁移。',
+                     '只强制验证将要发布的目标；保留旧入口不代表第三方目标始终可用。',
+                     '目标检查不代表真实客户端已验收；应用后分别验证新旧客户端。'])
             if kind in management_web.KINDS:
                 result = management_web.change(config,kind,values,self.root)
                 prepared = deployment.prepare(store,result['config'],expected_revision=base_revision,web_only=True)
@@ -292,6 +324,7 @@ class OperationService:
     def preview(identity,kind,revision,changes,impact,warnings):
         return {'plan_id':identity,'kind':kind,'base_revision':revision,
                 'summary':{'ssh.append':'追加 SSH 公钥','website.update':'更新网站标题','proxy.update':'更新 REALITY 节点',
+                           'reality.migrate':'新增 REALITY 目标与迁移入口','reality.select':'选择当前发布入口','reality.retire':'显式退役旧入口',
                            'website.create':'创建网站','website.enable':'启用网站','website.disable':'停用网站','website.delete':'删除网站',
                            'website.domain.bind':'绑定网站域名','website.domain.unbind':'解绑网站域名','website.certificate.bind':'更换网站证书绑定',
                            'certificate.add':'新增证书绑定','certificate.issue':'申请新证书绑定','certificate.delete':'删除证书绑定',

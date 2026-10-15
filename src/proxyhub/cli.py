@@ -84,6 +84,17 @@ def parser() -> argparse.ArgumentParser:
     for action in ('renew', 'delete'):
         command = certificate.add_parser(action, help='Prepare certificate '+action)
         command.add_argument('--certificate-id', required=True)
+    proxy = modules.add_parser('proxy', help='Proxy nodes and REALITY entry migration').add_subparsers(dest='operation')
+    reality = proxy.add_parser('reality', help='Manage REALITY targets while retaining existing entries').add_subparsers(dest='action')
+    reality.add_parser('list', help='List primary and retained REALITY entries')
+    migrate = reality.add_parser('migrate', help='Prepare a new REALITY entry and retain the old one')
+    target = migrate.add_mutually_exclusive_group(required=True)
+    target.add_argument('--site-id', help='Enabled managed website ID')
+    target.add_argument('--external-host', help='External TLS target address, separate from SNI; port 443')
+    migrate.add_argument('--sni', required=True)
+    for action in ('select', 'retire'):
+        command = reality.add_parser(action, help='Prepare '+action+' of a retained REALITY entry')
+        command.add_argument('--endpoint-id', required=True)
     deploy = modules.add_parser('deployment', help='Single-node generation, validation, activation and recovery').add_subparsers(dest='operation')
     init = deploy.add_parser('init', help='Write a private initial config with fresh node and link credentials')
     for field in ('site-domain', 'subscription-domain', 'public-address', 'certificate', 'key'):
@@ -172,6 +183,20 @@ def execute(args) -> dict:
     if args.module == 'host' and args.operation == 'enable-key-auth':
         from .host.policy import enable_key_auth
         return enable_key_auth(apply=args.apply)
+    if args.module == 'proxy':
+        from .management import OperationService
+        service = OperationService(synchronous=True)
+        try:
+            if args.action == 'list':
+                return service.handle('reality.resources', {})
+            if args.action == 'migrate':
+                values = {'type': 'site', 'site_id': args.site_id, 'sni': args.sni} if args.site_id else {
+                    'type': 'external', 'address': args.external_host, 'port': 443, 'sni': args.sni}
+            else:
+                values = {'endpoint_id': args.endpoint_id}
+            return _site_plan(service, 'reality.' + args.action, values)
+        finally:
+            service.close()
     if args.module == 'site' and args.operation == 'content':
         from .management import OperationService
         service = OperationService(synchronous=True)
@@ -343,11 +368,14 @@ def main(argv=None) -> int:
     if args.module is None:
         root.print_help()
         return 0
-    if args.module in {'host','site','deployment','sub','panel'} and args.operation is None:
+    if args.module in {'host','site','proxy','deployment','sub','panel'} and args.operation is None:
         _help(root,[args.module])
         return 0
     if args.module == 'site' and args.action is None:
         _help(root,['site',args.operation])
+        return 0
+    if args.module == 'proxy' and args.action is None:
+        _help(root,['proxy',args.operation])
         return 0
     if args.module == 'site' and args.operation == 'website' and args.action in {'domain', 'certificate'} and args.resource_action is None:
         _help(root, ['site', 'website', args.action])

@@ -45,12 +45,14 @@ def test_renew_cannot_revert_configuration_changed_during_acme(tmp_path, monkeyp
     store = StateStore(tmp_path/'plans')
     monkeypatch.setattr(cli, 'require_root', lambda: None)
     monkeypatch.setattr('proxyhub.state.StateStore', lambda _: store)
-    previous_read = Path.read_text
-    def read(path, *args, **kwargs):
-        if str(path).replace('\\','/').endswith('/current/config.json'):
-            return json.dumps({'server': {'site_domain':'site.example.test','subscription_domain':'sub.example.test','certificate_path':'old'},'subscription':{'token':'old'}})
-        return previous_read(path,*args,**kwargs)
-    monkeypatch.setattr(Path,'read_text',read)
+    active=tmp_path/'active'
+    active.mkdir()
+    (active/'config.json').write_text(json.dumps({'server':{'site_domain':'site.example.test',
+        'subscription_domain':'sub.example.test','certificate_path':'old'},'subscription':{'token':'old'}}))
+    original_resolve=Path.resolve
+    def resolve(path,*args,**kwargs):
+        return active if path==Path('/var/lib/proxyhub/current') else original_resolve(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'resolve',resolve)
     def concurrent_update(*args, **kwargs):
         store.commit(store.plan('ssh', {}))
         return {'certificate_path':'new','key_path':'new-key'}
@@ -95,6 +97,64 @@ def content_service(monkeypatch):
         return service
     monkeypatch.setattr(management, 'OperationService', synchronous_service)
     return service
+
+
+@pytest.mark.parametrize('arguments', [
+    ['proxy'], ['proxy','reality'], ['help','proxy'], ['help','proxy','reality'],
+    ['help','proxy','reality','list'], ['help','proxy','reality','migrate'],
+    ['help','proxy','reality','select'], ['help','proxy','reality','retire'],
+])
+def test_reality_help_does_not_require_root_or_state(arguments, capsys, monkeypatch):
+    monkeypatch.setattr('proxyhub.cli.require_root', lambda: pytest.fail('help must not require root'))
+    assert main(arguments) == 0
+    assert 'usage:' in capsys.readouterr().out
+
+
+def test_reality_list_uses_read_operation(content_service, capsys):
+    import json
+    content_service.result = {'revision':7,'node_id':'local-reality','primary_endpoint_id':'original','endpoints':[]}
+    assert main(['proxy','reality','list']) == 0
+    assert json.loads(capsys.readouterr().out) == content_service.result
+    assert content_service.calls == [('reality.resources', {})]
+    assert content_service.closed
+
+
+@pytest.mark.parametrize(('arguments', 'kind', 'values'), [
+    (['migrate','--site-id','site-2','--sni','second.example.test'], 'reality.migrate', {'type':'site','site_id':'site-2','sni':'second.example.test'}),
+    (['migrate','--external-host','203.0.113.50','--sni','external.example.test'], 'reality.migrate', {'type':'external','address':'203.0.113.50','port':443,'sni':'external.example.test'}),
+    (['select','--endpoint-id','original'], 'reality.select', {'endpoint_id':'original'}),
+    (['retire','--endpoint-id','original'], 'reality.retire', {'endpoint_id':'original'}),
+])
+def test_reality_changes_prepare_without_applying(arguments, kind, values, content_service, capsys):
+    import json
+    assert main(['proxy','reality',*arguments]) == 0
+    assert json.loads(capsys.readouterr().out)['plan_id'] == 'a' * 32
+    assert content_service.calls == [(kind, 7, values)]
+    assert content_service.closed
+
+
+@pytest.mark.parametrize('arguments', [
+    ['migrate','--sni','second.example.test'],
+    ['migrate','--site-id','site-2','--external-host','external.example.test','--sni','second.example.test'],
+    ['migrate','--site-id','site-2'],
+    ['migrate','--external-host','external.example.test'],
+    ['select'], ['retire'],
+])
+def test_reality_parser_requires_explicit_target_sni_and_entry(arguments, monkeypatch):
+    monkeypatch.setattr('proxyhub.cli.execute', lambda _: pytest.fail('invalid command must not open state'))
+    with pytest.raises(SystemExit) as result:
+        main(['proxy','reality',*arguments])
+    assert result.value.code == 2
+
+
+def test_reality_failure_closes_service_and_redacts_details(content_service, capsys):
+    def failed(*args):
+        raise OSError('PRIVATE-REALITY-DETAIL')
+    content_service.create_plan = failed
+    assert main(['proxy','reality','retire','--endpoint-id','original']) == 1
+    captured = capsys.readouterr()
+    assert 'PRIVATE-REALITY-DETAIL' not in captured.out + captured.err
+    assert content_service.closed
 
 
 def test_content_upload_prepares_with_current_revision(tmp_path, content_service, capsys):

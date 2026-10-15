@@ -68,7 +68,7 @@ def web_resources(config):
     server = config['server']
     certificates = []
     for binding in web['certificates']:
-        users = consumers(web,server,binding['id'])
+        users = consumers(web,server,binding['id'],config.get('reality'))
         domains = list(dict.fromkeys(binding['domains']+[item['domain'] for item in users if item['domain']]))
         try:
             details = validate_certificate(binding['certificate_path'],binding['key_path'],domains)
@@ -84,18 +84,23 @@ def web_resources(config):
     suffix = '' if server['public_port']==443 else ':'+str(server['public_port'])
     sites = [{**{key:site[key] for key in ('id','listener_id','tls_port','domains','title','enabled','certificate_id','content_version')},
               'url':'https://'+site['domains'][0]+suffix if site['enabled'] else None,
-              'dependencies':site_dependencies(web,server,site['id'])} for site in web['sites']]
+              'dependencies':site_dependencies(web,server,site['id'],config.get('reality'))} for site in web['sites']]
     return {'websites':sites,'certificates':certificates}
 
 
 def overview(config, revision, jobs, root):
+    from .reality import public_resources
+    reality = public_resources(config)
+    endpoint = next(entry for entry in reality['endpoints'] if entry['primary'])
     server, sub = config['server'], config['subscription']
     resources = web_resources(config)
     primary = get_site(normalize_web(config),'default')
     binding = next(item for item in resources['certificates'] if item['id']==primary['certificate_id'])
     certificate = binding
     status = []
-    for unit in ('proxyhub-proxy','proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
+    units = [('proxyhub-proxy' if entry['id']=='default' else 'proxyhub-reality@'+entry['id'])
+             for entry in reality['endpoints']]
+    for unit in (*units,'proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
         try:
             value = run(['systemctl','show',unit,'-p','ActiveState','--value'],timeout=5).strip()
         except Exception:
@@ -132,8 +137,9 @@ def overview(config, revision, jobs, root):
                            'status':certificate['status'],'error':certificate['error'],
                            'automatic_renewal':binding['automatic_renewal'],'consumers':[item['label'] for item in binding['consumers']]},
             'proxy':{'id':'local-reality','name':server['node_name'],'protocol':'VLESS REALITY / Vision',
-                     'public_address':server['public_address'],'port':server['public_port'],'sni':server['site_domain'],
-                     'target':'127.0.0.1:'+str(server['site_tls_port']),'verification':'请使用客户端验证当前连接；服务运行不等于真实代理请求通过'},
+                     'public_address':server['public_address'],'port':server['public_port'],'sni':endpoint['sni'],
+                     'target':endpoint['address']+':'+str(endpoint['port']),'verification':'请使用客户端验证当前连接；服务运行不等于真实代理请求通过'},
+            'reality':reality,
             'subscription':{'id':sub['id'],'name':sub['name'],'domain':server['subscription_domain'],
                             'update_interval_hours':sub['update_interval_hours'],'userinfo':sub['userinfo'],
                             'reset_day':sub.get('reset_day'),'reset_at':sub.get('reset_at'),
@@ -142,5 +148,6 @@ def overview(config, revision, jobs, root):
                 {'name':'多网站 / 证书依赖 / REALITY / 单订阅','available':True,'reason':'网站与证书绑定独立管理，现有 REALITY 目标保留'},
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
                 {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
-                {'name':'HY2、外部目标、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
+                {'name':'REALITY 本机/外部目标与 SNI 迁移','available':True,'reason':'独立新旧入口、目标预检与显式退役'},
+                {'name':'HY2、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
             **resources,'recent_jobs':jobs.list()['jobs'][:5]}

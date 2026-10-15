@@ -91,6 +91,53 @@ def assert_private_fields_absent(value, config):
         assert secret not in encoded
 
 
+@pytest.mark.parametrize('kind', ['reality.migrate','reality.select','reality.retire'])
+def test_reality_operations_share_typed_plans_without_exposing_credentials(environment,kind):
+    from proxyhub import reality
+    from proxyhub.websites import normalize_web
+    env=environment
+    config=deepcopy(env.config)
+    config['web']=normalize_web(config)
+    config['web']['sites'][0]['domains'].append('next.example.test')
+    config['web']['certificates'][0]['domains'].append('next.example.test')
+    values={'type':'site','site_id':'default','sni':'next.example.test'}
+    if kind!='reality.migrate':
+        config=reality.change(config,'reality.migrate',values)
+        endpoint=config['reality']['primary_endpoint_id']
+        values={'endpoint_id':'default' if kind=='reality.select' else endpoint}
+        if kind=='reality.retire':config=reality.change(config,'reality.select',{'endpoint_id':'default'})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    result=finish_job(env.service,'plan.create',{'kind':kind,'base_revision':0,'values':values})
+    assert result['status']=='succeeded'
+    assert_private_fields_absent(result,config)
+    candidate,options=env.prepared[0]
+    assert options['reality_operation']['kind']==kind.split('.')[1]
+    assert all(candidate[key]==config[key] for key in ('server','web','subscription','overrides'))
+    assert options['reality_operation']['endpoint_id']==(
+        candidate['reality']['primary_endpoint_id'] if kind=='reality.migrate' else values['endpoint_id'])
+    resources=env.service.handle('reality.resources',{})
+    assert resources['revision']==0
+    assert_private_fields_absent(resources,config)
+
+
+def test_overview_reports_selected_sni_without_rewriting_original_website(environment):
+    from proxyhub import reality
+    from proxyhub.websites import normalize_web
+    env=environment
+    config=deepcopy(env.config)
+    config['web']=normalize_web(config)
+    config['web']['sites'][0]['domains'].append('next.example.test')
+    config['web']['certificates'][0]['domains'].append('next.example.test')
+    config=reality.change(config,'reality.migrate',{'type':'site','site_id':'default','sni':'next.example.test'})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    result=env.service.handle('overview',{})
+    assert result['proxy']['sni']=='next.example.test'
+    assert result['website']['domain']==config['server']['site_domain']=='site.example.test'
+    assert len(result['reality']['endpoints'])==2
+    assert len([c for c in result['certificates'][0]['consumers'] if c['kind']=='reality'])==2
+    assert_private_fields_absent(result,config)
+
+
 def test_website_upload_and_restore_share_existing_plan_contract(environment,monkeypatch):
     import base64
     import io

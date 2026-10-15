@@ -164,7 +164,7 @@ def sync_default(config: Mapping) -> dict:
     return result
 
 
-def consumers(web: dict, server: Mapping, certificate_id: str) -> list[dict]:
+def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | None = None) -> list[dict]:
     """Describe binding dependencies, including disabled sites and REALITY."""
     get_certificate(web, certificate_id)
     result = []
@@ -176,16 +176,39 @@ def consumers(web: dict, server: Mapping, certificate_id: str) -> list[dict]:
     if web['subscription_certificate_id'] == certificate_id:
         result.append({'kind': 'subscription', 'id': 'subscription-tls', 'label': '订阅 HTTPS',
                        'domain': server['subscription_domain'], 'port': server['subscription_tls_port']})
-    default = get_site(web, 'default')
-    if default['certificate_id'] == certificate_id:
-        result.append({'kind': 'reality', 'id': 'local-reality', 'label': 'REALITY 本机握手目标（间接）',
-                       'domain': server['site_domain'], 'port': default['tls_port']})
+    if reality is None:
+        default = get_site(web, 'default')
+        if default['certificate_id'] == certificate_id:
+            result.append({'kind': 'reality', 'id': 'local-reality', 'label': 'REALITY 本机握手目标（间接）',
+                           'domain': server['site_domain'], 'port': default['tls_port']})
+    else:
+        targets = {target['id']: target for target in reality['targets']}
+        for endpoint in reality['endpoints']:
+            target = targets[endpoint['target_id']]
+            if target['type'] != 'site':
+                continue
+            site = get_site(web, target['site_id'])
+            if site['certificate_id'] == certificate_id:
+                result.append({'kind': 'reality', 'id': endpoint['id'],
+                               'label': 'REALITY ' + endpoint['id'] + ' 本机握手目标（网站 ' + site['id'] + '，间接）',
+                               'domain': target['server_name'], 'port': site['tls_port']})
     return result
 
 
-def site_dependencies(web: dict, server: Mapping, site_id: str) -> list[str]:
+def site_dependencies(web: dict, server: Mapping, site_id: str, reality: dict | None = None,
+                      domain: str | None = None) -> list[str]:
     site = get_site(web, site_id)
-    if site['id'] == 'default':
-        return ['REALITY 节点 local-reality 引用网站 default、域名 ' + server['site_domain']
-                + ' 与内部监听 ' + site['listener_id']]
-    return []
+    if reality is None:
+        if site['id'] == 'default' and domain in (None, server['site_domain']):
+            return ['REALITY 节点 local-reality 引用网站 default、域名 ' + server['site_domain']
+                    + ' 与内部监听 ' + site['listener_id']]
+        return []
+    targets = {target['id']: target for target in reality['targets']}
+    result = []
+    for endpoint in reality['endpoints']:
+        target = targets[endpoint['target_id']]
+        if (target['type'] == 'site' and target['site_id'] == site_id
+                and domain in (None, target['server_name'])):
+            result.append('REALITY 入口 ' + endpoint['id'] + ' 引用网站 ' + site_id + '、域名 '
+                          + target['server_name'] + ' 与内部监听 ' + site['listener_id'])
+    return result

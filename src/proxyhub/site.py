@@ -100,7 +100,8 @@ def validate_certificate(
     }
 
 
-def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = None) -> str:
+def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = None,
+                 reality: dict | None = None) -> str:
     """Render a standalone config; revision_dir must be an immutable managed path.
 
     Nginx must provide statically loaded stream, ssl_preread, HTTP SSL, and HTTP
@@ -138,14 +139,18 @@ def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = 
         }}
         location / {{ {response} }}
     }}""")
-    routes = [f"        {site} 127.0.0.1:{value['reality_port']};",
-              f"        {subscription} 127.0.0.1:{value['subscription_tls_port']};"]
+    from .reality import public_resources
+    entries = public_resources({'server':value,'web':resources,
+                                **({'reality':reality} if reality is not None else {})})['endpoints']
+    reality_domains = {entry['sni'] for entry in entries}
+    routes = [f"        {entry['sni']} 127.0.0.1:{entry['listen_port']};" for entry in entries]
+    routes.append(f"        {subscription} 127.0.0.1:{value['subscription_tls_port']};")
     website_servers = []
     for website in active_sites:
         certificate = get_certificate(resources, website['certificate_id'])
         domains = website['domains']
         routes.extend(f"        {domain} 127.0.0.1:{website['tls_port']};"
-                      for domain in domains if domain != site)
+                      for domain in domains if domain not in reality_domains)
         host_check = (f"if ($host != {domains[0]}) {{ return 444; }}" if len(domains) == 1 else
                       'if ($host !~ ^(?:' + '|'.join(re.escape(domain) for domain in domains) + ')$) { return 444; }')
         website_servers.append(f"""    server {{

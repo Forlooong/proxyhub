@@ -132,6 +132,50 @@ def test_disabled_bindings_remain_dependencies_and_can_be_explicitly_cleared(con
     }
 
 
+def test_reality_dependencies_follow_all_retained_endpoints_and_filter_domains(configured):
+    web, server = configured['web'], configured['server']
+    reality = {
+        'targets': [
+            {'id': 'default', 'type': 'site', 'site_id': 'default', 'server_name': server['site_domain']},
+            {'id': '1' * 32, 'type': 'site', 'site_id': SITE, 'server_name': 'second.example.test'},
+            {'id': '2' * 32, 'type': 'site', 'site_id': SITE, 'server_name': 'alias.example.test'},
+            {'id': '3' * 32, 'type': 'external', 'address': 'external.example.test', 'port': 443,
+             'server_name': 'external.example.test', 'pinned_address': '1.1.1.1'},
+        ],
+        'endpoints': [
+            {'id': 'default', 'listener_id': 'reality-default', 'listen_port': 2443, 'target_id': 'default'},
+            {'id': '4' * 32, 'listener_id': 'reality-' + '4' * 32, 'listen_port': 2444, 'target_id': '1' * 32},
+            {'id': '5' * 32, 'listener_id': 'reality-' + '5' * 32, 'listen_port': 2445, 'target_id': '2' * 32},
+            {'id': '6' * 32, 'listener_id': 'reality-' + '6' * 32, 'listen_port': 2446, 'target_id': '3' * 32},
+        ],
+        'primary_endpoint_id': '6' * 32,
+    }
+    get_site(web, SITE)['enabled'] = False
+    dependencies = site_dependencies(web, server, SITE, reality)
+    assert len(dependencies) == 2
+    assert '4' * 32 in dependencies[0] and '5' * 32 in dependencies[1]
+    assert all('site-' + SITE in item for item in dependencies)
+    assert site_dependencies(web, server, SITE, reality, 'alias.example.test') == [dependencies[1]]
+    assert site_dependencies(web, server, SITE, reality, 'unreferenced.example.test') == []
+    references = [item for item in consumers(web, server, CERTIFICATE, reality) if item['kind'] == 'reality']
+    assert [item['id'] for item in references] == ['4' * 32, '5' * 32]
+    assert [item['domain'] for item in references] == ['second.example.test', 'alias.example.test']
+    assert all(item['port'] == 9443 and SITE in item['label'] for item in references)
+
+
+def test_unreferenced_default_has_no_false_reality_dependency(configured):
+    web, server = configured['web'], configured['server']
+    reality = {
+        'targets': [{'id': '1' * 32, 'type': 'site', 'site_id': SITE, 'server_name': 'second.example.test'}],
+        'endpoints': [{'id': '2' * 32, 'listener_id': 'reality-' + '2' * 32,
+                       'listen_port': 2444, 'target_id': '1' * 32}],
+        'primary_endpoint_id': '2' * 32,
+    }
+    assert site_dependencies(web, server, 'default', reality) == []
+    assert {item['kind'] for item in consumers(web, server, 'default', reality)} == {'website', 'subscription'}
+    assert site_dependencies(web, server, 'default', domain='alias.example.test') == []
+
+
 def test_resource_ids_do_not_depend_on_domain_or_certificate_material(configured):
     original = deepcopy(configured)
     second = get_site(configured['web'], SITE)

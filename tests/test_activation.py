@@ -296,3 +296,16 @@ def test_renewal_timer_does_not_join_activation_services():
     assert 'ExecStart=/usr/local/bin/proxyhub deployment renew' in definitions['proxyhub-renew.service']
     assert 'ConditionPathExists=/var/lib/proxyhub/current/config.json' in definitions['proxyhub-renew.service']
     assert 'Persistent=true' in definitions['proxyhub-renew.timer']
+
+
+def test_reality_instance_template_is_isolated_from_legacy_activation():
+    from proxyhub.installer import UNITS, units
+    definitions = units()
+    legacy = definitions['proxyhub-proxy.service']
+    template = definitions['proxyhub-reality@.service']
+    assert template == legacy.replace('/current/sing-box.json', '/current/reality/%i.json')
+    assert template.startswith('# Managed by ProxyHub\n')
+    assert 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n' in template
+    assert 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n' in template
+    assert 'proxyhub-reality@.service' not in UNITS
+    assert 'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/sing-box.json\n' in legacy
