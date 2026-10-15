@@ -309,3 +309,16 @@ def test_reality_instance_template_is_isolated_from_legacy_activation():
     assert 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n' in template
     assert 'proxyhub-reality@.service' not in UNITS
     assert 'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/sing-box.json\n' in legacy
+
+
+def test_hy2_service_is_low_privilege_and_isolated_from_legacy_activation():
+    from proxyhub.installer import UNITS, units
+    definition = units()['proxyhub-hy2.service']
+    assert 'proxyhub-hy2.service' not in UNITS
+    assert definition.startswith('# Managed by ProxyHub\n')
+    assert 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n' in definition
+    assert 'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/hy2.json\n' in definition
+    assert 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n' in definition
+    assert 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n' in definition
+    for restriction in ('NoNewPrivileges=yes', 'PrivateTmp=yes', 'ProtectHome=yes', 'ProtectSystem=strict'):
+        assert restriction in definition

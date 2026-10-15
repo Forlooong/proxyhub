@@ -15,7 +15,7 @@ from .management_read import overview, ssh_details
 from .management_read import web_resources
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, sync_default
-from . import reality
+from . import reality, hy2
 
 ROOT = Path('/var/lib/proxyhub')
 
@@ -105,6 +105,11 @@ class OperationService:
             with self.state() as store:
                 _, config, revision, _ = self.snapshot(store,reject_pending=True)
                 return {'revision':revision,**reality.public_resources(config)}
+        if operation == 'hy2.resources':
+            shape(payload,())
+            with self.state() as store:
+                _, config, revision, _ = self.snapshot(store,reject_pending=True)
+                return {'revision':revision,**hy2.public_resources(config)}
         if operation == 'website.content.preview':
             shape(payload,('plan_id',))
             with self.state() as store:
@@ -137,7 +142,7 @@ class OperationService:
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in management_web.KINDS | reality.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
+            if payload['kind'] not in management_web.KINDS | reality.KINDS | hy2.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -158,6 +163,20 @@ class OperationService:
                     directory, config = self.active()
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
+            if kind in hy2.KINDS:
+                before = hy2.public_resources(config)['node']
+                candidate = hy2.change(config,kind,values)
+                after = hy2.public_resources(candidate)['node']
+                prepared = deployment.prepare(store,candidate,expected_revision=base_revision,
+                                              hy2_operation={'kind':kind.removeprefix('hy2.')})
+                changes = [{'label':label,'before':before[key] if before else None,'after':after[key]}
+                           for key,label in (('name','HY2 节点名称'),('port','UDP 监听端口'),
+                                             ('server_name','TLS 服务名'),('certificate_id','绑定证书'),('enabled','启用状态'))
+                           if before is None or before[key] != after[key]]
+                return self.preview(prepared['plan_id'],kind,base_revision,changes,
+                    ['仅调整独立 HY2 服务和关联订阅；REALITY 核心不重启，原 TCP 入口保留。'],
+                    ['HY2 需要 UDP 端口可达；TCP 网站和 REALITY 入口不受 UDP 监听影响。',
+                     '更新或停用 HY2 会中断该节点的连接；应用后刷新订阅并验证真实客户端请求。'])
             if kind in reality.KINDS:
                 before = reality.public_resources(config)
                 candidate = reality.change(config,kind,values)
@@ -188,7 +207,7 @@ class OperationService:
                 result = management_web.change(config,kind,values,self.root)
                 prepared = deployment.prepare(store,result['config'],expected_revision=base_revision,web_only=True)
                 return self.preview(prepared['plan_id'],kind,base_revision,result['changes'],
-                                    ['重新加载网站和订阅发布器，保留现有代理进程。'],result['warnings'])
+                                    ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 所用证书材料变化时重启 HY2，相关连接会中断。'],result['warnings'])
             if kind == 'certificate.issue' or (kind == 'certificate.renew' and ('web' in config or values)):
                 return self._acme_plan(store,directory,config,kind,base_revision,values)
             before = deepcopy(config)
@@ -257,7 +276,7 @@ class OperationService:
             options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
             if kind.startswith('website.'):
                 options.update(site_id=site_id,web_only=True)
-                impact = ['重新加载网站和订阅发布器，保留现有代理进程。']
+                impact = ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 所用证书材料变化时重启 HY2，相关连接会中断。']
             if kind.startswith('website.content.'):
                 options.update(site_files=site_files,website_change=True)
             result = deployment.prepare(store,config,**options)
@@ -296,7 +315,7 @@ class OperationService:
         return self.preview(plan,kind,base_revision,
                             [{'label':'证书绑定','before':None if action=='issue' else identity,'after':identity},
                              {'label':'域名','before':None,'after':domains}],
-                            ['申请成功后才保存绑定；证书变化时重载其消费者并核对实际指纹，保留代理进程。'],
+                            ['申请成功后才保存绑定；证书变化时更新消费者并核对实际指纹。保留 REALITY 进程，启用 HY2 所用材料变化时会重启 HY2 并中断其连接。'],
                             ['HTTP-01 要求所有 A/AAAA 正确指向本机且公网 TCP 80 可达。','签发失败不会替换当前有效配置；手工证书不会自动接管续期。'])
 
     def _ssh_plan(self, store, base_revision, values):
@@ -325,6 +344,7 @@ class OperationService:
         return {'plan_id':identity,'kind':kind,'base_revision':revision,
                 'summary':{'ssh.append':'追加 SSH 公钥','website.update':'更新网站标题','proxy.update':'更新 REALITY 节点',
                            'reality.migrate':'新增 REALITY 目标与迁移入口','reality.select':'选择当前发布入口','reality.retire':'显式退役旧入口',
+                           'hy2.create':'创建 HY2 节点','hy2.update':'更新 HY2 节点','hy2.enable':'启用 HY2 节点','hy2.disable':'停用 HY2 节点',
                            'website.create':'创建网站','website.enable':'启用网站','website.disable':'停用网站','website.delete':'删除网站',
                            'website.domain.bind':'绑定网站域名','website.domain.unbind':'解绑网站域名','website.certificate.bind':'更换网站证书绑定',
                            'certificate.add':'新增证书绑定','certificate.issue':'申请新证书绑定','certificate.delete':'删除证书绑定',

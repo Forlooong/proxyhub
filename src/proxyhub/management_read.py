@@ -68,7 +68,7 @@ def web_resources(config):
     server = config['server']
     certificates = []
     for binding in web['certificates']:
-        users = consumers(web,server,binding['id'],config.get('reality'))
+        users = consumers(web,server,binding['id'],config.get('reality'),config.get('hy2'))
         domains = list(dict.fromkeys(binding['domains']+[item['domain'] for item in users if item['domain']]))
         try:
             details = validate_certificate(binding['certificate_path'],binding['key_path'],domains)
@@ -90,7 +90,9 @@ def web_resources(config):
 
 def overview(config, revision, jobs, root):
     from .reality import public_resources
+    from .hy2 import public_resources as hy2_resources
     reality = public_resources(config)
+    hy2 = hy2_resources(config)
     endpoint = next(entry for entry in reality['endpoints'] if entry['primary'])
     server, sub = config['server'], config['subscription']
     resources = web_resources(config)
@@ -100,6 +102,8 @@ def overview(config, revision, jobs, root):
     status = []
     units = [('proxyhub-proxy' if entry['id']=='default' else 'proxyhub-reality@'+entry['id'])
              for entry in reality['endpoints']]
+    if hy2['node'] is not None:
+        units.append('proxyhub-hy2')
     for unit in (*units,'proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
         try:
             value = run(['systemctl','show',unit,'-p','ActiveState','--value'],timeout=5).strip()
@@ -140,6 +144,7 @@ def overview(config, revision, jobs, root):
                      'public_address':server['public_address'],'port':server['public_port'],'sni':endpoint['sni'],
                      'target':endpoint['address']+':'+str(endpoint['port']),'verification':'请使用客户端验证当前连接；服务运行不等于真实代理请求通过'},
             'reality':reality,
+            'hy2':hy2,
             'subscription':{'id':sub['id'],'name':sub['name'],'domain':server['subscription_domain'],
                             'update_interval_hours':sub['update_interval_hours'],'userinfo':sub['userinfo'],
                             'reset_day':sub.get('reset_day'),'reset_at':sub.get('reset_at'),
@@ -149,5 +154,6 @@ def overview(config, revision, jobs, root):
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
                 {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
                 {'name':'REALITY 本机/外部目标与 SNI 迁移','available':True,'reason':'独立新旧入口、目标预检与显式退役'},
-                {'name':'HY2、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
+                {'name':'独立 UDP HY2 节点','available':True,'reason':'显式启停，绑定受管证书并加入现有订阅'},
+                {'name':'规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
             **resources,'recent_jobs':jobs.list()['jobs'][:5]}

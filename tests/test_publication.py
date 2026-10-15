@@ -105,6 +105,17 @@ def test_invalid_profile_rejected(profile, field, value):
         build_bundle([profile], "one")
 
 
+def test_raw_subscription_accepts_only_generated_reality_and_hy2_protocols(profile):
+    body = 'vless://fixture-one\nhysteria2://fixture-two\n'
+    profile['raw'] = base64.b64encode(body.encode()).decode()
+    bundle = build_bundle([profile], 'two-protocols')
+    assert validate_bundle(bundle) == bundle
+    for line in ('hy2://unsupported-alias', 'trojan://unsupported', 'https://example.test', ''):
+        profile['raw'] = base64.b64encode((body + line + '\n').encode()).decode()
+        with pytest.raises(PublicationError):
+            build_bundle([profile], 'bad-protocol')
+
+
 def test_traffic_fields_and_duplicate_routes_rejected(profile):
     profile["userinfo"]["expire"] = -1
     with pytest.raises(PublicationError):

@@ -164,8 +164,9 @@ def sync_default(config: Mapping) -> dict:
     return result
 
 
-def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | None = None) -> list[dict]:
-    """Describe binding dependencies, including disabled sites and REALITY."""
+def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | None = None,
+              hy2: dict | None = None) -> list[dict]:
+    """Describe binding dependencies, including disabled sites and HY2."""
     get_certificate(web, certificate_id)
     result = []
     for site in web['sites']:
@@ -192,6 +193,9 @@ def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | N
                 result.append({'kind': 'reality', 'id': endpoint['id'],
                                'label': 'REALITY ' + endpoint['id'] + ' 本机握手目标（网站 ' + site['id'] + '，间接）',
                                'domain': target['server_name'], 'port': site['tls_port']})
+    if hy2 is not None and hy2['certificate_id'] == certificate_id:
+        result.append({'kind': 'hy2', 'id': hy2['id'], 'label': hy2['name'] + ' HY2',
+                       'domain': hy2['server_name'], 'port': hy2['port'], 'enabled': hy2['enabled']})
     return result
 
 

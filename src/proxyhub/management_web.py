@@ -137,6 +137,7 @@ def _change(config, kind, values, root):
     web = normalize_web(result)
     server = result['server']
     reality = result.get('reality')
+    hy2 = result.get('hy2')
     result['web'] = web
     changes, warnings = [], []
 
@@ -233,7 +234,7 @@ def _change(config, kind, values, root):
         identity = _identity(values.get('certificate_id', get_site(web, 'default')['certificate_id']))
         certificate = get_certificate(web, identity)
         required = list(dict.fromkeys(certificate['domains'] + [consumer['domain']
-                        for consumer in consumers(web, server, identity, reality) if consumer['domain'] is not None]))
+                        for consumer in consumers(web, server, identity, reality, hy2) if consumer['domain'] is not None]))
         imported = _import(values, required, root)
         certificate.update(certificate_path=imported['certificate_path'], key_path=imported['key_path'])
         changes = [{'label': '替换证书绑定', 'before': certificate['name'], 'after': certificate['name']},
@@ -246,7 +247,7 @@ def _change(config, kind, values, root):
     elif kind == 'certificate.delete':
         _shape(values, ('certificate_id',))
         certificate = get_certificate(web, _identity(values['certificate_id']))
-        _dependencies([consumer['label'] for consumer in consumers(web, server, certificate['id'], reality)])
+        _dependencies([consumer['label'] for consumer in consumers(web, server, certificate['id'], reality, hy2)])
         web['certificates'].remove(certificate)
         changes = [{'label': '删除证书绑定', 'before': certificate['name'], 'after': None}]
     return {'config': sync_default(result), 'changes': changes, 'warnings': warnings}

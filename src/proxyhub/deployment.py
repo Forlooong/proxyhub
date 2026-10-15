@@ -11,6 +11,8 @@ import shutil
 import socket
 import ssl
 import stat
+import subprocess
+import tempfile
 import time
 
 from .core import OperationError, atomic_write, canonical, digest, run
@@ -19,7 +21,7 @@ from .site import render_nginx, render_site, validate_certificate
 from .publication import build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, consumers, site_directory, sync_default
-from . import reality
+from . import reality, hy2
 
 ROOT = Path('/var/lib/proxyhub')
 BIN = Path('/opt/proxyhub/bin')
@@ -116,6 +118,13 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
     config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
     sites = normalize_web(config)['sites'] if 'web' in config else [{'id':'default'}]
     allowed = set(CANDIDATE_FILES) - {'site/index.html'}
+    if hy2.normalize_hy2(config) is not None:
+        file = directory/'hy2.json'
+        if file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != manifest.get('hy2.json'):
+            raise OperationError('HY2 candidate file changed after validation')
+        allowed.add('hy2.json')
+    elif (directory/'hy2.json').exists() or (directory/'hy2.json').is_symlink():
+        raise OperationError('Candidate contains an unmanaged HY2 configuration')
     for site in sites:
         part = _site_manifest(payload,site['id'])
         _read_site(directory,part,site['id'])
@@ -141,11 +150,14 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
             raise OperationError('Candidate contains an unmanaged website tree')
 
 
-def client_config(server: dict, overrides: dict, sni: str | None = None) -> dict:
+def client_config(server: dict, overrides: dict, sni: str | None = None, hy2_node: dict | None = None) -> dict:
     node = {key: server[key] for key in ('uuid', 'public_key', 'short_id')}
     node.update(id='local-reality', name=server['node_name'], server=server['public_address'],
                 port=server['public_port'], server_name=sni or server['site_domain'])
-    text = run([str(BIN/'node'), str(APP/'packages/converter/dist/worker.js')], input=json.dumps({'node':node,'overrides':overrides}), timeout=20)
+    source = {'node':node,'overrides':overrides}
+    if hy2_node is not None:
+        source['hy2'] = hy2_node
+    text = run([str(BIN/'node'), str(APP/'packages/converter/dist/worker.js')], input=json.dumps(source), timeout=20)
     return json.loads(text)
 
 
@@ -153,7 +165,7 @@ def _certificate_bindings(config: dict) -> dict:
     web = normalize_web(config)
     result = {}
     for binding in web['certificates']:
-        active = [item['domain'] for item in consumers(web,config['server'],binding['id'],config.get('reality'))
+        active = [item['domain'] for item in consumers(web,config['server'],binding['id'],config.get('reality'),config.get('hy2'))
                   if item.get('enabled',True) and item['domain']]
         details = validate_certificate(binding['certificate_path'],binding['key_path'],
                                        list(dict.fromkeys(active))) if active else {'sha256':None}
@@ -161,10 +173,15 @@ def _certificate_bindings(config: dict) -> dict:
     return result
 
 
-def _preserve_endpoints(config: dict, previous: Path | None, *, reality_operation: dict | None = None) -> None:
+def _preserve_endpoints(config: dict, previous: Path | None, *, reality_operation: dict | None = None,
+                        hy2_operation: dict | None = None) -> None:
     if previous is None:
+        if hy2.normalize_hy2(config) is not None:
+            raise OperationError('Create HY2 through a typed plan after the initial deployment')
         return
     old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+    if hy2_operation is None and hy2.normalize_hy2(config) != hy2.normalize_hy2(old):
+        raise OperationError('HY2 resources require an explicit creation, update, enable or disable plan')
     if (reality_operation is None and ('reality' in config or 'reality' in old)
             and reality.normalize_reality(config) != reality.normalize_reality(old)):
         raise OperationError('REALITY targets and entries require an explicit migration, selection or retirement plan')
@@ -182,7 +199,7 @@ def _preserve_endpoints(config: dict, previous: Path | None, *, reality_operatio
             raise OperationError('An enabled website must be disabled before deletion')
         for binding in old_web['certificates']:
             if (not any(item['id']==binding['id'] for item in new_web['certificates'])
-                    and consumers(old_web,old['server'],binding['id'],old.get('reality'))):
+                    and consumers(old_web,old['server'],binding['id'],old.get('reality'),old.get('hy2'))):
                 raise OperationError('A referenced certificate binding cannot be deleted')
         for site in new_web['sites']:
             previous_site = before.get(site['id'])
@@ -268,20 +285,63 @@ def _web_server(config: dict, previous: Path | None) -> None:
     _preserve_endpoints(config,previous)
 
 
+def _hy2_transition(config: dict, previous: Path | None, operation: dict) -> None:
+    if previous is None or not isinstance(operation,dict) or set(operation)!={'kind'}:
+        raise OperationError('HY2 activation requires an existing deployment and a typed transition')
+    old = sync_default(json.loads((previous/'config.json').read_text(encoding='utf-8')))
+    old['server'] = validate_spec(old['server'])
+    if ({key:value for key,value in config.items() if key!='hy2'}
+            != {key:value for key,value in old.items() if key!='hy2'}):
+        raise OperationError('HY2 activation cannot change REALITY, websites or subscription settings')
+    before, after = hy2.normalize_hy2(old), hy2.normalize_hy2(config)
+    kind = operation['kind']
+    if kind == 'create':
+        valid = before is None and after is not None and after['enabled']
+    elif kind == 'update':
+        allowed = {'name','port','server_name','certificate_id'}
+        valid = (before is not None and after is not None and before!=after
+                 and {k:v for k,v in before.items() if k not in allowed}
+                 == {k:v for k,v in after.items() if k not in allowed})
+    elif kind in ('enable','disable'):
+        valid = (before is not None and after is not None and before['enabled']!=after['enabled']
+                 and after['enabled']==(kind=='enable')
+                 and {k:v for k,v in before.items() if k!='enabled'}
+                 == {k:v for k,v in after.items() if k!='enabled'})
+    else:
+        valid = False
+    if not valid:
+        raise OperationError('HY2 transition differs from the approved operation')
+    _preserve_endpoints(config,previous,hy2_operation=operation)
+
+
+def _certificate_material(path: str) -> list[str]:
+    return Path(path).read_text(encoding='ascii').splitlines()
+
+
+def _render_hy2(config: dict) -> dict:
+    rendered = hy2.render_hy2(config)
+    tls = rendered['inbounds'][0]['tls']
+    # The archive stays root-only. The already private proxy-group runtime
+    # receives only its selected material, bound by the candidate manifest.
+    tls['certificate'] = _certificate_material(tls.pop('certificate_path'))
+    tls['key'] = _certificate_material(tls.pop('key_path'))
+    return rendered
+
+
 def prepare(store: StateStore, config: dict, *, expected_revision: int | None = None,
             publish_only: bool = False, site_files: dict[str, bytes] | None = None,
             website_change: bool = False, site_id: str = 'default', web_only: bool = False,
-            reality_operation: dict | None = None) -> dict:
+            reality_operation: dict | None = None, hy2_operation: dict | None = None) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
     if store.pending():
         raise OperationError('Recover the interrupted activation before preparing a deployment')
     if (not {'server','subscription','overrides'} <= set(config)
-            or set(config) - {'server','subscription','overrides','website_content','web','reality'}):
+            or set(config) - {'server','subscription','overrides','website_content','web','reality','hy2'}):
         raise OperationError('Deployment contains unknown or missing objects')
     if (type(publish_only) is not bool or type(web_only) is not bool
-            or sum((publish_only,web_only,reality_operation is not None))>1):
+            or sum((publish_only,web_only,reality_operation is not None,hy2_operation is not None))>1):
         raise OperationError('Activation mode selection must be unambiguous')
     original = config
     config = sync_default(config)
@@ -300,6 +360,8 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             raise OperationError('Publication-only activation cannot change website content')
     if reality_operation is not None:
         _reality_transition(config,previous,reality_operation)
+    elif hy2_operation is not None:
+        _hy2_transition(config,previous,hy2_operation)
     elif web_only:
         _web_server(config,previous)
     elif not publish_only:
@@ -309,11 +371,12 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
     if reality_operation is not None:
         reality.probe_targets(_reality_scope(config,'primary'))
     bindings = _certificate_bindings(config)
+    resource = hy2.normalize_hy2(config)
     if 'reality' in config:
         primary = next(entry for entry in reality.public_resources(config)['endpoints'] if entry['primary'])
-        generated = client_config(server,config['overrides'],primary['sni'])
+        generated = client_config(server,config['overrides'],primary['sni'],hy2.client_node(config)) if resource and resource['enabled'] else client_config(server,config['overrides'],primary['sni'])
     else:
-        generated = client_config(server,config['overrides'])
+        generated = client_config(server,config['overrides'],None,hy2.client_node(config)) if resource and resource['enabled'] else client_config(server,config['overrides'])
     revision = secrets.token_hex(16)
     selected = get_site(config['web'],site_id)
     from .site_content import validate_files
@@ -330,6 +393,11 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         singbox = directory/'sing-box.json'
         atomic_write(singbox,canonical(render_sing_box(server)),0o640)
         os.chown(singbox,0,proxy_gid)
+        if resource is not None:
+            path = directory/'hy2.json'
+            atomic_write(path,canonical(_render_hy2(config)),0o640)
+            os.chown(path,0,proxy_gid)
+            run([str(BIN/'sing-box'),'check','-c',str(path)])
         if 'reality' in config:
             for entry in reality.normalize_reality(config)['endpoints']:
                 if entry['id']=='default':
@@ -368,6 +436,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         run([str(BIN/'nginx'),'-e','stderr','-p',str(ROOT/'nginx')+'/','-t','-c',str(directory/'nginx.conf')])
         run([str(BIN/'mihomo'),'-t','-d',str(ROOT/'client-check'),'-f',str(directory/'client.yaml')])
         _check_new_ports(config,previous)
+        _check_hy2_ports(config,previous)
         if 'reality' in config:
             _check_reality_ports(config,previous)
         files = {path.relative_to(directory).as_posix():digest(path.read_bytes())
@@ -380,10 +449,12 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
                    'content_versions':{site['id']:site['content_version'] for site in config['web']['sites']
                                        if site['content_version']},
                    'website_summaries':summaries,
-                   'activation':('reality' if reality_operation is not None else
+                   'activation':('hy2' if hy2_operation is not None else 'reality' if reality_operation is not None else
                                  'publication' if publish_only else 'web' if web_only else 'full')}
         if reality_operation is not None:
             payload['reality_operation'] = reality_operation
+        if hy2_operation is not None:
+            payload['hy2_operation'] = hy2_operation
         if config.get('website_content'):
             payload['content_version'] = config['website_content']
         if 'default' in summaries:
@@ -392,6 +463,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             payload.update(website_change=True,website_id=site_id)
         plan_id = store.plan('deployment',payload,expected_revision=base_revision)
         changes = (['subscription bundle','publisher reload'] if publish_only else
+                   ['HY2 resource and service','subscription publication'] if hy2_operation is not None else
                    ['new or retained REALITY entries','Nginx reload','subscription SNI publication'] if reality_operation is not None else
                    ['website resources','Nginx reload','publisher reload'] if web_only else
                    ['managed websites','REALITY listener','subscription bundle','ProxyHub service activation'])
@@ -407,7 +479,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
 def _activation(payload: dict) -> str:
     """Missing mode identifies a phase-1 full-deployment record."""
     mode = payload.get('activation', 'full')
-    if mode not in ('full', 'publication', 'web', 'reality'):
+    if mode not in ('full', 'publication', 'web', 'reality', 'hy2'):
         raise OperationError('Unsupported activation mode')
     return mode
 
@@ -420,6 +492,8 @@ def _publication_server(server: dict, previous: Path | None, config: dict | None
     if path.is_symlink() or not path.is_file():
         raise OperationError('Active deployment configuration is not a managed file')
     current = json.loads(path.read_text(encoding='utf-8'))
+    if config is not None and hy2.normalize_hy2(config) != hy2.normalize_hy2(current):
+        raise OperationError('Publication-only activation cannot change HY2 resources')
     if validate_spec(server) != validate_spec(current['server']):
         raise OperationError('Publication-only activation cannot change server configuration')
     if config is not None and config.get('website_content') != current.get('website_content'):
@@ -462,10 +536,11 @@ def _reality_units(config: dict) -> dict[str,str]:
 
 
 def _core_units(config: dict) -> tuple[str,...]:
+    additional = ('proxyhub-hy2.service',) if _hy2_enabled(config) else ()
     if 'reality' not in config:
-        return _units()
+        return (*_units(),*additional)
     entries = _reality_units(config)
-    return (*entries.values(),*(unit for unit in _units() if unit!='proxyhub-proxy.service'))
+    return (*entries.values(),*(unit for unit in _units() if unit!='proxyhub-proxy.service'),*additional)
 
 
 def _managed_revision(path: str | Path) -> Path:
@@ -533,6 +608,8 @@ def _check_runtime_permissions(directory: Path) -> None:
     extra = list((directory/'reality').glob('*.json')) if 'reality' in config else []
     if extra:
         parents.append(directory/'reality')
+    if hy2.normalize_hy2(config) is not None:
+        extra.append(directory/'hy2.json')
     for path in (ROOT, ROOT/'revisions', directory, *parents, *trees,
                  *(path for tree in trees for path in tree.rglob('*') if path.is_dir())):
         info = path.lstat()
@@ -610,11 +687,133 @@ def _check_reality_ports(config: dict, previous: Path | None) -> None:
                 raise OperationError(f'New REALITY TCP port {port} is unavailable; no service was replaced') from None
 
 
+def _hy2_enabled(config: dict) -> bool:
+    resource = hy2.normalize_hy2(config)
+    return resource is not None and resource['enabled']
+
+
+def _check_hy2_ports(config: dict, previous: Path | None) -> None:
+    if not _hy2_enabled(config):
+        return
+    resource = hy2.normalize_hy2(config)
+    old = json.loads((previous/'config.json').read_text(encoding='utf-8')) if previous else {}
+    if _hy2_enabled(old) and hy2.normalize_hy2(old)['port']==resource['port']:
+        return
+    try:
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as checked:
+            checked.bind(('0.0.0.0',resource['port']))
+    except OSError:
+        raise OperationError('HY2 UDP port is unavailable; no service was replaced') from None
+
+
+def _hy2_changed(config: dict, old: dict) -> bool:
+    return (_hy2_enabled(config)!=_hy2_enabled(old)
+            or (_hy2_enabled(config) and hy2.render_hy2(config)!=hy2.render_hy2(old)))
+
+
+def _sync_hy2(config: dict, old: dict, *, restore: bool = False) -> bool:
+    changed = restore or _hy2_changed(config,old)
+    if not changed:
+        return False
+    unit = 'proxyhub-hy2.service'
+    if _hy2_enabled(config):
+        run(['systemctl','restart' if restore or _hy2_enabled(old) else 'start',unit])
+        run(['systemctl','enable',unit])
+    else:
+        run(['systemctl','stop',unit])
+        run(['systemctl','disable',unit])
+    return True
+
+
+def _hy2_probe(config: dict, fingerprint: str | None = None) -> None:
+    resource = hy2.normalize_hy2(config)
+    with socket.socket() as available:
+        available.bind(('127.0.0.1',0))
+        port = available.getsockname()[1]
+    with tempfile.TemporaryDirectory(prefix='.hy2-health-',dir=ROOT) as temp:
+        path = Path(temp)/'client.json'
+        client = {'mixed-port':port,'allow-lan':False,'bind-address':'127.0.0.1',
+                  'mode':'rule','log-level':'silent',
+                  'proxies':[{'name':'HY2-HEALTH','type':'hysteria2','server':'127.0.0.1',
+                              'port':resource['port'],'password':resource['password'],
+                              'sni':resource['server_name'],'skip-cert-verify':False}],
+                  'rules':['MATCH,HY2-HEALTH']}
+        if fingerprint is not None:
+            client['proxies'][0]['fingerprint'] = fingerprint
+        atomic_write(path,canonical(client))
+        process = subprocess.Popen([str(BIN/'mihomo'),'-d',temp,'-f',str(path)],
+                                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            for attempt in range(30):
+                if process.poll() is not None:
+                    raise OperationError('HY2 verification client could not start')
+                try:
+                    stream = socket.create_connection(('127.0.0.1',port),timeout=.2)
+                    break
+                except OSError:
+                    if attempt==29:
+                        raise OperationError('HY2 verification client is unavailable') from None
+                    time.sleep(.1)
+            with stream:
+                stream.settimeout(5)
+                target = config['server']['publisher_port']
+                stream.sendall(f'GET http://127.0.0.1:{target}/__hy2_health__ HTTP/1.1\r\nHost: 127.0.0.1:{target}\r\nConnection: close\r\n\r\n'.encode())
+                response = http.client.HTTPResponse(stream)
+                try:
+                    response.begin()
+                    if response.status!=404:
+                        raise OperationError('HY2 authenticated QUIC or selected certificate check failed')
+                finally:
+                    response.close()
+        except (OSError,http.client.HTTPException):
+            raise OperationError('HY2 authenticated QUIC or selected certificate check failed') from None
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _hy2_health(config: dict, directory: Path) -> None:
+    if not _hy2_enabled(config):
+        return
+    # Mihomo's leaf pin replaces PKI verification. Require a separate ordinary
+    # trust/name probe as well as the exact selected leaf, never treat a pin as PKI.
+    resource = hy2.normalize_hy2(config)
+    fingerprint = _certificate_bindings(config)[resource['certificate_id']]['sha256']
+    _hy2_probe(config)
+    _hy2_probe(config,fingerprint)
+
+
+def _wait_hy2_health(config: dict, directory: Path) -> None:
+    for attempt in range(3):
+        try:
+            _hy2_health(config,directory)
+            return
+        except OperationError:
+            if attempt==2:
+                raise
+            time.sleep(.2)
+
+
 def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
-             reality_operation: dict | None = None) -> None:
+             reality_operation: dict | None = None, hy2_operation: dict | None = None) -> None:
     current = _current_revision()
     if current not in (None, previous, candidate):
         raise OperationError('Refusing to overwrite an unexpected current revision')
+    if activation == 'hy2':
+        config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+        _hy2_transition(config,previous,hy2_operation)
+        restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        _link(previous)
+        _publish(previous)
+        _sync_hy2(restored,config,restore=True)
+        _wait_hy2_health(restored,previous)
+        run(['systemctl','reload','proxyhub-publisher.service'])
+        _wait_publication(previous)
+        return
     if activation == 'publication':
         # Re-check this invariant during crash recovery as well as normal apply.
         # A publication rollback must never mask a server configuration change.
@@ -631,11 +830,14 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
         restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
         _link(previous)
         _publish(previous)
+        changed_hy2 = _sync_hy2(restored,config)
         run(['systemctl','reload','proxyhub-nginx.service'])
         run(['systemctl','reload','proxyhub-publisher.service'])
         _wait_web_health(restored,previous)
         if 'reality' in restored:
             _wait_local_reality_health(restored,previous)
+        if changed_hy2:
+            _wait_hy2_health(restored,previous)
         _wait_publication(previous)
         return
     if activation == 'reality':
@@ -675,6 +877,7 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
             _wait_web_health(config,previous)
         if 'reality' in config:
             _wait_local_reality_health(config,previous)
+        _wait_hy2_health(config,previous)
     else:
         # Every service is attempted even if one stop fails. The journal is left
         # pending when any action fails, so a later recover can safely retry.
@@ -723,9 +926,10 @@ def recover(store: StateStore) -> dict:
         if candidate.name != record['payload']['revision']:
             raise OperationError('Recovery candidate differs from its plan')
         previous = _managed_revision(details['previous']) if details['previous'] else None
-        if activation=='reality':
+        if activation in ('reality','hy2'):
             _verify_candidate(candidate,record['payload'])
-            _restore(previous,candidate,activation,record['payload'].get('reality_operation'))
+            _restore(previous,candidate,activation,record['payload'].get('reality_operation'),
+                     record['payload'].get('hy2_operation'))
         else:
             _restore(previous, candidate, activation)
         store.abort(item['plan_id'], {'recovered': True, 'previous_available': previous is not None})
@@ -932,6 +1136,8 @@ def apply(store: StateStore, identity: str) -> dict:
             _publication_server(server, previous, config)
         elif activation == 'reality':
             _reality_transition(config,previous,payload.get('reality_operation'))
+        elif activation == 'hy2':
+            _hy2_transition(config,previous,payload.get('hy2_operation'))
         elif activation == 'web':
             _web_server(config,previous)
         else:
@@ -941,6 +1147,7 @@ def apply(store: StateStore, identity: str) -> dict:
             if activation != 'publication':
                 _check_new_domains(config,previous)
         _check_runtime_permissions(directory)
+        _check_hy2_ports(config,previous)
         if 'reality' in config:
             _check_reality_ports(config,previous)
         if activation=='reality':
@@ -955,12 +1162,22 @@ def apply(store: StateStore, identity: str) -> dict:
             if activation == 'publication':
                 run(['systemctl', 'reload', 'proxyhub-publisher.service'])
                 _wait_publication(directory)
+            elif activation == 'hy2':
+                old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+                _sync_hy2(config,old)
+                _wait_hy2_health(config,directory)
+                run(['systemctl','reload','proxyhub-publisher.service'])
+                _wait_publication(directory)
             elif activation == 'web':
+                old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+                changed_hy2 = _sync_hy2(config,old)
                 run(['systemctl','reload','proxyhub-nginx.service'])
                 run(['systemctl','reload','proxyhub-publisher.service'])
                 _wait_web_health(config,directory)
                 if 'reality' in config:
                     _wait_local_reality_health(config,directory)
+                if changed_hy2:
+                    _wait_hy2_health(config,directory)
                 _wait_publication(directory)
             elif activation == 'reality':
                 old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
@@ -991,14 +1208,15 @@ def apply(store: StateStore, identity: str) -> dict:
                     _website_health(server, directory)
                 if 'reality' in config:
                     _wait_local_reality_health(config,directory)
+                _wait_hy2_health(config,directory)
                 run(['systemctl','enable',*_core_units(config)])
             store.commit(identity)
         except Exception:
             # A successful database COMMIT is the boundary. Never undo it if a
             # later Python exception occurs; recovery sees no pending activation.
             if store.inspect(identity)['status'] != 'applied':
-                if activation=='reality':
-                    _restore(previous,directory,activation,payload.get('reality_operation'))
+                if activation in ('reality','hy2'):
+                    _restore(previous,directory,activation,payload.get('reality_operation'),payload.get('hy2_operation'))
                 else:
                     _restore(previous, directory, activation)
                 store.abort(identity, {'previous_available': previous is not None})

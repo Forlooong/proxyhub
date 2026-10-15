@@ -25,6 +25,10 @@ export type RealityEndpoint = {
   id: string; listener_id: string; listen_port: number; target_id: string; sni: string; primary: boolean;
   target_type: 'site' | 'external'; site_id: string | null; address: string; port: number;
 };
+export type Hy2Node = {
+  id: string; listener_id: string; enabled: boolean; name: string; port: number;
+  server_name: string; certificate_id: string;
+};
 export type Overview = {
   revision: number;
   server: {hostname: string; os: string; architecture: string; memory_total_bytes: number | null; accounts: string[]; ssh_context: SSHContext};
@@ -34,6 +38,7 @@ export type Overview = {
   certificates: Certificate[];
   proxy: {id: string; name: string; protocol: string; public_address: string; port: number; sni: string; target: string; verification: string};
   reality: {node_id: string; primary_endpoint_id: string; endpoints: RealityEndpoint[]};
+  hy2: {node: Hy2Node | null};
   subscription: {id: string; name: string; domain: string; update_interval_hours: number; userinfo: Record<string, number>; reset_day: number | null; reset_at: number | null; overrides: JsonObject; traffic_source: string};
   services: {name: string; status: string}[];
   capabilities: {name: string; available: boolean; reason: string}[];

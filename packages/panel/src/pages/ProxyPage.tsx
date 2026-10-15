@@ -61,5 +61,42 @@ export function ProxyPage({data, prepare, busy}: FormProps) {
         <div className="form-actions"><button className="button primary" disabled={busy || (targetType === 'site' ? !site || !selectedSni : !externalAddress || !externalSni)}>验证并预览迁移</button></div>
       </form>
     </Section>
+    <Hy2Section key={JSON.stringify(data.hy2.node)} data={data} prepare={prepare} busy={busy} />
   </>;
+}
+
+function Hy2Section({data, prepare, busy}: Pick<FormProps, 'data' | 'prepare' | 'busy'>) {
+  const node = data.hy2.node;
+  const [name, setName] = useState(node?.name ?? 'ProxyHub HY2');
+  const [port, setPort] = useState(String(node?.port ?? 443));
+  const [serverName, setServerName] = useState(node?.server_name ?? data.website.domain);
+  const [certificateId, setCertificateId] = useState(node?.certificate_id ?? '');
+  const binding = data.certificates.find(item => item.id === certificateId);
+  const changed = !node || name !== node.name || Number(port) !== node.port || serverName !== node.server_name || certificateId !== node.certificate_id;
+  const service = data.services.find(item => item.name === 'proxyhub-hy2');
+  return <Section title="HY2 节点" description="使用独立 UDP 监听和证书，与 REALITY、网站共用现有订阅。">
+    {node ? <>
+      <Details rows={[
+        ['节点编号', <code>{node.id}</code>], ['发布状态', node.enabled ? '已启用，加入订阅' : '已停用，不加入订阅'],
+        ['服务状态', <Status value={service?.status ?? 'unknown'} />],
+        ['连接地址', <code>{data.proxy.public_address}:{node.port} / UDP</code>],
+        ['TLS 服务名', <code>{node.server_name}</code>], ['绑定证书', <code>{node.certificate_id}</code>],
+        ['验证记录', '请使用客户端完成真实代理请求；服务运行不等于连接通过'],
+      ]} />
+      <div className="form-actions"><button className="button secondary" disabled={busy} onClick={() => void prepare(node.enabled ? 'hy2.disable' : 'hy2.enable', {})}>{node.enabled ? '预览停用 HY2' : '预览启用 HY2'}</button></div>
+    </> : <Notice>当前尚未创建 HY2 节点。创建时自动生成独立认证密码，普通资源和变更预览不显示密码。</Notice>}
+    <form className="form-stack separated" onSubmit={event => {
+      event.preventDefault();
+      void prepare(node ? 'hy2.update' : 'hy2.create', {name, port: Number(port), server_name: serverName, certificate_id: certificateId});
+    }}>
+      <h3>{node ? '更新 HY2 配置' : '创建 HY2 节点'}</h3>
+      <Field label="HY2 节点名称"><input value={name} required maxLength={120} disabled={busy} onChange={event => setName(event.target.value)} /></Field>
+      <Field label="UDP 监听端口" hint="默认 UDP 443；同端口的 TCP 网站与 REALITY 服务保持不变。"><input type="number" min={1} max={65535} step={1} value={port} required disabled={busy} onChange={event => setPort(event.target.value)} /></Field>
+      <Field label="TLS 服务名" hint="填写绑定证书覆盖的域名。客户端连接地址沿用上方公网连接地址。"><input className="code-input" value={serverName} required maxLength={253} disabled={busy} onChange={event => setServerName(event.target.value)} /></Field>
+      <Field label="HY2 绑定证书" hint="引用受管证书；证书替换和续期将同时更新引用它的服务。"><select required value={certificateId} disabled={busy} onChange={event => setCertificateId(event.target.value)}><option value="">选择证书</option>{data.certificates.map(item => <option key={item.id} value={item.id} disabled={item.status !== 'valid'}>{item.name} · {item.id}{item.status !== 'valid' ? ' · 校验失败' : ''}</option>)}</select></Field>
+      {binding && <p className="muted">证书覆盖：{binding.domains.join('、')}。HY2 停用后仍保留证书绑定。</p>}
+      <Notice>应用只调整独立 HY2 服务和订阅，REALITY 核心不重启。UDP 端口需能从客户端访问；更新或停用会中断 HY2 连接。应用后刷新订阅并完成真实代理请求。</Notice>
+      <div className="form-actions"><button className="button primary" disabled={busy || !changed || !certificateId}>{node ? '验证并预览 HY2 更新' : '验证并预览创建 HY2'}</button></div>
+    </form>
+  </Section>;
 }

@@ -84,7 +84,7 @@ def parser() -> argparse.ArgumentParser:
     for action in ('renew', 'delete'):
         command = certificate.add_parser(action, help='Prepare certificate '+action)
         command.add_argument('--certificate-id', required=True)
-    proxy = modules.add_parser('proxy', help='Proxy nodes and REALITY entry migration').add_subparsers(dest='operation')
+    proxy = modules.add_parser('proxy', help='Proxy nodes, REALITY entry migration and HY2').add_subparsers(dest='operation')
     reality = proxy.add_parser('reality', help='Manage REALITY targets while retaining existing entries').add_subparsers(dest='action')
     reality.add_parser('list', help='List primary and retained REALITY entries')
     migrate = reality.add_parser('migrate', help='Prepare a new REALITY entry and retain the old one')
@@ -95,6 +95,16 @@ def parser() -> argparse.ArgumentParser:
     for action in ('select', 'retire'):
         command = reality.add_parser(action, help='Prepare '+action+' of a retained REALITY entry')
         command.add_argument('--endpoint-id', required=True)
+    hy2 = proxy.add_parser('hy2', help='Manage the independent UDP HY2 node').add_subparsers(dest='action')
+    hy2.add_parser('list', help='List the HY2 node without credentials')
+    for action in ('create', 'update'):
+        command = hy2.add_parser(action, help='Prepare HY2 '+action+'; apply the returned plan explicitly')
+        command.add_argument('--name')
+        command.add_argument('--port', type=int, help='UDP port; create defaults to 443')
+        command.add_argument('--server-name', required=action == 'create')
+        command.add_argument('--certificate-id', required=action == 'create')
+    for action in ('enable', 'disable'):
+        hy2.add_parser(action, help='Prepare HY2 '+action)
     deploy = modules.add_parser('deployment', help='Single-node generation, validation, activation and recovery').add_subparsers(dest='operation')
     init = deploy.add_parser('init', help='Write a private initial config with fresh node and link credentials')
     for field in ('site-domain', 'subscription-domain', 'public-address', 'certificate', 'key'):
@@ -187,6 +197,12 @@ def execute(args) -> dict:
         from .management import OperationService
         service = OperationService(synchronous=True)
         try:
+            if args.operation == 'hy2':
+                if args.action == 'list':
+                    return service.handle('hy2.resources', {})
+                fields = ('name', 'port', 'server_name', 'certificate_id')
+                values = {field:getattr(args,field) for field in fields if getattr(args,field,None) is not None}
+                return _site_plan(service, 'hy2.' + args.action, values)
             if args.action == 'list':
                 return service.handle('reality.resources', {})
             if args.action == 'migrate':

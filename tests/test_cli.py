@@ -157,6 +157,45 @@ def test_reality_failure_closes_service_and_redacts_details(content_service, cap
     assert content_service.closed
 
 
+@pytest.mark.parametrize('arguments', [
+    ['proxy','hy2'], ['help','proxy','hy2'], ['help','proxy','hy2','list'],
+    ['help','proxy','hy2','create'], ['help','proxy','hy2','update'],
+    ['help','proxy','hy2','enable'], ['help','proxy','hy2','disable'],
+])
+def test_hy2_help_does_not_require_root_or_state(arguments, capsys, monkeypatch):
+    monkeypatch.setattr('proxyhub.cli.require_root', lambda: pytest.fail('help must not require root'))
+    assert main(arguments) == 0
+    assert 'usage:' in capsys.readouterr().out
+
+
+def test_hy2_list_uses_read_operation(content_service, capsys):
+    import json
+    content_service.result = {'revision':7,'node':None}
+    assert main(['proxy','hy2','list']) == 0
+    assert json.loads(capsys.readouterr().out) == content_service.result
+    assert content_service.calls == [('hy2.resources', {})] and content_service.closed
+
+
+@pytest.mark.parametrize(('arguments', 'values'), [
+    (['create','--server-name','site.example.test','--certificate-id','default'], {'server_name':'site.example.test','certificate_id':'default'}),
+    (['update','--name','Second HY2','--port','5443'], {'name':'Second HY2','port':5443}),
+    (['enable'], {}), (['disable'], {}),
+])
+def test_hy2_changes_prepare_without_applying(arguments, values, content_service, capsys):
+    assert main(['proxy','hy2',*arguments]) == 0
+    assert content_service.calls == [('hy2.'+arguments[0],7,values)] and content_service.closed
+
+
+def test_hy2_failure_closes_service_and_redacts_details(content_service, capsys):
+    def failed(*args):
+        raise OSError('HY2-PRIVATE-PASSWORD')
+    content_service.create_plan = failed
+    assert main(['proxy','hy2','disable']) == 1
+    captured = capsys.readouterr()
+    assert 'HY2-PRIVATE-PASSWORD' not in captured.out + captured.err
+    assert content_service.closed
+
+
 def test_content_upload_prepares_with_current_revision(tmp_path, content_service, capsys):
     import base64
     import json

@@ -176,6 +176,21 @@ def test_unreferenced_default_has_no_false_reality_dependency(configured):
     assert site_dependencies(web, server, 'default', domain='alias.example.test') == []
 
 
+@pytest.mark.parametrize('enabled', [True, False])
+def test_hy2_depends_on_certificate_without_a_website_binding(configured, enabled):
+    web, server = configured['web'], configured['server']
+    get_site(web, SITE).update(enabled=False, domains=[], certificate_id=None)
+    hy2 = {'id': 'local-hy2', 'listener_id': 'hy2-default', 'enabled': enabled,
+           'name': 'HY2 node', 'port': 443, 'server_name': 'future.example.test',
+           'certificate_id': CERTIFICATE, 'password': 'not-public'}
+    assert consumers(web, server, CERTIFICATE, hy2=hy2) == [{
+        'kind': 'hy2', 'id': 'local-hy2', 'label': 'HY2 node HY2',
+        'domain': 'future.example.test', 'port': 443, 'enabled': enabled,
+    }]
+    assert all(item['kind'] != 'hy2' for item in consumers(web, server, 'default', hy2=hy2))
+    assert site_dependencies(web, server, SITE) == []
+
+
 def test_resource_ids_do_not_depend_on_domain_or_certificate_material(configured):
     original = deepcopy(configured)
     second = get_site(configured['web'], SITE)

@@ -1,7 +1,7 @@
 # Minimal subscription converter
 
 This independently implemented worker supports one VLESS REALITY TCP/Vision
-node. It does not import external subscriptions, fetch rules, or provide a
+node and an optional managed Hysteria2 node. It does not import external subscriptions, fetch rules, or provide a
 second configuration generator.
 
 Build with Node 24:
@@ -13,8 +13,10 @@ node packages/converter/dist/worker.js < input.json > output.json
 ```
 
 The worker reads one UTF-8 JSON document, at most 64 KiB, from stdin. Successful
-stdout is one JSON document containing `yaml`, `raw`, and `uri`. `raw` is standard
-Base64 of the URI plus a newline. Invalid, unknown, duplicate, or unsupported
+stdout is one JSON document containing `yaml`, `raw`, `uri`, and `uris`. `uri`
+remains the REALITY URI for existing callers. `uris` contains REALITY first,
+then Hysteria2 when supplied; `raw` is standard Base64 of those URI lines,
+each ending with a newline. Invalid, unknown, duplicate, or unsupported
 input fields cause a nonzero exit and a fixed error message on stderr. The
 worker performs no file writes or network requests.
 
@@ -57,6 +59,18 @@ on an already-established proxy to bootstrap node DNS.
 is an even-length hexadecimal string of 0–16 characters. The private REALITY
 key never enters the converter. Unicode node names are supported; reserved
 group/builtin names and commas are rejected.
+
+An optional top-level `hy2` object has exactly `id`, `name`, `server`, `port`,
+`password`, and `server_name`. Its stable ID is `local-hy2`, name must differ
+from the REALITY name, password must be 32–128 URL-safe ASCII characters,
+and SNI must be a non-local DNS name. The generated Mihomo node uses
+`type: hysteria2`, `password`, `sni`, and `skip-cert-verify: false`; it has no
+bandwidth, obfuscation, insecure TLS, or advanced overrides. Its URI is
+`hysteria2://<password>@<server>:<port>/?sni=<name>#<label>` with encoded
+credentials and label, and bracketed IPv6 authority when needed. The `PROXY`
+select group retains REALITY as its first default choice. A disabled managed
+resource is omitted by Python before invoking the worker; explicit `hy2: null`
+is rejected.
 
 The Python publication contract is documented in `proxyhub.publication`.
 The publisher accepts only generated bundles and serves exact host/path pairs:

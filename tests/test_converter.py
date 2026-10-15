@@ -116,6 +116,49 @@ def test_ipv6_uri_has_bracketed_authority(input_document):
     assert parse_yaml(output["yaml"])["proxies"][0]["server"] == "2001:db8::1"
 
 
+def add_hy2(document):
+    document['hy2'] = {
+        'id': 'local-hy2', 'name': '测试 HY2 & two', 'server': '2001:db8::2', 'port': 443,
+        'password': 'test-only-hy2-password-' + 'a' * 21, 'server_name': 'hy2.example.test'}
+    return document
+
+
+def test_hy2_and_reality_share_snapshot_with_reality_selected_first(input_document):
+    output = json.loads(run_worker(add_hy2(input_document)).stdout)
+    config = parse_yaml(output['yaml'])
+    node = input_document['hy2']
+    assert config['proxies'][1] == {
+        'name': node['name'], 'type': 'hysteria2', 'server': node['server'], 'port': 443,
+        'password': node['password'], 'sni': node['server_name'], 'skip-cert-verify': False}
+    assert config['proxy-groups'][0]['proxies'] == [input_document['node']['name'], node['name']]
+    assert output['uris'][0] == output['uri']
+    assert base64.b64decode(output['raw']).decode().splitlines() == output['uris']
+    uri = urlsplit(output['uris'][1])
+    assert uri.scheme == 'hysteria2' and uri.hostname == node['server'] and uri.port == 443
+    assert unquote(uri.username) == node['password'] and unquote(uri.fragment) == node['name']
+    assert parse_qs(uri.query) == {'sni': [node['server_name']]}
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('id', 'other'), ('name', 'PROXY'), ('name', '测试节点 & one'), ('port', True),
+    ('password', 'secret-input-marker'), ('password', 'a' * 31 + ':'),
+    ('server_name', 'bad.test\r\ninjection'), ('server_name', '127.0.0.1'),
+    ('server_name', 'localhost'), ('skip-cert-verify', True), ('obfs', 'salamander'),
+])
+def test_invalid_hy2_fields_fail_without_echoing_credentials(input_document, field, value):
+    add_hy2(input_document)['hy2'][field] = value
+    process = run_worker(input_document)
+    assert process.returncode != 0 and process.stdout == ''
+    assert process.stderr == 'converter: invalid or unsupported input\n'
+
+
+def test_hy2_requires_an_object_and_all_credential_fields(input_document):
+    for value in (None, {}, {'id': 'local-hy2'}):
+        input_document['hy2'] = value
+        process = run_worker(input_document)
+        assert process.returncode != 0 and process.stdout == ''
+
+
 def test_input_size_limit():
     process = subprocess.run([NODE, str(WORKER)], input=" " * (64 * 1024 + 1), capture_output=True, text=True, cwd=ROOT, timeout=10)
     assert process.returncode != 0 and process.stdout == ""
@@ -129,12 +172,16 @@ def test_malformed_or_duplicate_json_is_rejected(text):
     assert process.stderr == "converter: invalid or unsupported input\n"
 
 
-def test_pinned_mihomo_accepts_generated_config(input_document, tmp_path):
+@pytest.mark.parametrize('with_hy2', [False, True])
+def test_pinned_mihomo_accepts_generated_config(input_document, tmp_path, with_hy2):
     configured = os.environ.get("MIHOMO_BIN")
     binary = Path(configured) if configured else ROOT / ".cache/runtime/windows-amd64/mihomo.exe"
     if not binary.is_file():
         pytest.skip("Optional pinned Mihomo binary is not installed; set MIHOMO_BIN")
-    output = json.loads(run_worker(copy.deepcopy(input_document)).stdout)
+    document = copy.deepcopy(input_document)
+    if with_hy2:
+        add_hy2(document)
+    output = json.loads(run_worker(document).stdout)
     config = tmp_path / "mihomo.yaml"
     config.write_text(output["yaml"], encoding="utf-8")
     process = subprocess.run([str(binary), "-t", "-d", str(tmp_path), "-f", str(config)], capture_output=True, timeout=30)

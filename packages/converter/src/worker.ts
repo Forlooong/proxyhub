@@ -45,9 +45,9 @@ function hostname(value: unknown, ipAllowed: boolean): string {
   return host;
 }
 
-function compose(input: unknown): { yaml: string; raw: string; uri: string } {
+function compose(input: unknown): { yaml: string; raw: string; uri: string; uris: string[] } {
   const source = record(input);
-  keys(source, ["node", "overrides"], ["node"]);
+  keys(source, ["node", "hy2", "overrides"], ["node"]);
   const node = record(source.node);
   keys(node, ["id", "name", "server", "port", "uuid", "server_name", "public_key", "short_id"]);
   const id = string(node.id, 64);
@@ -70,6 +70,29 @@ function compose(input: unknown): { yaml: string; raw: string; uri: string } {
   }
   if (typeof node.short_id !== "string" || !/^(?:[0-9a-f]{2}){0,8}$/iu.test(node.short_id)) {
     throw new InputError("Invalid REALITY short identifier");
+  }
+  let hy2: RecordValue | undefined;
+  if (Object.hasOwn(source, "hy2")) {
+    const inputHy2 = record(source.hy2);
+    keys(inputHy2, ["id", "name", "server", "port", "password", "server_name"]);
+    if (inputHy2.id !== "local-hy2") throw new InputError("Invalid HY2 node identifier");
+    const hy2Name = string(inputHy2.name, 120);
+    if ([name, "PROXY", "DIRECT", "REJECT", "GLOBAL", "PASS", "REJECT-DROP", "COMPATIBLE"].includes(hy2Name) || hy2Name.includes(",")) {
+      throw new InputError("Reserved or duplicate HY2 node name");
+    }
+    const password = string(inputHy2.password, 128);
+    if (!/^[A-Za-z0-9_-]{32,128}$/u.test(password)) throw new InputError("Invalid HY2 credential");
+    const hy2Sni = hostname(inputHy2.server_name, false);
+    const labels = hy2Sni.toLowerCase().split(".");
+    const suffix = labels[labels.length - 1] as string;
+    if (labels.length < 2 || !/[a-z]/u.test(suffix) || ["local", "localhost"].includes(suffix)) {
+      throw new InputError("Invalid HY2 server name");
+    }
+    hy2 = {
+      name: hy2Name, type: "hysteria2", server: hostname(inputHy2.server, true),
+      port: integer(inputHy2.port, 1, 65535), password,
+      sni: hy2Sni, "skip-cert-verify": false,
+    };
   }
   const overrides = source.overrides === undefined ? {} : record(source.overrides);
   keys(overrides, ["mixed-port", "log-level", "mode", "ipv6", "allow-lan"], []);
@@ -107,8 +130,8 @@ function compose(input: unknown): { yaml: string; raw: string; uri: string } {
       tls: true, servername: serverName, flow: "xtls-rprx-vision",
       "client-fingerprint": "chrome", "packet-encoding": "xudp",
       "reality-opts": { "public-key": publicKey, "short-id": node.short_id },
-    }],
-    "proxy-groups": [{ name: "PROXY", type: "select", proxies: [name] }],
+    }, ...(hy2 === undefined ? [] : [hy2])],
+    "proxy-groups": [{ name: "PROXY", type: "select", proxies: [name, ...(hy2 === undefined ? [] : [hy2.name])] }],
     rules: ["MATCH,PROXY"],
   };
   const parameters: Record<string, string> = {
@@ -119,7 +142,13 @@ function compose(input: unknown): { yaml: string; raw: string; uri: string } {
   const query = Object.entries(parameters).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("&");
   const authority = isIP(server) === 6 ? `[${server}]` : server;
   const uri = `vless://${encodeURIComponent(uuid)}@${authority}:${port}?${query}#${encodeURIComponent(name)}`;
-  return { yaml: stringify(config), raw: Buffer.from(`${uri}\n`, "utf8").toString("base64"), uri };
+  const uris = [uri];
+  if (hy2 !== undefined) {
+    const hy2Server = hy2.server as string;
+    const hy2Authority = isIP(hy2Server) === 6 ? `[${hy2Server}]` : hy2Server;
+    uris.push(`hysteria2://${encodeURIComponent(hy2.password as string)}@${hy2Authority}:${hy2.port}/?sni=${encodeURIComponent(hy2.sni as string)}#${encodeURIComponent(hy2.name as string)}`);
+  }
+  return { yaml: stringify(config), raw: Buffer.from(`${uris.join("\n")}\n`, "utf8").toString("base64"), uri, uris };
 }
 
 async function main(): Promise<void> {

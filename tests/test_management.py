@@ -138,6 +138,45 @@ def test_overview_reports_selected_sni_without_rewriting_original_website(enviro
     assert_private_fields_absent(result,config)
 
 
+@pytest.mark.parametrize('kind', ['hy2.create','hy2.update','hy2.enable','hy2.disable'])
+def test_hy2_operations_prepare_restricted_plans_without_passwords(environment,kind):
+    from proxyhub import hy2
+    env = environment
+    config = deepcopy(env.config)
+    values = {'server_name':'site.example.test','certificate_id':'default'}
+    if kind != 'hy2.create':
+        config = hy2.change(config,'hy2.create',values)
+        if kind == 'hy2.enable':
+            config = hy2.change(config,'hy2.disable',{})
+        values = {'name':'Updated HY2'} if kind == 'hy2.update' else {}
+    (env.directory/'config.json').write_bytes(canonical(config))
+    job = finish_job(env.service,'plan.create',{'kind':kind,'base_revision':0,'values':values})
+    assert job['status'] == 'succeeded'
+    candidate, options = env.prepared[0]
+    assert options == {'expected_revision':0,'hy2_operation':{'kind':kind.split('.')[1]}}
+    assert all(candidate[key] == config[key] for key in ('server','subscription','overrides'))
+    password = candidate['hy2']['password']
+    assert password not in json.dumps(job) and 'password' not in json.dumps(job)
+    assert_private_fields_absent(job,config)
+    resources = env.service.handle('hy2.resources',{})
+    assert resources['revision'] == 0
+    assert 'password' not in json.dumps(resources) and password not in json.dumps(resources)
+
+
+def test_hy2_overview_reports_binding_and_actual_service_state(environment):
+    from proxyhub import hy2
+    env = environment
+    config = hy2.change(env.config,'hy2.create',{'server_name':'site.example.test','certificate_id':'default'})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    result = env.service.handle('overview',{})
+    assert result['hy2']['node']['id'] == 'local-hy2'
+    assert {'name':'proxyhub-hy2','status':'active'} in result['services']
+    assert any(item['kind'] == 'hy2' for item in result['certificates'][0]['consumers'])
+    assert result['proxy']['id'] == 'local-reality'
+    assert config['hy2']['password'] not in json.dumps(result) and 'password' not in json.dumps(result)
+    assert_private_fields_absent(result,config)
+
+
 def test_website_upload_and_restore_share_existing_plan_contract(environment,monkeypatch):
     import base64
     import io

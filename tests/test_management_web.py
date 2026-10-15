@@ -145,6 +145,20 @@ def test_certificate_delete_reports_disabled_website_subscription_and_reality_co
     assert [certificate['id'] for certificate in removed['web']['certificates']] == ['default']
 
 
+@pytest.mark.parametrize('enabled', [True, False])
+def test_hy2_blocks_certificate_deletion_after_website_removal(configured, tmp_path, enabled):
+    configured['hy2'] = {'id': 'local-hy2', 'listener_id': 'hy2-default', 'enabled': enabled,
+                         'name': 'Independent node', 'port': 443, 'server_name': 'alias.example.test',
+                         'certificate_id': CERTIFICATE, 'password': 'not-public'}
+    disabled = change(configured, 'website.disable', {'site_id': SITE}, tmp_path)['config']
+    removed = change(disabled, 'website.delete', {'site_id': SITE}, tmp_path)['config']
+    with pytest.raises(ManagementError, match='Independent node HY2') as caught:
+        change(removed, 'certificate.delete', {'certificate_id': CERTIFICATE}, tmp_path)
+    assert caught.value.code == 'DEPENDENCY'
+    assert 'not-public' not in str(caught.value)
+    assert removed['hy2'] == configured['hy2']
+
+
 def test_binding_checks_actual_certificate_even_on_disabled_empty_site(configured, tmp_path, monkeypatch):
     site = get_site(configured['web'], SITE)
     site.update(enabled=False, domains=[])
