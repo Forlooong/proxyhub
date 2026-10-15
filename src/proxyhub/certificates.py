@@ -22,18 +22,44 @@ _MAX_PEM_BYTES = 1024 * 1024
 _PEM = re.compile(
     br'-----BEGIN ([A-Z ]+)-----\r?\n([A-Za-z0-9+/=\r\n]+)-----END \1-----'
 )
+_LINEAGE = re.compile(r'(?:proxyhub|proxyhub-[0-9a-f]{32})\Z')
+
+
+def acme_source(binding: dict) -> dict | None:
+    """Read renewal ownership for a stable binding, never infer it from a hash."""
+    try:
+        identity = binding['id']
+        lineage = 'proxyhub' if identity == 'default' else 'proxyhub-' + identity
+        if not isinstance(identity, str) or not _LINEAGE.fullmatch(lineage):
+            return None
+        names = binding['domains']
+        if not isinstance(names, list) or not 1 <= len(names) <= 10:
+            return None
+        names = [validate_domain(name) for name in names]
+        if len(set(names)) != len(names):
+            return None
+        marker = Path(binding['certificate_path']).parent/'acme.json'
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 16384:
+            return None
+        source = json.loads(marker.read_text(encoding='utf-8'))
+        domains = source['domains']
+        if not isinstance(domains, list) or not 1 <= len(domains) <= 10:
+            return None
+        normalized = [validate_domain(name) for name in domains]
+        if (source['source'] != 'acme-http-01' or source['lineage'] != lineage
+                or len(set(normalized)) != len(normalized) or set(normalized) != set(names)):
+            return None
+        return {'source': 'acme-http-01', 'lineage': lineage, 'domains': normalized}
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
 
 
 def managed_acme(server: dict) -> bool:
     """Only explicitly issued ProxyHub lineages opt into automatic renewal."""
-    marker = Path(server['certificate_path']).parent/'acme.json'
-    if marker.is_symlink() or not marker.is_file():
-        return False
     try:
-        source = json.loads(marker.read_text(encoding='utf-8'))
-        return (source['source'] == 'acme-http-01' and source['lineage'] == 'proxyhub'
-                and set(source['domains']) == {server['site_domain'],server['subscription_domain']})
-    except (KeyError, TypeError, ValueError):
+        return acme_source({'id': 'default', 'certificate_path': server['certificate_path'],
+                            'domains': [server['site_domain'], server['subscription_domain']]}) is not None
+    except (KeyError, TypeError):
         return False
 
 
@@ -148,7 +174,11 @@ def import_pair(certificate: Path, key: Path, domains: list[str]) -> dict:
             shutil.rmtree(staging)
 
 
-def issue(domains: list[str], *, standalone: bool = True) -> dict:
+def issue(domains: list[str], *, standalone: bool = True, lineage: str = 'proxyhub') -> dict:
+    if not isinstance(lineage, str) or not _LINEAGE.fullmatch(lineage):
+        raise OperationError('Invalid managed ACME lineage')
+    if not isinstance(domains, list):
+        raise OperationError('Provide 1–10 domain names')
     domains = list(dict.fromkeys(validate_domain(domain) for domain in domains))
     if not 1 <= len(domains) <= 10:
         raise OperationError('Provide 1–10 domain names')
@@ -166,17 +196,27 @@ def issue(domains: list[str], *, standalone: bool = True) -> dict:
         (acme/name).mkdir(parents=True, mode=0o700, exist_ok=True)
     arguments = ['certbot', 'certonly', '--non-interactive', '--agree-tos',
                  '--register-unsafely-without-email', '--preferred-challenges', 'http',
-                 '--cert-name', 'proxyhub', '--config-dir', str(acme/'config'),
+                 '--cert-name', lineage, '--config-dir', str(acme/'config'),
                  '--work-dir', str(acme/'work'), '--logs-dir', str(acme/'logs'),
                  '--keep-until-expiring']
     arguments += ['--standalone'] if standalone else ['--webroot', '-w', str(acme)]
     for domain in domains:
         arguments += ['-d', domain]
     run(arguments, timeout=180)
-    source = acme/'config/live/proxyhub'
+    source = acme/'config/live'/lineage
     result = import_pair(source/'fullchain.pem', source/'privkey.pem', domains)
-    atomic_write(Path(result['certificate_path']).parent/'acme.json',
-                 canonical({'source':'acme-http-01','lineage':'proxyhub','domains':domains}))
+    marker = Path(result['certificate_path']).parent/'acme.json'
+    if marker.is_symlink():
+        raise OperationError('ACME ownership marker must not be a symlink')
+    if marker.exists():
+        try:
+            ownership = json.loads(marker.read_text(encoding='utf-8'))
+            valid = ownership['source'] == 'acme-http-01' and ownership['lineage'] == lineage
+        except (OSError, KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise OperationError('Certificate pair already belongs to another ACME lineage')
+    atomic_write(marker, canonical({'source':'acme-http-01','lineage':lineage,'domains':domains}))
     result['source'] = 'acme-http-01'
     result['consumer_reload'] = 'requires_deployment_apply'
     return result

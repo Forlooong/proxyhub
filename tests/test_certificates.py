@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import json
 import shutil
 import subprocess
 
@@ -137,3 +138,93 @@ def test_trailing_text_and_invalid_der_are_rejected(source, which, suffix):
     with pytest.raises(ValueError):
         imported(source)
     assert revisions() == []
+
+
+def test_acme_source_uses_stable_binding_identity_and_validated_domains(tmp_path):
+    marker = tmp_path/'acme.json'
+    identity = 'a' * 32
+    binding = {'id': identity, 'domains': ['site.example.test'],
+               'certificate_path': str(tmp_path/'fullchain.pem')}
+    source = {'source': 'acme-http-01', 'lineage': 'proxyhub-' + identity,
+              'domains': ['site.example.test']}
+    marker.write_text(json.dumps(source), encoding='utf-8')
+    assert certificates.acme_source(binding) == source
+    assert certificates.acme_source({**binding, 'id': 'b' * 32}) is None
+    assert certificates.acme_source({**binding, 'domains': ['other.example.test']}) is None
+    for domains in ([], 'site.example.test', ['site.example.test'] * 2, ['../unsafe']):
+        marker.write_text(json.dumps({**source, 'domains': domains}), encoding='utf-8')
+        assert certificates.acme_source(binding) is None
+
+
+def test_legacy_acme_marker_remains_compatible_and_cannot_own_other_bindings(tmp_path):
+    marker = tmp_path/'acme.json'
+    source = {'source': 'acme-http-01', 'lineage': 'proxyhub',
+              'domains': ['site.example.test', 'sub.example.test']}
+    marker.write_text(json.dumps(source), encoding='utf-8')
+    server = {'certificate_path': str(tmp_path/'fullchain.pem'),
+              'site_domain': 'site.example.test', 'subscription_domain': 'sub.example.test'}
+    assert certificates.managed_acme(server) is True
+    binding = {'id': 'a' * 32, 'domains': source['domains'], 'certificate_path': server['certificate_path']}
+    assert certificates.acme_source(binding) is None
+    marker.write_text('invalid JSON', encoding='utf-8')
+    assert certificates.managed_acme(server) is False
+
+
+@pytest.mark.parametrize('lineage', ['../proxyhub', 'proxyhub-abc', 'proxyhub-' + 'A' * 32, 'arbitrary', None])
+def test_issue_rejects_unmanaged_lineage_before_invoking_certbot(tmp_path, monkeypatch, lineage):
+    monkeypatch.setattr(certificates, 'ROOT', tmp_path)
+    monkeypatch.setattr(certificates, 'run', lambda *args, **kwargs: pytest.fail('Invalid lineage must not invoke Certbot'))
+    with pytest.raises(OperationError, match='lineage'):
+        certificates.issue(['site.example.test'], standalone=False, lineage=lineage)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize('lineage', ['proxyhub', 'proxyhub-' + 'a' * 32])
+def test_issue_preserves_lineage_in_certbot_paths_and_ownership(tmp_path, monkeypatch, lineage):
+    monkeypatch.setattr(certificates, 'ROOT', tmp_path)
+    arguments, imports = [], []
+    monkeypatch.setattr(certificates, 'run', lambda args, **kwargs: arguments.append(args))
+    published = tmp_path/'certificates'/'pair'
+    published.mkdir(parents=True)
+    def import_pair(cert, key, domains):
+        imports.append((cert, key, domains))
+        return {'certificate_path': str(published/'fullchain.pem'), 'key_path': str(published/'privkey.pem')}
+    monkeypatch.setattr(certificates, 'import_pair', import_pair)
+    result = certificates.issue(['site.example.test'], standalone=False, lineage=lineage)
+    command = arguments[0]
+    assert command[command.index('--cert-name') + 1] == lineage
+    assert imports == [(tmp_path/'acme/config/live'/lineage/'fullchain.pem',
+                        tmp_path/'acme/config/live'/lineage/'privkey.pem', ['site.example.test'])]
+    identity = 'default' if lineage == 'proxyhub' else 'a' * 32
+    assert certificates.acme_source({'id': identity, 'domains': ['site.example.test'],
+                                     'certificate_path': result['certificate_path']}) == {
+        'source': 'acme-http-01', 'lineage': lineage, 'domains': ['site.example.test']}
+
+
+def test_identical_pair_cannot_be_taken_over_by_another_acme_lineage(tmp_path, monkeypatch):
+    monkeypatch.setattr(certificates, 'ROOT', tmp_path)
+    monkeypatch.setattr(certificates, 'run', lambda *args, **kwargs: None)
+    published = tmp_path/'certificates'/'pair'
+    published.mkdir(parents=True)
+    marker = published/'acme.json'
+    original = json.dumps({'source': 'acme-http-01', 'lineage': 'proxyhub',
+                           'domains': ['site.example.test']})
+    marker.write_text(original, encoding='utf-8')
+    monkeypatch.setattr(certificates, 'import_pair', lambda *args: {
+        'certificate_path': str(published/'fullchain.pem'), 'key_path': str(published/'privkey.pem')})
+    with pytest.raises(OperationError, match='another ACME lineage'):
+        certificates.issue(['site.example.test'], standalone=False, lineage='proxyhub-' + 'a' * 32)
+    assert marker.read_text(encoding='utf-8') == original
+
+
+def test_symlink_acme_marker_never_establishes_renewal_ownership(tmp_path):
+    target = tmp_path/'external.json'
+    target.write_text(json.dumps({'source': 'acme-http-01', 'lineage': 'proxyhub',
+                                  'domains': ['site.example.test', 'sub.example.test']}), encoding='utf-8')
+    try:
+        (tmp_path/'acme.json').symlink_to(target)
+    except OSError:
+        pytest.skip('Creating symlinks requires OS privileges')
+    server = {'certificate_path': str(tmp_path/'fullchain.pem'),
+              'site_domain': 'site.example.test', 'subscription_domain': 'sub.example.test'}
+    assert certificates.managed_acme(server) is False

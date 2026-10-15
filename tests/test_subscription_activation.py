@@ -104,6 +104,7 @@ def website_environment(environment, monkeypatch):
     monkeypatch.setattr(deployment, '_wait_health', lambda server: None)
     monkeypatch.setattr(deployment, '_wait_publication', lambda directory: None)
     monkeypatch.setattr(deployment, '_website_health', lambda server, directory: None)
+    monkeypatch.setattr(deployment, '_wait_web_health', lambda config, directory: None)
     return env
 
 
@@ -130,10 +131,12 @@ def test_uploaded_content_survives_publication_and_restores_without_old_config(w
     assert versions['versions'][1]['current'] is True
     config['server']['node_name'] = 'Current node name'
     config.pop('website_content')
+    config['web']['sites'][0]['content_version'] = None
     template = deployment.prepare(env.store,config,website_change=True)
     deployment.apply(env.store,template['plan_id'])
     assert 'website_content' not in read_config(env.pointer['current'])
     config['website_content'] = uploaded['revision']
+    config['web']['sites'][0]['content_version'] = uploaded['revision']
     restored = deployment.prepare(env.store,config,website_change=True)
     deployment.apply(env.store,restored['plan_id'])
     active = read_config(env.pointer['current'])
@@ -165,7 +168,7 @@ def test_website_ack_failure_restores_previous_and_does_not_publish_history(webs
     result = deployment.prepare(env.store,read_config(env.previous),site_files={'index.html':b'new'},website_change=True)
     def failure(*args):
         raise OperationError('Website has not loaded the selected content')
-    monkeypatch.setattr(deployment,'_website_health',failure)
+    monkeypatch.setattr(deployment,'_wait_web_health',failure)
     with pytest.raises(OperationError,match='not loaded'):
         deployment.apply(env.store,result['plan_id'])
     assert env.pointer['current'] == env.previous and env.store.pending() == []

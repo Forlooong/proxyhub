@@ -104,7 +104,7 @@ def test_website_upload_and_restore_share_existing_plan_contract(environment,mon
     assert options['site_files'] == {'index.html':b'<h1>Upload</h1>'}
     assert options['website_change'] is True and options['publish_only'] is False
     assert_private_fields_absent(result,env.config)
-    monkeypatch.setattr(deployment,'content_version',lambda store,version:{'index.html':b'old'})
+    monkeypatch.setattr(deployment,'content_version',lambda store,version,site_id='default':{'index.html':b'old'})
     env.service.create_plan('website.content.restore',0,{'version_id':'b'*32})
     restored,options = env.prepared[-1]
     assert restored['server'] == env.config['server'] and restored['subscription'] == env.config['subscription']
@@ -165,6 +165,84 @@ def test_synchronous_website_service_does_not_recover_manager_jobs(environment,m
     service = management.OperationService(environment.root,synchronous=True)
     assert service.jobs is None
     service.close()
+
+
+def test_new_certificate_issue_is_planned_before_acme_and_commits_stable_binding(environment,monkeypatch):
+    from proxyhub import management_web
+    env = environment
+    seen = []
+    monkeypatch.setattr(management_web,'check_domain',lambda server,domain:None)
+    def issued(domains,**options):
+        seen.append((domains,options))
+        return {'certificate_path':'/var/lib/proxyhub/certificates/'+'d'*64+'/fullchain.pem',
+                'key_path':'/var/lib/proxyhub/certificates/'+'d'*64+'/privkey.pem'}
+    monkeypatch.setattr(certificates,'issue',issued)
+    preview = env.service.create_plan('certificate.issue',0,{'name':'Second certificate','domains':['second.example.test']})
+    assert seen == []
+    with env.service.state() as store:
+        payload = store.inspect(preview['plan_id'])['payload']
+    assert payload['lineage'] == 'proxyhub-'+payload['certificate_id']
+    monkeypatch.setattr(deployment,'apply',fake_activation)
+    env.service.apply_plan(preview['plan_id'])
+    config,options = env.prepared[-1]
+    assert options['web_only'] is True
+    assert config['web']['certificates'][-1]['id'] == payload['certificate_id']
+    assert config['server'] == env.config['server']
+    assert seen == [(['second.example.test'],{'standalone':False,'lineage':payload['lineage']})]
+    with env.service.state() as store:
+        assert store.inspect(preview['plan_id'])['status'] == 'applied' and store.revision == 1
+
+
+def test_scoped_renewal_changes_only_its_binding(environment,monkeypatch):
+    from proxyhub import management_web
+    from proxyhub.websites import normalize_web
+    env = environment
+    config = deepcopy(env.config)
+    config['web'] = normalize_web(config)
+    identity = 'c'*32
+    config['web']['certificates'].append({'id':identity,'name':'Separate certificate','domains':['second.example.test'],
+        'certificate_path':'/var/lib/proxyhub/certificates/'+'d'*64+'/fullchain.pem',
+        'key_path':'/var/lib/proxyhub/certificates/'+'d'*64+'/privkey.pem'})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    monkeypatch.setattr(management_web,'check_domain',lambda server,domain:None)
+    monkeypatch.setattr(certificates,'acme_source',lambda binding:{'lineage':'proxyhub-'+identity,'domains':['second.example.test']})
+    monkeypatch.setattr(certificates,'issue',lambda *args,**kw:{
+        'certificate_path':'/var/lib/proxyhub/certificates/'+'e'*64+'/fullchain.pem',
+        'key_path':'/var/lib/proxyhub/certificates/'+'e'*64+'/privkey.pem'})
+    monkeypatch.setattr(deployment,'apply',fake_activation)
+    preview = env.service.create_plan('certificate.renew',0,{'certificate_id':identity})
+    env.service.apply_plan(preview['plan_id'])
+    changed, options = env.prepared[-1]
+    assert changed['web']['certificates'][0] == config['web']['certificates'][0]
+    assert changed['web']['certificates'][1]['id'] == identity
+    assert changed['server'] == config['server'] and changed['subscription'] == config['subscription']
+    assert options['web_only'] is True
+
+
+def test_new_acme_plan_rejects_configuration_changed_during_issue(environment,monkeypatch):
+    from proxyhub import management_web
+    env = environment
+    monkeypatch.setattr(management_web,'check_domain',lambda server,domain:None)
+    preview = env.service.create_plan('certificate.issue',0,{'name':'Second certificate','domains':['second.example.test']})
+    def changed(*args,**kwargs):
+        with env.service.state() as store:
+            store.commit(store.plan('ssh-append',{}))
+        return {'certificate_path':'unused','key_path':'unused'}
+    monkeypatch.setattr(certificates,'issue',changed)
+    with pytest.raises(ManagementError) as error:
+        env.service.apply_plan(preview['plan_id'])
+    assert error.value.code == 'STALE_REVISION' and env.prepared == []
+
+
+def test_public_web_resources_have_stable_ids_and_no_secret_material(environment):
+    env = environment
+    result = env.service.handle('web.resources',{})
+    assert result['websites'][0]['id'] == 'default'
+    assert result['websites'][0]['listener_id'] == 'site-default'
+    assert result['certificates'][0]['id'] == 'default'
+    assert {item['kind'] for item in result['certificates'][0]['consumers']} == {'website','subscription','reality'}
+    assert_private_fields_absent(result,env.config)
+    assert 'key_path' not in json.dumps(result)
 
 
 def test_overview_projects_only_public_state(environment):
@@ -397,10 +475,10 @@ def test_certificate_import_keeps_private_pem_out_of_preview_and_reports_ownersh
         return {'certificate_path':env.config['server']['certificate_path'],'key_path':env.config['server']['key_path'],
                 'sha256':'d'*64,'not_after':'2030-01-01','private_key':pem_secret}
     monkeypatch.setattr(certificates,'import_pair',imported)
-    monkeypatch.setattr(certificates,'managed_acme',lambda server:managed)
+    monkeypatch.setattr(certificates,'acme_source',lambda binding:{'lineage':'proxyhub'} if managed else None)
     result = env.service.create_plan('certificate.import',0,{'certificate_pem':'PUBLIC-PEM-TEST-FIXTURE','private_key_pem':pem_secret})
     assert pem_secret not in json.dumps(result)
-    assert ('保留已验证' if managed else '不接管自动续期') in result['warnings'][0]
+    assert ('保留自动续期' if managed else '不接管自动续期') in result['warnings'][0]
     assert list((env.root/'certificates').iterdir()) == []
 
 

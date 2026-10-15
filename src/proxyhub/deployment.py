@@ -18,6 +18,7 @@ from .proxy import validate_spec, render_sing_box
 from .site import render_nginx, render_site, validate_certificate
 from .publication import build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES
 from .state import StateStore
+from .websites import normalize_web, get_site, get_certificate, consumers, site_directory, sync_default
 
 ROOT = Path('/var/lib/proxyhub')
 BIN = Path('/opt/proxyhub/bin')
@@ -25,11 +26,13 @@ APP = Path('/opt/proxyhub/app')
 CANDIDATE_FILES = ('sing-box.json', 'nginx.conf', 'site/index.html', 'bundle.json', 'config.json', 'client.yaml')
 
 
-def _read_site(directory: Path, manifest: dict) -> dict[str, bytes]:
+def _read_site(directory: Path, manifest: dict, site_id: str = 'default') -> dict[str, bytes]:
     """Read only the bounded static tree recorded in an immutable plan."""
     from .site_content import MAX_EXPANDED_BYTES, MAX_FILES, validate_files
-    site = directory / 'site'
-    if site.is_symlink() or not site.is_dir():
+    prefix = site_directory(site_id)
+    site = directory / prefix
+    if (site.is_symlink() or not site.is_dir()
+            or (site_id != 'default' and (directory/'sites').is_symlink())):
         raise OperationError('Website content is not a managed directory')
     files, total, entries = {}, 0, 0
     for parent, directories, names in os.walk(site, followlinks=False):
@@ -43,7 +46,7 @@ def _read_site(directory: Path, manifest: dict) -> dict[str, bytes]:
             if not stat.S_ISREG(path.stat().st_mode):
                 raise OperationError('Website content is not a regular file')
             relative = path.relative_to(site).as_posix()
-            if 'site/' + relative not in manifest:
+            if prefix + '/' + relative not in manifest:
                 raise OperationError('Website content differs from its immutable manifest')
             with path.open('rb') as source:
                 body = source.read(MAX_EXPANDED_BYTES - total + 1)
@@ -52,51 +55,79 @@ def _read_site(directory: Path, manifest: dict) -> dict[str, bytes]:
                 raise OperationError('Website content exceeds the size limit')
             files[relative] = body
     files = validate_files(files)
-    if {'site/' + name: digest(body) for name, body in files.items()} != manifest:
+    if {prefix + '/' + name: digest(body) for name, body in files.items()} != manifest:
         raise OperationError('Website content changed after validation')
     return files
 
 
-def content_version(store: StateStore, version: str) -> dict[str, bytes]:
+def _site_manifest(payload: dict, site_id: str) -> dict:
+    prefix = site_directory(site_id) + '/'
+    return {name: value for name, value in payload['files'].items() if name.startswith(prefix)}
+
+
+def _content_source(payload: dict, site_id: str):
+    if 'content_versions' in payload:
+        return payload['content_versions'].get(site_id)
+    return payload.get('content_version') if site_id == 'default' else None
+
+
+def content_version(store: StateStore, version: str, site_id: str = 'default') -> dict[str, bytes]:
     """Only successfully applied uploads are eligible for content restoration."""
     if not isinstance(version, str) or not re.fullmatch(r'[0-9a-f]{32}', version):
         raise OperationError('Invalid website content version')
     for (identity,) in store.db.execute("SELECT id FROM plans WHERE kind='deployment' AND status='applied' ORDER BY created DESC, rowid DESC"):
         payload = store.inspect(identity)['payload']
-        if payload.get('revision') == version and payload.get('content_version') == version:
+        if payload.get('revision') == version and _content_source(payload,site_id) == version:
             directory = _managed_revision(ROOT / 'revisions' / version)
-            return _read_site(directory, {name: value for name, value in payload['files'].items() if name.startswith('site/')})
+            return _read_site(directory,_site_manifest(payload,site_id),site_id)
     raise OperationError('Website content version has not been successfully applied')
 
 
-def content_versions(store: StateStore, config: dict) -> dict:
-    current = config.get('website_content')
-    template = render_site(config['server']).encode()
+def content_versions(store: StateStore, config: dict, site_id: str = 'default') -> dict:
+    site = get_site(normalize_web(config),site_id)
+    current = site['content_version']
+    template = render_site({**config['server'],'site_title':site['title']}).encode()
     versions = [{'id': 'template', 'source': 'template', 'created': None,
                  'file_count': 1, 'total_bytes': len(template), 'current': current is None}]
     seen = set()
     for identity, created in store.db.execute("SELECT id,created FROM plans WHERE kind='deployment' AND status='applied' ORDER BY created DESC, rowid DESC"):
         payload = store.inspect(identity)['payload']
-        version = payload.get('content_version')
+        version = _content_source(payload,site_id)
         if version is None or version != payload.get('revision') or version in seen:
             continue
         seen.add(version)
         if len(versions) <= 50 or version == current:
+            summary = (payload.get('website_summaries',{}).get(site_id)
+                       or (payload.get('website_summary') if site_id == 'default' else None))
             versions.append({'id': version, 'source': 'upload', 'created': created,
-                             **payload['website_summary'], 'current': current == version})
+                             **summary, 'current': current == version})
     return {'current_version': current, 'versions': versions}
 
 
 def _verify_candidate(directory: Path, payload: dict) -> None:
     manifest = payload['files']
-    if (not isinstance(manifest, dict) or not set(CANDIDATE_FILES) <= set(manifest)
-            or any(name not in CANDIDATE_FILES and not name.startswith('site/') for name in manifest)):
+    if not isinstance(manifest, dict) or not set(CANDIDATE_FILES) <= set(manifest):
         raise OperationError('Candidate file manifest is invalid')
-    _read_site(directory, {name: value for name, value in manifest.items() if name.startswith('site/')})
     for name in set(CANDIDATE_FILES) - {'site/index.html'}:
         file = directory / name
         if file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != manifest[name]:
             raise OperationError('Candidate file changed after validation')
+    config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
+    sites = normalize_web(config)['sites'] if 'web' in config else [{'id':'default'}]
+    allowed = set(CANDIDATE_FILES) - {'site/index.html'}
+    for site in sites:
+        part = _site_manifest(payload,site['id'])
+        _read_site(directory,part,site['id'])
+        allowed.update(part)
+    if set(manifest) != allowed:
+        raise OperationError('Candidate file manifest contains an unmanaged site')
+    parent = directory/'sites'
+    if parent.exists() or parent.is_symlink():
+        if parent.is_symlink() or not parent.is_dir():
+            raise OperationError('Unsafe additional website directory')
+        expected = {site['id'] for site in sites if site['id'] != 'default'}
+        if {path.name for path in parent.iterdir()} != expected:
+            raise OperationError('Candidate contains an unmanaged website tree')
 
 
 def client_config(server: dict, overrides: dict) -> dict:
@@ -107,86 +138,160 @@ def client_config(server: dict, overrides: dict) -> dict:
     return json.loads(text)
 
 
+def _certificate_bindings(config: dict) -> dict:
+    web = normalize_web(config)
+    result = {}
+    for binding in web['certificates']:
+        active = [item['domain'] for item in consumers(web,config['server'],binding['id'])
+                  if item.get('enabled',True) and item['domain']]
+        details = validate_certificate(binding['certificate_path'],binding['key_path'],
+                                       list(dict.fromkeys(active))) if active else {'sha256':None}
+        result[binding['id']] = {'sha256':details['sha256'],'files':_certificate_files(binding)}
+    return result
+
+
+def _preserve_endpoints(config: dict, previous: Path | None) -> None:
+    if previous is None:
+        return
+    old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+    fields = ('site_domain','subscription_domain','http_port','public_port','reality_port',
+              'site_tls_port','subscription_tls_port','publisher_port')
+    # The normalized server shape owns the complete listener contract.
+    if all(field in old['server'] and field in config['server'] for field in fields):
+        if any(old['server'][field] != config['server'][field] for field in fields):
+            raise OperationError('Existing SNI and listener endpoints require the separate migration stage')
+    if 'web' in old and 'web' in config:
+        old_web, new_web = normalize_web(old), normalize_web(config)
+        before = {site['id']:site for site in old_web['sites']}
+        after = {site['id']:site for site in new_web['sites']}
+        if any(site['enabled'] for identity,site in before.items() if identity not in after):
+            raise OperationError('An enabled website must be disabled before deletion')
+        for binding in old_web['certificates']:
+            if (not any(item['id']==binding['id'] for item in new_web['certificates'])
+                    and consumers(old_web,old['server'],binding['id'])):
+                raise OperationError('A referenced certificate binding cannot be deleted')
+        for site in new_web['sites']:
+            previous_site = before.get(site['id'])
+            if previous_site and any(previous_site[key] != site[key] for key in ('listener_id','tls_port')):
+                raise OperationError('An existing website listener identity and port cannot change')
+
+
+def _web_server(config: dict, previous: Path | None) -> None:
+    if previous is None:
+        raise OperationError('Web-only activation requires an active deployment')
+    old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+    allowed = {'site_title','certificate_path','key_path'}
+    if ({key:value for key,value in validate_spec(config['server']).items() if key not in allowed}
+            != {key:value for key,value in validate_spec(old['server']).items() if key not in allowed}
+            or any(config[key] != old[key] for key in ('subscription','overrides'))):
+        raise OperationError('Web-only activation cannot change proxy or subscription configuration')
+    _preserve_endpoints(config,previous)
+
+
 def prepare(store: StateStore, config: dict, *, expected_revision: int | None = None,
             publish_only: bool = False, site_files: dict[str, bytes] | None = None,
-            website_change: bool = False) -> dict:
+            website_change: bool = False, site_id: str = 'default', web_only: bool = False) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
     if store.pending():
         raise OperationError('Recover the interrupted activation before preparing a deployment')
-    if not {'server', 'subscription', 'overrides'} <= set(config) or set(config) - {'server', 'subscription', 'overrides', 'website_content'}:
-        raise OperationError('Deployment requires server, subscription and overrides objects only')
-    if type(publish_only) is not bool:
-        raise OperationError('Publication activation selection must be a boolean')
+    if (not {'server','subscription','overrides'} <= set(config)
+            or set(config) - {'server','subscription','overrides','website_content','web'}):
+        raise OperationError('Deployment contains unknown or missing objects')
+    if type(publish_only) is not bool or type(web_only) is not bool or (publish_only and web_only):
+        raise OperationError('Activation mode selection must be unambiguous')
+    original = config
+    config = sync_default(config)
+    if 'web' in original and (original.get('website_content') != config.get('website_content')
+            or any(original['server'].get(key) != config['server'].get(key)
+                   for key in ('site_title','certificate_path','key_path'))):
+        raise OperationError('Legacy fields conflict with the managed default website; update the website resource')
     server = validate_spec(config['server'])
+    config['server'] = server
     if server['publisher_port'] != 18890:
-        raise OperationError('The phase-1 publisher unit reserves loopback port 18890')
+        raise OperationError('The publisher unit reserves loopback port 18890')
+    previous = _current_revision()
     if publish_only:
-        _publication_server(server, _current_revision(), config)
+        _publication_server(server,previous,config)
         if site_files is not None:
             raise OperationError('Publication-only activation cannot change website content')
-    certificate = validate_certificate(server['certificate_path'], server['key_path'], [server['site_domain'],server['subscription_domain']])
-    generated = client_config(server, config['overrides'])
+    if web_only:
+        _web_server(config,previous)
+    elif not publish_only:
+        _preserve_endpoints(config,previous)
+    if not publish_only:
+        _check_new_domains(config,previous)
+    bindings = _certificate_bindings(config)
+    generated = client_config(server,config['overrides'])
     revision = secrets.token_hex(16)
-    config = dict(config)
+    selected = get_site(config['web'],site_id)
     from .site_content import validate_files
     if site_files is not None:
         site_files = validate_files(site_files)
-        config['website_content'] = revision
-    elif 'website_content' in config:
-        site_files = content_version(store, config['website_content'])
-    else:
-        site_files = {'index.html': render_site(server).encode()}
+        selected['content_version'] = revision
+        config = sync_default(config)
     directory = ROOT/'revisions'/revision
-    directory.mkdir(parents=True, mode=0o711)
+    directory.mkdir(parents=True,mode=0o711)
     try:
-        # The manager runs with UMask=0077. mkdir's mode is filtered by that mask;
-        # runtime users still need to traverse the immutable revision after restart.
         directory.chmod(0o711)
-        (directory/'site').mkdir(mode=0o755)
-        (directory/'site').chmod(0o755)
         import pwd
         proxy_gid = pwd.getpwnam('proxyhub-proxy').pw_gid
         singbox = directory/'sing-box.json'
-        atomic_write(singbox, canonical(render_sing_box(server)), 0o640)
-        os.chown(singbox, 0, proxy_gid)
-        atomic_write(directory/'nginx.conf', render_nginx(server, str(directory)).encode(), 0o600)
-        for name, body in site_files.items():
-            target = directory / 'site' / name
-            atomic_write(target, body, 0o644)
-            parent = target.parent
-            while parent != directory:
-                parent.chmod(0o755)
-                parent = parent.parent
+        atomic_write(singbox,canonical(render_sing_box(server)),0o640)
+        os.chown(singbox,0,proxy_gid)
+        atomic_write(directory/'nginx.conf',render_nginx(server,str(directory),config['web']).encode(),0o600)
+        summaries = {}
+        for site in config['web']['sites']:
+            identity = site['id']
+            if identity == site_id and site_files is not None:
+                content = site_files
+                summaries[identity] = {'file_count':len(content),'total_bytes':sum(map(len,content.values()))}
+            elif site['content_version']:
+                content = content_version(store,site['content_version'],identity)
+            else:
+                content = {'index.html':render_site({**server,'site_title':site['title']}).encode()}
+            for name,body in content.items():
+                target = directory/site_directory(identity)/name
+                atomic_write(target,body,0o644)
+                parent = target.parent
+                while parent != directory:
+                    parent.chmod(0o755)
+                    parent = parent.parent
         subscription = dict(config['subscription'])
-        subscription.update(host=server['subscription_domain'], yaml=generated['yaml'], raw=generated['raw'])
-        bundle = build_bundle([subscription], revision)
-        save_bundle(directory/'bundle.json', bundle)
-        atomic_write(directory/'config.json', canonical({**config, 'server':server}))
-        atomic_write(directory/'client.yaml', generated['yaml'].encode())
-        run([str(BIN/'sing-box'), 'check', '-c', str(singbox)])
-        run([str(BIN/'nginx'), '-e', 'stderr', '-p', str(ROOT/'nginx')+'/', '-t', '-c', str(directory/'nginx.conf')])
-        run([str(BIN/'mihomo'), '-t', '-d', str(ROOT/'client-check'), '-f', str(directory/'client.yaml')])
-        files = {path.relative_to(directory).as_posix(): digest(path.read_bytes()) for path in directory.rglob('*') if path.is_file()}
-        payload = {'revision':revision, 'files':files, 'site_domain':server['site_domain'],
-                   'subscription_domain':server['subscription_domain'], 'certificate_sha256':certificate['sha256'],
-                   'certificate_files': _certificate_files(server),
-                   'activation': 'publication' if publish_only else 'full'}
-        if 'website_content' in config:
+        subscription.update(host=server['subscription_domain'],yaml=generated['yaml'],raw=generated['raw'])
+        save_bundle(directory/'bundle.json',build_bundle([subscription],revision))
+        atomic_write(directory/'config.json',canonical(config))
+        atomic_write(directory/'client.yaml',generated['yaml'].encode())
+        run([str(BIN/'sing-box'),'check','-c',str(singbox)])
+        run([str(BIN/'nginx'),'-e','stderr','-p',str(ROOT/'nginx')+'/','-t','-c',str(directory/'nginx.conf')])
+        run([str(BIN/'mihomo'),'-t','-d',str(ROOT/'client-check'),'-f',str(directory/'client.yaml')])
+        _check_new_ports(config,previous)
+        files = {path.relative_to(directory).as_posix():digest(path.read_bytes())
+                 for path in directory.rglob('*') if path.is_file()}
+        default_binding = get_site(config['web'],'default')['certificate_id']
+        payload = {'revision':revision,'files':files,'site_domain':server['site_domain'],
+                   'subscription_domain':server['subscription_domain'],
+                   'certificate_sha256':bindings[default_binding]['sha256'],
+                   'certificate_files':_certificate_files(server),'certificate_bindings':bindings,
+                   'content_versions':{site['id']:site['content_version'] for site in config['web']['sites']
+                                       if site['content_version']},
+                   'website_summaries':summaries,
+                   'activation':'publication' if publish_only else ('web' if web_only else 'full')}
+        if config.get('website_content'):
             payload['content_version'] = config['website_content']
-        if config.get('website_content') == revision:
-            payload['website_summary'] = {'file_count': len(site_files), 'total_bytes': sum(map(len, site_files.values()))}
+        if 'default' in summaries:
+            payload['website_summary'] = summaries['default']
         if website_change:
-            payload['website_change'] = True
-        plan_id = store.plan('deployment', payload, expected_revision=base_revision)
+            payload.update(website_change=True,website_id=site_id)
+        plan_id = store.plan('deployment',payload,expected_revision=base_revision)
+        changes = (['subscription bundle','publisher reload'] if publish_only else
+                   ['website resources','Nginx reload','publisher reload'] if web_only else
+                   ['managed websites','REALITY listener','subscription bundle','ProxyHub service activation'])
         return {'plan_id':plan_id,'revision':revision,'site_domain':server['site_domain'],
-                'subscription_domain':server['subscription_domain'],'checks':['certificate','sing-box','nginx','mihomo'],
-                'activation': payload['activation'],
-                'changes':(['subscription bundle','publisher reload'] if publish_only else
-                           ['managed website','REALITY listener','subscription bundle','ProxyHub service activation'])}
+                'subscription_domain':server['subscription_domain'],'checks':['certificates','sing-box','nginx','mihomo'],
+                'activation':payload['activation'],'changes':changes}
     except Exception:
-        # This directory was created exclusively for this failed preparation.
         shutil.rmtree(directory)
         raise
 
@@ -195,7 +300,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
 def _activation(payload: dict) -> str:
     """Missing mode identifies a phase-1 full-deployment record."""
     mode = payload.get('activation', 'full')
-    if mode not in ('full', 'publication'):
+    if mode not in ('full', 'publication', 'web'):
         raise OperationError('Unsupported activation mode')
     return mode
 
@@ -212,6 +317,8 @@ def _publication_server(server: dict, previous: Path | None, config: dict | None
         raise OperationError('Publication-only activation cannot change server configuration')
     if config is not None and config.get('website_content') != current.get('website_content'):
         raise OperationError('Publication-only activation cannot change website content')
+    if config is not None and normalize_web(config) != normalize_web(current):
+        raise OperationError('Publication-only activation cannot change website resources')
 
 
 def _link(directory: Path) -> None:
@@ -296,14 +403,18 @@ def _check_runtime_permissions(directory: Path) -> None:
     """
     if os.name != 'posix':
         return
-    for path in (ROOT, ROOT/'revisions', directory, directory/'site',
-                 *(path for path in (directory/'site').rglob('*') if path.is_dir())):
+    config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
+    identities = [site['id'] for site in normalize_web(config)['sites']] if 'web' in config else ['default']
+    trees = [directory/site_directory(identity) for identity in identities]
+    parents = [directory/'sites'] if len(trees)>1 else []
+    for path in (ROOT, ROOT/'revisions', directory, *parents, *trees,
+                 *(path for tree in trees for path in tree.rglob('*') if path.is_dir())):
         info = path.lstat()
         if (not stat.S_ISDIR(info.st_mode) or not info.st_mode & stat.S_IXOTH
                 or info.st_mode & 0o022):
             raise OperationError('Managed runtime directory permissions do not allow safe service access')
     for path, required in ((directory/'sing-box.json', stat.S_IRGRP),
-                           *((path, stat.S_IROTH) for path in (directory/'site').rglob('*') if path.is_file())):
+                           *((path, stat.S_IROTH) for tree in trees for path in tree.rglob('*') if path.is_file())):
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or not info.st_mode & required
                 or info.st_mode & 0o022):
@@ -323,6 +434,37 @@ def _check_ports(server: dict) -> None:
                 raise OperationError(f'TCP port {port} is unavailable; no service was replaced') from exc
 
 
+def _check_new_ports(config: dict, previous: Path | None) -> None:
+    web = normalize_web(config)
+    owned = {config['server']['site_tls_port']}
+    if previous is not None:
+        old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        owned.update(site['tls_port'] for site in normalize_web(old)['sites'] if site['enabled'])
+    for site in web['sites']:
+        port = site['tls_port']
+        if not site['enabled'] or port in owned:
+            continue
+        for family,address in ((socket.AF_INET,'0.0.0.0'),(socket.AF_INET6,'::')):
+            try:
+                with socket.socket(family) as probe:
+                    if family == socket.AF_INET6:
+                        probe.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1)
+                    probe.bind((address,port))
+            except OSError:
+                raise OperationError(f'New website TCP port {port} is unavailable; no service was replaced') from None
+
+
+def _check_new_domains(config: dict, previous: Path | None) -> None:
+    from .management_web import check_domain
+    old_domains = set()
+    if previous is not None:
+        old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        old_domains = {domain for site in normalize_web(old)['sites'] if site['enabled'] for domain in site['domains']}
+    domains = {domain for site in normalize_web(config)['sites'] if site['enabled'] for domain in site['domains']}
+    for domain in sorted(domains-old_domains):
+        check_domain(config['server'],domain)
+
+
 def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -> None:
     current = _current_revision()
     if current not in (None, previous, candidate):
@@ -337,6 +479,17 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -
         run(['systemctl', 'reload', 'proxyhub-publisher.service'])
         _wait_publication(previous)
         return
+    if activation == 'web':
+        config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+        _web_server(config,previous)
+        restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        _link(previous)
+        _publish(previous)
+        run(['systemctl','reload','proxyhub-nginx.service'])
+        run(['systemctl','reload','proxyhub-publisher.service'])
+        _wait_web_health(restored,previous)
+        _wait_publication(previous)
+        return
     if activation != 'full':
         raise OperationError('Unsupported activation mode')
     if previous is not None:
@@ -348,6 +501,8 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -
         # systemctl restart acknowledges process startup, not HTTPS readiness.
         # Keep the activation pending until every restored consumer is healthy.
         _wait_health(config['server'])
+        if 'web' in config:
+            _wait_web_health(config,previous)
     else:
         # Every service is attempted even if one stop fails. The journal is left
         # pending when any action fails, so a later recover can safely retry.
@@ -443,6 +598,45 @@ def _website_health(server: dict, directory: Path) -> None:
                 response.close()
 
 
+def _web_health(config: dict, directory: Path) -> None:
+    """Check every active TLS consumer against its actual certificate and content."""
+    web = normalize_web(config)
+    bindings = _certificate_bindings(config)
+    targets = []
+    for site in web['sites']:
+        if site['enabled']:
+            body = (directory/site_directory(site['id'])/'index.html').read_bytes()
+            for domain in site['domains']:
+                targets.append((domain,site['tls_port'],site['certificate_id'],body,200))
+    targets.append((config['server']['subscription_domain'],config['server']['subscription_tls_port'],
+                    web['subscription_certificate_id'],None,404))
+    context = ssl.create_default_context()
+    for domain,port,identity,body,status in targets:
+        with socket.create_connection(('127.0.0.1',port),timeout=2) as raw:
+            with context.wrap_socket(raw,server_hostname=domain) as stream:
+                if digest(stream.getpeercert(binary_form=True)) != bindings[identity]['sha256']:
+                    raise OperationError('A TLS consumer has not loaded the selected certificate')
+                stream.sendall(f'GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n'.encode())
+                response = http.client.HTTPResponse(stream)
+                try:
+                    response.begin()
+                    if response.status != status or (body is not None and response.read(len(body)+1) != body):
+                        raise OperationError('A website consumer has not loaded the selected content')
+                finally:
+                    response.close()
+
+
+def _wait_web_health(config: dict, directory: Path) -> None:
+    for attempt in range(20):
+        try:
+            _web_health(config,directory)
+            return
+        except (OSError,OperationError,http.client.HTTPException):
+            if attempt == 19:
+                raise
+            time.sleep(.2)
+
+
 def _publication_health(directory: Path) -> None:
     """Check the loaded generation, exact bodies and headers through real GETs.
 
@@ -502,14 +696,26 @@ def apply(store: StateStore, identity: str) -> dict:
         _verify_candidate(directory, payload)
         config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
         server = config['server']
-        certificate = validate_certificate(server['certificate_path'], server['key_path'],
-                                           [server['site_domain'], server['subscription_domain']])
-        if (certificate['sha256'] != payload['certificate_sha256']
-                or _certificate_files(server) != payload['certificate_files']):
-            raise OperationError('Deployment certificate changed after validation')
+        if 'certificate_bindings' in payload:
+            if _certificate_bindings(config) != payload['certificate_bindings']:
+                raise OperationError('A certificate binding changed after validation')
+        else:
+            certificate = validate_certificate(server['certificate_path'], server['key_path'],
+                                               [server['site_domain'], server['subscription_domain']])
+            if (certificate['sha256'] != payload['certificate_sha256']
+                    or _certificate_files(server) != payload['certificate_files']):
+                raise OperationError('Deployment certificate changed after validation')
         previous = _current_revision()
         if activation == 'publication':
             _publication_server(server, previous, config)
+        elif activation == 'web':
+            _web_server(config,previous)
+        else:
+            _preserve_endpoints(config,previous)
+        if 'web' in config:
+            _check_new_ports(config,previous)
+            if activation != 'publication':
+                _check_new_domains(config,previous)
         _check_runtime_permissions(directory)
         if previous is None:
             _check_ports(server)
@@ -521,11 +727,18 @@ def apply(store: StateStore, identity: str) -> dict:
             if activation == 'publication':
                 run(['systemctl', 'reload', 'proxyhub-publisher.service'])
                 _wait_publication(directory)
+            elif activation == 'web':
+                run(['systemctl','reload','proxyhub-nginx.service'])
+                run(['systemctl','reload','proxyhub-publisher.service'])
+                _wait_web_health(config,directory)
+                _wait_publication(directory)
             else:
                 for service in _units():
                     run(['systemctl','restart',service])
                 _wait_health(server)
-                if payload.get('website_change') or config.get('website_content'):
+                if 'web' in config:
+                    _wait_web_health(config,directory)
+                elif payload.get('website_change') or config.get('website_content'):
                     _website_health(server, directory)
                 run(['systemctl','enable',*_units()])
             store.commit(identity)

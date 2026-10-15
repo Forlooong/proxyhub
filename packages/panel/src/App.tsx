@@ -24,6 +24,7 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
   const [page, setPage] = useState<Page>('overview');
   const [data, setData] = useState<Overview | null>(null);
+  const [selectedSiteId, setSelectedSiteId] = useState('default');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -39,7 +40,7 @@ export default function App() {
   const navigate = useCallback((target: Page) => {setPage(target); setError(''); setOutcome(''); window.scrollTo({top: 0});}, []);
   const reset = useCallback(() => {
     authEpoch.current++; setAuthenticated(false); setData(null); setPreview(null); setMenu(false);
-    setActiveJob(null); setBusy(false); setOutcome(''); setPreviewError(''); setPage('overview');
+    setActiveJob(null); setBusy(false); setOutcome(''); setPreviewError(''); setPage('overview'); setSelectedSiteId('default');
   }, []);
   useEffect(() => {
     void session().then(setAuthenticated).catch(error => {setError(message(error)); setAuthenticated(false);});
@@ -60,6 +61,9 @@ export default function App() {
     finally {setLoading(false);}
   }
   useEffect(() => {if (authenticated) void refresh();}, [authenticated]);
+  useEffect(() => {
+    if (data && !data.websites.some(site => site.id === selectedSiteId)) setSelectedSiteId('default');
+  }, [data, selectedSiteId]);
   async function runJob<T>(name: string, payload: JsonObject): Promise<T> {
     const epoch = authEpoch.current;
     const result = await operation<{job_id: string}>(name, payload);
@@ -106,7 +110,7 @@ export default function App() {
       {data && formProps && <div key={`${page}-${data.revision}`} className="page-body">
         {page === 'overview' && <OverviewPage data={data} navigate={navigate} />}
         {page === 'server' && <ServerPage {...formProps} />}
-        {page === 'site' && <SitePage {...formProps} />}
+        {page === 'site' && <SitePage key={selectedSiteId} {...formProps} selectedSiteId={selectedSiteId} selectSite={setSelectedSiteId} />}
         {page === 'proxy' && <ProxyPage {...formProps} />}
         {page === 'subscription' && <SubscriptionPage {...formProps} />}
         {page === 'jobs' && <JobsPage activeId={activeJob?.id} activeStatus={activeJob?.status} recover={() => void recover()} busy={busy} />}

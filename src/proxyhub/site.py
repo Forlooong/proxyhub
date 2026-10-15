@@ -100,20 +100,32 @@ def validate_certificate(
     }
 
 
-def render_nginx(spec: Mapping[str, Any], revision_dir: str) -> str:
+def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = None) -> str:
     """Render a standalone config; revision_dir must be an immutable managed path.
 
     Nginx must provide statically loaded stream, ssl_preread, HTTP SSL, and HTTP
     request-limit modules. Installers must verify their actual binary/modules.
     No package-global default config or dynamic-module wildcard is included.
     """
+    from .websites import get_certificate, normalize_web, site_directory
+
     value = validate_spec(spec)
     if not isinstance(revision_dir, str) or not re.fullmatch(r"/var/lib/proxyhub/revisions/[0-9a-f]{8,64}", revision_dir):
         raise ValueError("revision_dir must be /var/lib/proxyhub/revisions/<8-64 lowercase hex digits>")
     site, subscription = value["site_domain"], value["subscription_domain"]
+    resources = normalize_web({'server': value, **({'web': web} if web is not None else {})})
+    active_sites = [website for website in resources['sites'] if website['enabled']]
+    active_domains = {domain for website in active_sites for domain in website['domains']} | {subscription}
+    challenge_domains = list(dict.fromkeys([
+        *(domain for website in resources['sites'] for domain in website['domains']),
+        subscription,
+        *(domain for certificate in resources['certificates'] for domain in certificate['domains']),
+    ]))
     https_suffix = "" if value["public_port"] == 443 else f":{value['public_port']}"
     redirects = []
-    for domain in (site, subscription):
+    for domain in challenge_domains:
+        response = (f'return 308 https://{domain}{https_suffix}$request_uri;'
+                    if domain in active_domains else 'return 404;')
         redirects.append(f"""    server {{
         listen {value['http_port']};
         listen [::]:{value['http_port']};
@@ -124,8 +136,35 @@ def render_nginx(spec: Mapping[str, Any], revision_dir: str) -> str:
             limit_except GET {{ deny all; }}
             try_files $uri =404;
         }}
-        location / {{ return 308 https://{domain}{https_suffix}$request_uri; }}
+        location / {{ {response} }}
     }}""")
+    routes = [f"        {site} 127.0.0.1:{value['reality_port']};",
+              f"        {subscription} 127.0.0.1:{value['subscription_tls_port']};"]
+    website_servers = []
+    for website in active_sites:
+        certificate = get_certificate(resources, website['certificate_id'])
+        domains = website['domains']
+        routes.extend(f"        {domain} 127.0.0.1:{website['tls_port']};"
+                      for domain in domains if domain != site)
+        host_check = (f"if ($host != {domains[0]}) {{ return 444; }}" if len(domains) == 1 else
+                      'if ($host !~ ^(?:' + '|'.join(re.escape(domain) for domain in domains) + ')$) { return 444; }')
+        website_servers.append(f"""    server {{
+        listen 127.0.0.1:{website['tls_port']} ssl;
+        server_name {' '.join(domains)};
+        {host_check}
+        ssl_certificate {certificate['certificate_path']};
+        ssl_certificate_key {certificate['key_path']};
+        root {revision_dir}/{site_directory(website['id'])};
+        index index.html;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
+        location / {{
+            limit_except GET {{ deny all; }}
+            try_files $uri $uri/ =404;
+        }}
+    }}""")
+    subscription_certificate = get_certificate(resources, resources['subscription_certificate_id'])
     return f"""# ProxyHub managed configuration; requires stream + ssl_preread + HTTP SSL.
 user proxyhub-web;
 worker_processes 1;
@@ -137,8 +176,7 @@ events {{ worker_connections 1024; }}
 stream {{
     map $ssl_preread_server_name $proxyhub_tls_upstream {{
         default 127.0.0.1:1;
-        {site} 127.0.0.1:{value['reality_port']};
-        {subscription} 127.0.0.1:{value['subscription_tls_port']};
+{chr(10).join(routes)}
     }}
     server {{
         listen {value['public_port']};
@@ -176,8 +214,6 @@ http {{
     limit_req_zone $server_name zone=proxyhub_subscription:1m rate=10r/s;
     ssl_protocols TLSv1.3;
     ssl_ecdh_curve X25519:prime256v1;
-    ssl_certificate {value['certificate_path']};
-    ssl_certificate_key {value['key_path']};
     ssl_session_cache shared:ProxyHubTLS:1m;
     ssl_session_timeout 10m;
     ssl_session_tickets off;
@@ -186,29 +222,24 @@ http {{
         listen {value['http_port']} default_server;
         listen [::]:{value['http_port']} default_server;
         server_name _;
-        return 444;
+        location ^~ /.well-known/acme-challenge/ {{
+            root /var/lib/proxyhub/acme;
+            default_type text/plain;
+            limit_except GET {{ deny all; }}
+            try_files $uri =404;
+        }}
+        location / {{ return 444; }}
     }}
 {chr(10).join(redirects)}
 
-    server {{
-        listen 127.0.0.1:{value['site_tls_port']} ssl;
-        server_name {site};
-        if ($host != {site}) {{ return 444; }}
-        root {revision_dir}/site;
-        index index.html;
-        add_header X-Content-Type-Options nosniff always;
-        add_header Referrer-Policy no-referrer always;
-        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
-        location / {{
-            limit_except GET {{ deny all; }}
-            try_files $uri $uri/ =404;
-        }}
-    }}
+{chr(10).join(website_servers)}
 
     server {{
         listen 127.0.0.1:{value['subscription_tls_port']} ssl;
         server_name {subscription};
         if ($host != {subscription}) {{ return 444; }}
+        ssl_certificate {subscription_certificate['certificate_path']};
+        ssl_certificate_key {subscription_certificate['key_path']};
         access_log off;
         error_log /dev/null crit;
         location / {{

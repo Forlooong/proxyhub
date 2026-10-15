@@ -12,11 +12,22 @@ export type Preview = {
   changes: {label: string; before: unknown; after: unknown}[];
   impact: string[]; warnings: string[];
 };
+export type Website = {
+  id: string; listener_id: string; tls_port: number; domains: string[]; title: string; enabled: boolean;
+  certificate_id: string | null; content_version: string | null; url: string | null; dependencies: string[];
+};
+export type Certificate = {
+  id: string; name: string; domains: string[]; not_after: string | null; sha256: string | null;
+  status: 'valid' | 'invalid'; error: string | null; automatic_renewal: boolean;
+  consumers: {kind: string; id: string; label: string; domain: string; port: number; enabled?: boolean}[];
+};
 export type Overview = {
   revision: number;
   server: {hostname: string; os: string; architecture: string; memory_total_bytes: number | null; accounts: string[]; ssh_context: SSHContext};
   website: {id: string; domain: string; title: string; url: string; content_version: string | null};
   certificate: {id: string; domains: string[]; not_after: string | null; sha256: string | null; automatic_renewal: boolean; consumers: string[]; status?: 'valid' | 'invalid'; error?: string | null};
+  websites: Website[];
+  certificates: Certificate[];
   proxy: {id: string; name: string; protocol: string; public_address: string; port: number; sni: string; target: string; verification: string};
   subscription: {id: string; name: string; domain: string; update_interval_hours: number; userinfo: Record<string, number>; reset_day: number | null; reset_at: number | null; overrides: JsonObject; traffic_source: string};
   services: {name: string; status: string}[];

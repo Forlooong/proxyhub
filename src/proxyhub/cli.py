@@ -30,12 +30,33 @@ def parser() -> argparse.ArgumentParser:
     for argument in ('addr', 'host', 'laddr', 'lport'):
         ssh.add_argument('--'+argument, required=True)
     site = modules.add_parser('site', help='Website content and certificate operations').add_subparsers(dest='operation')
+    website = site.add_parser('website', help='Manage independent websites and their dependencies').add_subparsers(dest='action')
+    website.add_parser('list', help='List websites and certificate dependencies')
+    create = website.add_parser('create', help='Prepare an independent website')
+    create.add_argument('--title', required=True)
+    create.add_argument('--domain', required=True)
+    create.add_argument('--certificate-id', required=True)
+    for action in ('enable', 'disable', 'delete'):
+        command = website.add_parser(action, help='Prepare website '+action)
+        command.add_argument('--site-id', required=True)
+    domains = website.add_parser('domain', help='Manage website domain bindings').add_subparsers(dest='resource_action')
+    for action in ('bind', 'unbind'):
+        command = domains.add_parser(action, help='Prepare domain '+action)
+        command.add_argument('--site-id', required=True)
+        command.add_argument('--domain', required=True)
+    bindings = website.add_parser('certificate', help='Manage website certificate bindings').add_subparsers(dest='resource_action')
+    binding = bindings.add_parser('bind', help='Prepare binding a certificate to a website')
+    binding.add_argument('--site-id', required=True)
+    binding.add_argument('--certificate-id', required=True)
     content = site.add_parser('content', help='Preview, version and restore static website content').add_subparsers(dest='action')
     upload = content.add_parser('upload', help='Prepare a static ZIP upload; apply the returned plan explicitly')
     upload.add_argument('--archive', type=Path, required=True)
-    content.add_parser('versions', help='List website content versions and the current version')
+    upload.add_argument('--site-id', help='Website ID; omitted means the default website')
+    versions = content.add_parser('versions', help='List website content versions and the current version')
+    versions.add_argument('--site-id', help='Website ID; omitted means the default website')
     restore = content.add_parser('restore', help='Prepare restoring an uploaded version or template')
     restore.add_argument('--version', required=True)
+    restore.add_argument('--site-id', help='Website ID; omitted means the default website')
     preview = content.add_parser('preview', help='Write a prepared plan HTML preview to a private file')
     preview.add_argument('--plan-id', required=True)
     preview.add_argument('--output', type=Path, required=True)
@@ -47,6 +68,22 @@ def parser() -> argparse.ArgumentParser:
     imported.add_argument('--certificate', type=Path, required=True)
     imported.add_argument('--key', type=Path, required=True)
     imported.add_argument('--domain', action='append', required=True)
+    certificate.add_parser('list', help='List certificates and their consumers')
+    added = certificate.add_parser('add', help='Prepare adding a manually managed certificate')
+    added.add_argument('--name', required=True)
+    added.add_argument('--domain', action='append', required=True)
+    added.add_argument('--certificate', type=Path, required=True)
+    added.add_argument('--key', type=Path, required=True)
+    replace = certificate.add_parser('replace', help='Prepare replacing a certificate without changing its ID')
+    replace.add_argument('--certificate-id', required=True)
+    replace.add_argument('--certificate', type=Path, required=True)
+    replace.add_argument('--key', type=Path, required=True)
+    requested = certificate.add_parser('request', help='Prepare a managed HTTP-01 certificate request')
+    requested.add_argument('--name', required=True)
+    requested.add_argument('--domain', action='append', required=True)
+    for action in ('renew', 'delete'):
+        command = certificate.add_parser(action, help='Prepare certificate '+action)
+        command.add_argument('--certificate-id', required=True)
     deploy = modules.add_parser('deployment', help='Single-node generation, validation, activation and recovery').add_subparsers(dest='operation')
     init = deploy.add_parser('init', help='Write a private initial config with fresh node and link credentials')
     for field in ('site-domain', 'subscription-domain', 'public-address', 'certificate', 'key'):
@@ -99,6 +136,20 @@ def _initial_config(args) -> dict:
     return {'status': 'created', 'private_config': str(args.output), 'traffic_metadata': 'unknown'}
 
 
+def _read_pem(path: Path) -> str:
+    with path.open('rb') as source:
+        content = source.read(100 * 1024 + 1)
+    if not content or len(content) > 100 * 1024:
+        raise OperationError('PEM file must be nonempty and no larger than 100 KiB')
+    return content.decode('utf-8')
+
+
+def _site_plan(service, kind: str, values: dict) -> dict:
+    with service.state() as state:
+        revision = state.revision
+    return service.create_plan(kind, revision, values)
+
+
 def execute(args) -> dict:
     require_root()
     if args.module == 'install-services':
@@ -126,7 +177,7 @@ def execute(args) -> dict:
         service = OperationService(synchronous=True)
         try:
             if args.action == 'versions':
-                return service.handle('website.content.versions', {})
+                return service.handle('website.content.versions', {'site_id': args.site_id} if args.site_id else {})
             if args.action == 'preview':
                 result = service.handle('website.content.preview', {'plan_id': args.plan_id})
                 atomic_write(args.output, result['html'].encode('utf-8'), 0o600)
@@ -140,16 +191,45 @@ def execute(args) -> dict:
                 kind, values = 'website.content.upload', {'archive_base64': base64.b64encode(archive).decode('ascii')}
             else:
                 kind, values = 'website.content.restore', {'version_id': args.version}
-            with service.state() as state:
-                revision = state.revision
-            return service.create_plan(kind, revision, values)
+            if args.site_id:
+                values['site_id'] = args.site_id
+            return _site_plan(service, kind, values)
         finally:
             service.close()
     if args.module == 'site':
-        from .certificates import import_pair, issue
-        if args.action == 'issue':
-            return issue(args.domain, standalone=not args.webroot)
-        return import_pair(args.certificate, args.key, args.domain)
+        if args.operation == 'certificate' and args.action in {'issue', 'import'}:
+            from .certificates import import_pair, issue
+            if args.action == 'issue':
+                return issue(args.domain, standalone=not args.webroot)
+            return import_pair(args.certificate, args.key, args.domain)
+        from .management import OperationService
+        service = OperationService(synchronous=True)
+        try:
+            if args.action == 'list':
+                return service.handle('web.resources', {})
+            if args.operation == 'website':
+                if args.action == 'create':
+                    values = {'title': args.title, 'domain': args.domain, 'certificate_id': args.certificate_id}
+                else:
+                    values = {'site_id': args.site_id}
+                    if args.action == 'domain':
+                        values['domain'] = args.domain
+                    elif args.action == 'certificate':
+                        values['certificate_id'] = args.certificate_id
+                kind = 'website.' + args.action
+                if args.action in {'domain', 'certificate'}:
+                    kind += '.' + args.resource_action
+            else:
+                if args.action in {'add', 'request'}:
+                    values = {'name': args.name, 'domains': args.domain}
+                else:
+                    values = {'certificate_id': args.certificate_id}
+                if args.action in {'add', 'replace'}:
+                    values.update(certificate_pem=_read_pem(args.certificate), private_key_pem=_read_pem(args.key))
+                kind = 'certificate.' + {'request': 'issue', 'replace': 'import'}.get(args.action, args.action)
+            return _site_plan(service, kind, values)
+        finally:
+            service.close()
     if args.module == 'deployment' and args.operation == 'init':
         return _initial_config(args)
     if args.module == 'sub':
@@ -187,6 +267,13 @@ def execute(args) -> dict:
                 result = apply_append(payload)
                 store.commit(args.plan_id)
                 return result
+        if kind == 'panel-renew':
+            from .management import OperationService
+            service = OperationService(synchronous=True)
+            try:
+                return service.apply_plan(args.plan_id)
+            finally:
+                service.close()
         raise OperationError('Unsupported plan type')
     from .deployment import prepare, recover, apply
     if args.operation == 'plan':
@@ -198,6 +285,41 @@ def execute(args) -> dict:
         base_revision = store.revision
         previous = Path('/var/lib/proxyhub/current').resolve()
         config = json.loads((previous/'config.json').read_text())
+        if 'web' in config:
+            from .certificates import acme_source
+            from .management import OperationService
+            from .management_errors import public_error
+            from .websites import normalize_web
+            bindings = [binding['id'] for binding in normalize_web(config)['certificates'] if acme_source(binding)]
+            service = OperationService(synchronous=True)
+            results = []
+            recovery_required = False
+            try:
+                for identity in bindings:
+                    with service.state() as current:
+                        if current.pending():
+                            results.append({'certificate_id':identity,'status':'failed','error':{'code':'BUSY'}})
+                            recovery_required = True
+                            break
+                        revision = current.revision
+                    try:
+                        prepared = service.create_plan('certificate.renew',revision,{'certificate_id':identity})
+                        results.append({'certificate_id':identity,**service.apply_plan(prepared['plan_id'])})
+                    except Exception as exc:
+                        error = public_error(exc)['code']
+                        results.append({'certificate_id':identity,'status':'failed','error':{'code':error}})
+                        with service.state() as current:
+                            recovery_required = bool(current.pending()) or error == 'BUSY'
+                        if recovery_required:
+                            break
+            finally:
+                service.close()
+            failed = sum(result.get('status') == 'failed' for result in results)
+            result = {'status':('partial_failure' if failed < len(results) else 'failed') if failed else 'checked',
+                      'certificates':results}
+            if recovery_required:
+                result['recovery_required'] = True
+            return result
         server = config['server']
         if not managed_acme(server):
             return {'status':'skipped','certificate':'externally managed; renew through its original issuer'}
@@ -227,8 +349,14 @@ def main(argv=None) -> int:
     if args.module == 'site' and args.action is None:
         _help(root,['site',args.operation])
         return 0
+    if args.module == 'site' and args.operation == 'website' and args.action in {'domain', 'certificate'} and args.resource_action is None:
+        _help(root, ['site', 'website', args.action])
+        return 0
     try:
-        print(json.dumps(execute(args), ensure_ascii=False, indent=2))
+        result = execute(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.module == 'deployment' and args.operation == 'renew' and result.get('status') in {'partial_failure','failed'}:
+            return 1
         return 0
     except Exception as exc:
         # Never echo runtime output, config, key, token, or exception paths.

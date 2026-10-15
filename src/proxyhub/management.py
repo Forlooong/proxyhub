@@ -4,14 +4,17 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import re
-import tempfile
+import secrets
 
 from . import deployment
-from .core import OperationError, atomic_write
+from . import management_web
+from .core import OperationError
 from .jobs import Jobs
 from .management_errors import ManagementError, public_error
 from .management_read import overview, ssh_details
+from .management_read import web_resources
 from .state import StateStore
+from .websites import normalize_web, get_site, get_certificate, sync_default
 
 ROOT = Path('/var/lib/proxyhub')
 
@@ -87,10 +90,15 @@ class OperationService:
             shape(payload,('account','context'))
             return ssh_details(payload['account'],payload['context'])
         if operation == 'website.content.versions':
-            shape(payload,())
+            shape(payload,('site_id',),())
             with self.state() as store:
                 _, config, _, _ = self.snapshot(store,reject_pending=True)
-                return deployment.content_versions(store,config)
+                return deployment.content_versions(store,config,payload.get('site_id','default'))
+        if operation == 'web.resources':
+            shape(payload,())
+            with self.state() as store:
+                _, config, revision, _ = self.snapshot(store,reject_pending=True)
+                return {'revision':revision,**web_resources(config)}
         if operation == 'website.content.preview':
             shape(payload,('plan_id',))
             with self.state() as store:
@@ -99,7 +107,8 @@ class OperationService:
                     if kind != 'deployment' or candidate.get('website_change') is not True:
                         raise ManagementError('VALIDATION','此计划不是网站内容变更。')
                     directory = deployment._managed_revision(deployment.ROOT/'revisions'/candidate['revision'])
-                    files = deployment._read_site(directory,{name:value for name,value in candidate['files'].items() if name.startswith('site/')})
+                    site_id = candidate.get('website_id','default')
+                    files = deployment._read_site(directory,deployment._site_manifest(candidate,site_id),site_id)
             from .site_content import preview_html
             try:
                 html = preview_html(files)
@@ -122,7 +131,7 @@ class OperationService:
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in ('ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.import','certificate.renew'):
+            if payload['kind'] not in management_web.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -143,32 +152,50 @@ class OperationService:
                     directory, config = self.active()
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
+            if kind in management_web.KINDS:
+                result = management_web.change(config,kind,values,self.root)
+                prepared = deployment.prepare(store,result['config'],expected_revision=base_revision,web_only=True)
+                return self.preview(prepared['plan_id'],kind,base_revision,result['changes'],
+                                    ['重新加载网站和订阅发布器，保留现有代理进程。'],result['warnings'])
+            if kind == 'certificate.issue' or (kind == 'certificate.renew' and ('web' in config or values)):
+                return self._acme_plan(store,directory,config,kind,base_revision,values)
             before = deepcopy(config)
             site_files = None
+            site_id = 'default'
             warnings, changes, impact = [], [], ['将重新加载网站、代理与订阅服务，现有连接可能短暂中断。']
             if kind == 'website.update':
-                shape(values,('site_title',))
-                if config.get('website_content') is not None:
+                shape(values,('site_title','site_id'),('site_title',))
+                site_id = values.get('site_id','default')
+                config['web'] = normalize_web(config)
+                selected = get_site(config['web'],site_id)
+                if selected['content_version'] is not None:
                     raise ManagementError('VALIDATION','上传网站的标题由 HTML 管理；如需默认页面，请先恢复默认模板。')
-                config['server']['site_title'] = values['site_title']
-                changes = [{'label':'网站标题','before':before['server']['site_title'],'after':values['site_title']}]
+                changes = [{'label':'网站标题','before':selected['title'],'after':values['site_title']}]
+                selected['title'] = values['site_title']
+                config = sync_default(config)
             elif kind == 'website.content.upload':
-                shape(values,('archive_base64',))
+                shape(values,('archive_base64','site_id'),('archive_base64',))
+                site_id = values.get('site_id','default')
+                selected = get_site(normalize_web(config),site_id)
                 from .site_content import decode_archive
                 site_files = decode_archive(values['archive_base64'])
-                changes = [{'label':'网站内容','before':config.get('website_content') or '默认模板','after':'新上传的静态网站'},
+                changes = [{'label':'网站内容','before':selected['content_version'] or '默认模板','after':'新上传的静态网站'},
                            {'label':'文件数','before':None,'after':len(site_files)},
                            {'label':'内容字节数','before':None,'after':sum(map(len,site_files.values()))}]
                 warnings = ['仅更换静态内容，沿用当前域名、证书、REALITY 与订阅配置。','隔离预览禁用脚本和外部资源；应用后请验证公网网站和真实代理请求。']
             elif kind == 'website.content.restore':
-                shape(values,('version_id',))
+                shape(values,('version_id','site_id'),('version_id',))
+                site_id = values.get('site_id','default')
+                config['web'] = normalize_web(config)
+                selected = get_site(config['web'],site_id)
                 version = values['version_id']
                 if version == 'template':
-                    config.pop('website_content',None)
+                    selected['content_version'] = None
                 else:
-                    deployment.content_version(store,version)
-                    config['website_content'] = version
-                changes = [{'label':'网站内容版本','before':before.get('website_content') or '默认模板','after':version}]
+                    deployment.content_version(store,version,site_id)
+                    selected['content_version'] = version
+                changes = [{'label':'网站内容版本','before':get_site(normalize_web(before),site_id)['content_version'] or '默认模板','after':version}]
+                config = sync_default(config)
                 warnings = ['恢复仅改变内容，沿用当前域名、证书、REALITY 与订阅配置。','恢复默认模板时使用当前网站标题，不恢复历史基础配置。']
             elif kind == 'proxy.update':
                 shape(values,('node_name','public_address'))
@@ -195,29 +222,50 @@ class OperationService:
                     raise ManagementError('UNSUPPORTED','此证书由外部签发流程维护，请导入更新后的证书。')
                 identity = store.plan('panel-renew',{'current':directory.name},expected_revision=base_revision)
                 return self.preview(identity,kind,base_revision,[],['检查 HTTP-01 续期；仅证书变化时加载新证书。'],['必须保持公网 TCP 80 可达；失败保留有效旧配置。'])
-            elif kind == 'certificate.import':
-                shape(values,('certificate_pem','private_key_pem'))
-                for key in values:
-                    if not isinstance(values[key],str) or not 1<=len(values[key].encode())<=100000:
-                        raise ManagementError('VALIDATION','证书和私钥需要有效 PEM，单个输入不得超过 100KB。')
-                from .certificates import import_pair
-                with tempfile.TemporaryDirectory(prefix='.panel-import-',dir=self.root/'certificates') as temporary:
-                    cert, key = Path(temporary)/'cert.pem', Path(temporary)/'key.pem'
-                    atomic_write(cert,values['certificate_pem'].encode(),0o600)
-                    atomic_write(key,values['private_key_pem'].encode(),0o600)
-                    result = import_pair(cert,key,[config['server']['site_domain'],config['server']['subscription_domain']])
-                config['server'].update(certificate_path=result['certificate_path'],key_path=result['key_path'])
-                changes = [{'label':'证书 SHA256','before':'当前绑定证书','after':result['sha256']},
-                           {'label':'有效期至','before':None,'after':result['not_after']}]
-                from .certificates import managed_acme
-                ownership = ('此证书已有受管 HTTP-01 签发记录，保留已验证的自动续期归属。'
-                             if managed_acme(config['server']) else '导入证书由原签发流程维护，不接管自动续期。')
-                warnings = [ownership,'私钥不进入预览或任务结果。']
             options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
+            if kind.startswith('website.'):
+                options.update(site_id=site_id,web_only=True)
+                impact = ['重新加载网站和订阅发布器，保留现有代理进程。']
             if kind.startswith('website.content.'):
                 options.update(site_files=site_files,website_change=True)
             result = deployment.prepare(store,config,**options)
             return self.preview(result['plan_id'],kind,base_revision,changes,impact,warnings)
+
+    def _acme_plan(self, store, directory, config, kind, base_revision, values):
+        from .certificates import acme_source
+        from .proxy import _text, validate_domain
+        web = normalize_web(config)
+        if kind == 'certificate.issue':
+            shape(values,('name','domains'))
+            if len(web['certificates']) >= 32:
+                raise ManagementError('VALIDATION','证书绑定数量已达到上限。')
+            if not isinstance(values['domains'],list) or not 1 <= len(values['domains']) <= 10:
+                raise ManagementError('VALIDATION','请输入 1–10 个有效域名。')
+            domains = [validate_domain(domain) for domain in values['domains']]
+            if len(set(domains)) != len(domains):
+                raise ManagementError('VALIDATION','域名不得重复。')
+            identity, name = secrets.token_hex(16), _text(values['name'],'certificate name')
+            lineage = 'proxyhub-'+identity
+            action = 'issue'
+        else:
+            shape(values,('certificate_id',),())
+            identity = values.get('certificate_id',get_site(web,'default')['certificate_id'])
+            binding = get_certificate(web,identity)
+            source = acme_source(binding)
+            if source is None:
+                raise ManagementError('UNSUPPORTED','此绑定由外部流程维护，请导入更新后的证书。')
+            name, domains, lineage = binding['name'], source['domains'], source['lineage']
+            action = 'renew'
+        for domain in domains:
+            management_web.check_domain(config['server'],domain)
+        payload = {'current':directory.name,'action':action,'certificate_id':identity,
+                   'name':name,'domains':domains,'lineage':lineage}
+        plan = store.plan('panel-renew',payload,expected_revision=base_revision)
+        return self.preview(plan,kind,base_revision,
+                            [{'label':'证书绑定','before':None if action=='issue' else identity,'after':identity},
+                             {'label':'域名','before':None,'after':domains}],
+                            ['申请成功后才保存绑定；证书变化时重载其消费者并核对实际指纹，保留代理进程。'],
+                            ['HTTP-01 要求所有 A/AAAA 正确指向本机且公网 TCP 80 可达。','签发失败不会替换当前有效配置；手工证书不会自动接管续期。'])
 
     def _ssh_plan(self, store, base_revision, values):
         from .host.ssh import plan_append
@@ -244,6 +292,9 @@ class OperationService:
     def preview(identity,kind,revision,changes,impact,warnings):
         return {'plan_id':identity,'kind':kind,'base_revision':revision,
                 'summary':{'ssh.append':'追加 SSH 公钥','website.update':'更新网站标题','proxy.update':'更新 REALITY 节点',
+                           'website.create':'创建网站','website.enable':'启用网站','website.disable':'停用网站','website.delete':'删除网站',
+                           'website.domain.bind':'绑定网站域名','website.domain.unbind':'解绑网站域名','website.certificate.bind':'更换网站证书绑定',
+                           'certificate.add':'新增证书绑定','certificate.issue':'申请新证书绑定','certificate.delete':'删除证书绑定',
                            'website.content.upload':'发布网站内容','website.content.restore':'恢复网站内容',
                            'subscription.update':'发布订阅变更','certificate.import':'替换绑定证书','certificate.renew':'检查并更新证书'}[kind],
                 'changes':changes,'impact':impact,'warnings':warnings}
@@ -262,6 +313,8 @@ class OperationService:
                     store.commit(identity)
                 return {key:result[key] for key in ('status','verification','fingerprint')}
             if kind == 'panel-renew':
+                if 'action' in payload:
+                    return self._apply_acme(store,identity)
                 from .certificates import issue, managed_acme
                 with store.exclusive():
                     _,payload = store.get(identity)
@@ -288,6 +341,48 @@ class OperationService:
                 store.link_renewal(identity,prepared['plan_id'])
                 return deployment.apply(store,prepared['plan_id'])
             raise ManagementError('UNSUPPORTED','此计划不属于已接入的操作。')
+
+    def _apply_acme(self, store, identity):
+        from .certificates import issue, acme_source
+        with store.exclusive():
+            _, payload = store.get(identity)
+            child = store.renewal_child(identity)
+            base = store.revision
+            directory, config = self.active()
+        if child is not None:
+            return deployment.apply(store,child)
+        if directory.name != payload['current']:
+            raise ManagementError('STALE_REVISION','证书或绑定关系已变化，请重新预览。')
+        web = normalize_web(config)
+        binding = None
+        if payload['action']=='renew':
+            binding = get_certificate(web,payload['certificate_id'])
+            source = acme_source(binding)
+            if source is None or source['lineage'] != payload['lineage'] or source['domains'] != payload['domains']:
+                raise ManagementError('STALE_REVISION','证书的续期归属已变化，请重新预览。')
+        elif payload['action']!='issue':
+            raise ManagementError('UNSUPPORTED','不支持此证书任务。')
+        for domain in payload['domains']:
+            management_web.check_domain(config['server'],domain)
+        certificate = issue(payload['domains'],standalone=False,lineage=payload['lineage'])
+        if store.revision != base or self.active()[0] != directory:
+            raise ManagementError('STALE_REVISION','签发期间配置已变化，已保留当前部署，请重新预览。')
+        if binding is not None and certificate['certificate_path']==binding['certificate_path']:
+            with store.exclusive():
+                store.get(identity)
+                if self.active()[0] != directory:
+                    raise ManagementError('STALE_REVISION','证书绑定已变化，请重新预览。')
+                store.commit(identity)
+            return {'status':'unchanged','certificate_id':binding['id'],'message':'证书未到更新期，当前服务保持运行。'}
+        if binding is None:
+            binding = {'id':payload['certificate_id'],'name':payload['name'],'domains':payload['domains']}
+            web['certificates'].append(binding)
+        binding.update(certificate_path=certificate['certificate_path'],key_path=certificate['key_path'])
+        config['web'] = web
+        config = sync_default(config)
+        prepared = deployment.prepare(store,config,expected_revision=base,web_only=True)
+        store.link_renewal(identity,prepared['plan_id'])
+        return deployment.apply(store,prepared['plan_id'])
 
     def recover(self):
         with self.state() as store:

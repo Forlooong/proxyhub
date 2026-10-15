@@ -9,6 +9,7 @@ import socket
 
 from .core import canonical, run
 from .management_errors import ManagementError
+from .websites import normalize_web, get_site, consumers, site_dependencies
 
 
 def accounts():
@@ -60,19 +61,39 @@ def ssh_details(account, context):
             'verification':'unverified'}
 
 
-def overview(config, revision, jobs, root):
-    from .certificates import managed_acme
+def web_resources(config):
+    from .certificates import acme_source, managed_acme
     from .site import validate_certificate
+    web = normalize_web(config)
+    server = config['server']
+    certificates = []
+    for binding in web['certificates']:
+        users = consumers(web,server,binding['id'])
+        domains = list(dict.fromkeys(binding['domains']+[item['domain'] for item in users if item['domain']]))
+        try:
+            details = validate_certificate(binding['certificate_path'],binding['key_path'],domains)
+            state = {'not_after':details['not_after'],'sha256':details['sha256'],'status':'valid','error':None}
+        except Exception:
+            state = {'not_after':None,'sha256':None,'status':'invalid',
+                     'error':'证书不可用或校验失败，请检查有效期、域名及私钥匹配。'}
+        automatic = acme_source(binding) is not None
+        if 'web' not in config and binding['id'] == 'default':
+            automatic = managed_acme(server)
+        certificates.append({'id':binding['id'],'name':binding['name'],'domains':domains,**state,
+                             'automatic_renewal':automatic,'consumers':users})
+    suffix = '' if server['public_port']==443 else ':'+str(server['public_port'])
+    sites = [{**{key:site[key] for key in ('id','listener_id','tls_port','domains','title','enabled','certificate_id','content_version')},
+              'url':'https://'+site['domains'][0]+suffix if site['enabled'] else None,
+              'dependencies':site_dependencies(web,server,site['id'])} for site in web['sites']]
+    return {'websites':sites,'certificates':certificates}
+
+
+def overview(config, revision, jobs, root):
     server, sub = config['server'], config['subscription']
-    domains = [server['site_domain'],server['subscription_domain']]
-    try:
-        certificate = {**validate_certificate(server['certificate_path'],server['key_path'],domains),
-                       'status':'valid','error':None}
-    except Exception:
-        # The management surface must remain usable to repair expired/missing
-        # certificates. Runtime validation still fails closed before activation.
-        certificate = {'domains':domains,'not_after':None,'sha256':None,'status':'invalid',
-                       'error':'证书不可用或校验失败，请检查有效期、域名与私钥匹配，并通过续期或导入修复。'}
+    resources = web_resources(config)
+    primary = get_site(normalize_web(config),'default')
+    binding = next(item for item in resources['certificates'] if item['id']==primary['certificate_id'])
+    certificate = binding
     status = []
     for unit in ('proxyhub-proxy','proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
         try:
@@ -106,10 +127,10 @@ def overview(config, revision, jobs, root):
                       'memory_total_bytes':total,'accounts':accounts(),'ssh_context':defaults},
             'website':{'id':'default','domain':server['site_domain'],'title':server['site_title'],'url':'https://'+server['site_domain']+port,
                        'content_version':config.get('website_content')},
-            'certificate':{'id':Path(server['certificate_path']).parent.name,'domains':certificate['domains'],
+            'certificate':{'id':binding['id'],'domains':certificate['domains'],
                            'not_after':certificate['not_after'],'sha256':certificate['sha256'],
                            'status':certificate['status'],'error':certificate['error'],
-                           'automatic_renewal':managed_acme(server),'consumers':['网站 HTTPS','订阅 HTTPS','REALITY 本机握手目标（间接）']},
+                           'automatic_renewal':binding['automatic_renewal'],'consumers':[item['label'] for item in binding['consumers']]},
             'proxy':{'id':'local-reality','name':server['node_name'],'protocol':'VLESS REALITY / Vision',
                      'public_address':server['public_address'],'port':server['public_port'],'sni':server['site_domain'],
                      'target':'127.0.0.1:'+str(server['site_tls_port']),'verification':'请使用客户端验证当前连接；服务运行不等于真实代理请求通过'},
@@ -118,8 +139,8 @@ def overview(config, revision, jobs, root):
                             'reset_day':sub.get('reset_day'),'reset_at':sub.get('reset_at'),
                             'overrides':config['overrides'],'traffic_source':'manual'},
             'services':status,'capabilities':[
-                {'name':'单网站 / REALITY / 单订阅','available':True,'reason':'当前已接入的管理范围'},
+                {'name':'多网站 / 证书依赖 / REALITY / 单订阅','available':True,'reason':'网站与证书绑定独立管理，现有 REALITY 目标保留'},
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
-                {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'在当前单站点复用部署计划与回滚'},
-                {'name':'多站点、HY2、外部目标、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
-            'recent_jobs':jobs.list()['jobs'][:5]}
+                {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
+                {'name':'HY2、外部目标、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
+            **resources,'recent_jobs':jobs.list()['jobs'][:5]}
