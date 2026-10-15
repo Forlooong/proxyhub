@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import stat
@@ -24,6 +25,80 @@ APP = Path('/opt/proxyhub/app')
 CANDIDATE_FILES = ('sing-box.json', 'nginx.conf', 'site/index.html', 'bundle.json', 'config.json', 'client.yaml')
 
 
+def _read_site(directory: Path, manifest: dict) -> dict[str, bytes]:
+    """Read only the bounded static tree recorded in an immutable plan."""
+    from .site_content import MAX_EXPANDED_BYTES, MAX_FILES, validate_files
+    site = directory / 'site'
+    if site.is_symlink() or not site.is_dir():
+        raise OperationError('Website content is not a managed directory')
+    files, total, entries = {}, 0, 0
+    for parent, directories, names in os.walk(site, followlinks=False):
+        for name in directories + names:
+            entries += 1
+            path = Path(parent) / name
+            if entries > MAX_FILES or path.is_symlink():
+                raise OperationError('Website content contains unsafe or excessive entries')
+            if name in directories:
+                continue
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise OperationError('Website content is not a regular file')
+            relative = path.relative_to(site).as_posix()
+            if 'site/' + relative not in manifest:
+                raise OperationError('Website content differs from its immutable manifest')
+            with path.open('rb') as source:
+                body = source.read(MAX_EXPANDED_BYTES - total + 1)
+            total += len(body)
+            if total > MAX_EXPANDED_BYTES:
+                raise OperationError('Website content exceeds the size limit')
+            files[relative] = body
+    files = validate_files(files)
+    if {'site/' + name: digest(body) for name, body in files.items()} != manifest:
+        raise OperationError('Website content changed after validation')
+    return files
+
+
+def content_version(store: StateStore, version: str) -> dict[str, bytes]:
+    """Only successfully applied uploads are eligible for content restoration."""
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9a-f]{32}', version):
+        raise OperationError('Invalid website content version')
+    for (identity,) in store.db.execute("SELECT id FROM plans WHERE kind='deployment' AND status='applied' ORDER BY created DESC, rowid DESC"):
+        payload = store.inspect(identity)['payload']
+        if payload.get('revision') == version and payload.get('content_version') == version:
+            directory = _managed_revision(ROOT / 'revisions' / version)
+            return _read_site(directory, {name: value for name, value in payload['files'].items() if name.startswith('site/')})
+    raise OperationError('Website content version has not been successfully applied')
+
+
+def content_versions(store: StateStore, config: dict) -> dict:
+    current = config.get('website_content')
+    template = render_site(config['server']).encode()
+    versions = [{'id': 'template', 'source': 'template', 'created': None,
+                 'file_count': 1, 'total_bytes': len(template), 'current': current is None}]
+    seen = set()
+    for identity, created in store.db.execute("SELECT id,created FROM plans WHERE kind='deployment' AND status='applied' ORDER BY created DESC, rowid DESC"):
+        payload = store.inspect(identity)['payload']
+        version = payload.get('content_version')
+        if version is None or version != payload.get('revision') or version in seen:
+            continue
+        seen.add(version)
+        if len(versions) <= 50 or version == current:
+            versions.append({'id': version, 'source': 'upload', 'created': created,
+                             **payload['website_summary'], 'current': current == version})
+    return {'current_version': current, 'versions': versions}
+
+
+def _verify_candidate(directory: Path, payload: dict) -> None:
+    manifest = payload['files']
+    if (not isinstance(manifest, dict) or not set(CANDIDATE_FILES) <= set(manifest)
+            or any(name not in CANDIDATE_FILES and not name.startswith('site/') for name in manifest)):
+        raise OperationError('Candidate file manifest is invalid')
+    _read_site(directory, {name: value for name, value in manifest.items() if name.startswith('site/')})
+    for name in set(CANDIDATE_FILES) - {'site/index.html'}:
+        file = directory / name
+        if file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != manifest[name]:
+            raise OperationError('Candidate file changed after validation')
+
+
 def client_config(server: dict, overrides: dict) -> dict:
     node = {key: server[key] for key in ('uuid', 'public_key', 'short_id')}
     node.update(id='local-reality', name=server['node_name'], server=server['public_address'],
@@ -33,13 +108,14 @@ def client_config(server: dict, overrides: dict) -> dict:
 
 
 def prepare(store: StateStore, config: dict, *, expected_revision: int | None = None,
-            publish_only: bool = False) -> dict:
+            publish_only: bool = False, site_files: dict[str, bytes] | None = None,
+            website_change: bool = False) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
     if store.pending():
         raise OperationError('Recover the interrupted activation before preparing a deployment')
-    if set(config) != {'server', 'subscription', 'overrides'}:
+    if not {'server', 'subscription', 'overrides'} <= set(config) or set(config) - {'server', 'subscription', 'overrides', 'website_content'}:
         raise OperationError('Deployment requires server, subscription and overrides objects only')
     if type(publish_only) is not bool:
         raise OperationError('Publication activation selection must be a boolean')
@@ -47,44 +123,73 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
     if server['publisher_port'] != 18890:
         raise OperationError('The phase-1 publisher unit reserves loopback port 18890')
     if publish_only:
-        _publication_server(server, _current_revision())
+        _publication_server(server, _current_revision(), config)
+        if site_files is not None:
+            raise OperationError('Publication-only activation cannot change website content')
     certificate = validate_certificate(server['certificate_path'], server['key_path'], [server['site_domain'],server['subscription_domain']])
     generated = client_config(server, config['overrides'])
     revision = secrets.token_hex(16)
+    config = dict(config)
+    from .site_content import validate_files
+    if site_files is not None:
+        site_files = validate_files(site_files)
+        config['website_content'] = revision
+    elif 'website_content' in config:
+        site_files = content_version(store, config['website_content'])
+    else:
+        site_files = {'index.html': render_site(server).encode()}
     directory = ROOT/'revisions'/revision
     directory.mkdir(parents=True, mode=0o711)
-    # The manager runs with UMask=0077. mkdir's mode is filtered by that mask;
-    # runtime users still need to traverse the immutable revision after restart.
-    directory.chmod(0o711)
-    (directory/'site').mkdir(mode=0o755)
-    (directory/'site').chmod(0o755)
-    import pwd
-    proxy_gid = pwd.getpwnam('proxyhub-proxy').pw_gid
-    singbox = directory/'sing-box.json'
-    atomic_write(singbox, canonical(render_sing_box(server)), 0o640)
-    os.chown(singbox, 0, proxy_gid)
-    atomic_write(directory/'nginx.conf', render_nginx(server, str(directory)).encode(), 0o600)
-    atomic_write(directory/'site/index.html', render_site(server).encode(), 0o644)
-    subscription = dict(config['subscription'])
-    subscription.update(host=server['subscription_domain'], yaml=generated['yaml'], raw=generated['raw'])
-    bundle = build_bundle([subscription], revision)
-    save_bundle(directory/'bundle.json', bundle)
-    atomic_write(directory/'config.json', canonical({**config, 'server':server}))
-    atomic_write(directory/'client.yaml', generated['yaml'].encode())
-    run([str(BIN/'sing-box'), 'check', '-c', str(singbox)])
-    run([str(BIN/'nginx'), '-e', 'stderr', '-p', str(ROOT/'nginx')+'/', '-t', '-c', str(directory/'nginx.conf')])
-    run([str(BIN/'mihomo'), '-t', '-d', str(ROOT/'client-check'), '-f', str(directory/'client.yaml')])
-    files = {str(path.relative_to(directory)): digest(path.read_bytes()) for path in directory.rglob('*') if path.is_file()}
-    payload = {'revision':revision, 'files':files, 'site_domain':server['site_domain'],
-               'subscription_domain':server['subscription_domain'], 'certificate_sha256':certificate['sha256'],
-               'certificate_files': _certificate_files(server),
-               'activation': 'publication' if publish_only else 'full'}
-    plan_id = store.plan('deployment', payload, expected_revision=base_revision)
-    return {'plan_id':plan_id,'revision':revision,'site_domain':server['site_domain'],
-            'subscription_domain':server['subscription_domain'],'checks':['certificate','sing-box','nginx','mihomo'],
-            'activation': payload['activation'],
-            'changes':(['subscription bundle','publisher reload'] if publish_only else
-                       ['managed website','REALITY listener','subscription bundle','ProxyHub service activation'])}
+    try:
+        # The manager runs with UMask=0077. mkdir's mode is filtered by that mask;
+        # runtime users still need to traverse the immutable revision after restart.
+        directory.chmod(0o711)
+        (directory/'site').mkdir(mode=0o755)
+        (directory/'site').chmod(0o755)
+        import pwd
+        proxy_gid = pwd.getpwnam('proxyhub-proxy').pw_gid
+        singbox = directory/'sing-box.json'
+        atomic_write(singbox, canonical(render_sing_box(server)), 0o640)
+        os.chown(singbox, 0, proxy_gid)
+        atomic_write(directory/'nginx.conf', render_nginx(server, str(directory)).encode(), 0o600)
+        for name, body in site_files.items():
+            target = directory / 'site' / name
+            atomic_write(target, body, 0o644)
+            parent = target.parent
+            while parent != directory:
+                parent.chmod(0o755)
+                parent = parent.parent
+        subscription = dict(config['subscription'])
+        subscription.update(host=server['subscription_domain'], yaml=generated['yaml'], raw=generated['raw'])
+        bundle = build_bundle([subscription], revision)
+        save_bundle(directory/'bundle.json', bundle)
+        atomic_write(directory/'config.json', canonical({**config, 'server':server}))
+        atomic_write(directory/'client.yaml', generated['yaml'].encode())
+        run([str(BIN/'sing-box'), 'check', '-c', str(singbox)])
+        run([str(BIN/'nginx'), '-e', 'stderr', '-p', str(ROOT/'nginx')+'/', '-t', '-c', str(directory/'nginx.conf')])
+        run([str(BIN/'mihomo'), '-t', '-d', str(ROOT/'client-check'), '-f', str(directory/'client.yaml')])
+        files = {path.relative_to(directory).as_posix(): digest(path.read_bytes()) for path in directory.rglob('*') if path.is_file()}
+        payload = {'revision':revision, 'files':files, 'site_domain':server['site_domain'],
+                   'subscription_domain':server['subscription_domain'], 'certificate_sha256':certificate['sha256'],
+                   'certificate_files': _certificate_files(server),
+                   'activation': 'publication' if publish_only else 'full'}
+        if 'website_content' in config:
+            payload['content_version'] = config['website_content']
+        if config.get('website_content') == revision:
+            payload['website_summary'] = {'file_count': len(site_files), 'total_bytes': sum(map(len, site_files.values()))}
+        if website_change:
+            payload['website_change'] = True
+        plan_id = store.plan('deployment', payload, expected_revision=base_revision)
+        return {'plan_id':plan_id,'revision':revision,'site_domain':server['site_domain'],
+                'subscription_domain':server['subscription_domain'],'checks':['certificate','sing-box','nginx','mihomo'],
+                'activation': payload['activation'],
+                'changes':(['subscription bundle','publisher reload'] if publish_only else
+                           ['managed website','REALITY listener','subscription bundle','ProxyHub service activation'])}
+    except Exception:
+        # This directory was created exclusively for this failed preparation.
+        shutil.rmtree(directory)
+        raise
+
 
 
 def _activation(payload: dict) -> str:
@@ -95,7 +200,7 @@ def _activation(payload: dict) -> str:
     return mode
 
 
-def _publication_server(server: dict, previous: Path | None) -> None:
+def _publication_server(server: dict, previous: Path | None, config: dict | None = None) -> None:
     """Publication-only plans must not silently change any server-owned field."""
     if previous is None:
         raise OperationError('Publication-only activation requires an active deployment')
@@ -105,6 +210,8 @@ def _publication_server(server: dict, previous: Path | None) -> None:
     current = json.loads(path.read_text(encoding='utf-8'))
     if validate_spec(server) != validate_spec(current['server']):
         raise OperationError('Publication-only activation cannot change server configuration')
+    if config is not None and config.get('website_content') != current.get('website_content'):
+        raise OperationError('Publication-only activation cannot change website content')
 
 
 def _link(directory: Path) -> None:
@@ -189,13 +296,14 @@ def _check_runtime_permissions(directory: Path) -> None:
     """
     if os.name != 'posix':
         return
-    for path in (ROOT, ROOT/'revisions', directory, directory/'site'):
+    for path in (ROOT, ROOT/'revisions', directory, directory/'site',
+                 *(path for path in (directory/'site').rglob('*') if path.is_dir())):
         info = path.lstat()
         if (not stat.S_ISDIR(info.st_mode) or not info.st_mode & stat.S_IXOTH
                 or info.st_mode & 0o022):
             raise OperationError('Managed runtime directory permissions do not allow safe service access')
     for path, required in ((directory/'sing-box.json', stat.S_IRGRP),
-                           (directory/'site/index.html', stat.S_IROTH)):
+                           *((path, stat.S_IROTH) for path in (directory/'site').rglob('*') if path.is_file())):
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or not info.st_mode & required
                 or info.st_mode & 0o022):
@@ -223,7 +331,7 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full') -
         # Re-check this invariant during crash recovery as well as normal apply.
         # A publication rollback must never mask a server configuration change.
         config = json.loads((candidate / 'config.json').read_text(encoding='utf-8'))
-        _publication_server(config['server'], previous)
+        _publication_server(config['server'], previous, config)
         _link(previous)
         _publish(previous)
         run(['systemctl', 'reload', 'proxyhub-publisher.service'])
@@ -320,6 +428,21 @@ def _wait_health(server: dict) -> None:
             time.sleep(0.2)
 
 
+def _website_health(server: dict, directory: Path) -> None:
+    """A running web server must actually serve the selected index before commit."""
+    expected = (directory / 'site/index.html').read_bytes()
+    with socket.create_connection(('127.0.0.1', server['site_tls_port']), timeout=5) as raw:
+        with ssl.create_default_context().wrap_socket(raw, server_hostname=server['site_domain']) as stream:
+            stream.sendall(f"GET / HTTP/1.1\r\nHost: {server['site_domain']}\r\nConnection: close\r\n\r\n".encode())
+            response = http.client.HTTPResponse(stream)
+            try:
+                response.begin()
+                if response.status != 200 or response.read(len(expected) + 1) != expected:
+                    raise OperationError('Website has not loaded the selected content')
+            finally:
+                response.close()
+
+
 def _publication_health(directory: Path) -> None:
     """Check the loaded generation, exact bodies and headers through real GETs.
 
@@ -376,12 +499,7 @@ def apply(store: StateStore, identity: str) -> dict:
             raise OperationError('Plan type is not deployment')
         activation = _activation(payload)
         directory = _managed_revision(ROOT/'revisions'/payload['revision'])
-        if set(payload['files']) != set(CANDIDATE_FILES):
-            raise OperationError('Candidate file manifest is invalid')
-        for name, expected in payload['files'].items():
-            file = directory/name
-            if file.parent.is_symlink() or file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != expected:
-                raise OperationError('Candidate file changed after validation')
+        _verify_candidate(directory, payload)
         config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
         server = config['server']
         certificate = validate_certificate(server['certificate_path'], server['key_path'],
@@ -391,7 +509,7 @@ def apply(store: StateStore, identity: str) -> dict:
             raise OperationError('Deployment certificate changed after validation')
         previous = _current_revision()
         if activation == 'publication':
-            _publication_server(server, previous)
+            _publication_server(server, previous, config)
         _check_runtime_permissions(directory)
         if previous is None:
             _check_ports(server)
@@ -407,6 +525,8 @@ def apply(store: StateStore, identity: str) -> dict:
                 for service in _units():
                     run(['systemctl','restart',service])
                 _wait_health(server)
+                if payload.get('website_change') or config.get('website_content'):
+                    _website_health(server, directory)
                 run(['systemctl','enable',*_units()])
             store.commit(identity)
         except Exception:

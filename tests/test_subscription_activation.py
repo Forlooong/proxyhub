@@ -94,6 +94,131 @@ def read_config(path):
     return json.loads((path / 'config.json').read_text(encoding='utf-8'))
 
 
+@pytest.fixture
+def website_environment(environment, monkeypatch):
+    env = environment
+    monkeypatch.setitem(sys.modules, 'pwd', SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_gid=123)))
+    monkeypatch.setattr(deployment.os, 'chown', lambda *a: None, raising=False)
+    monkeypatch.setattr(deployment, 'render_nginx', lambda *a: 'test nginx config')
+    monkeypatch.setattr(deployment, 'client_config', lambda *a: {'yaml':profile()['yaml'],'raw':profile()['raw']})
+    monkeypatch.setattr(deployment, '_wait_health', lambda server: None)
+    monkeypatch.setattr(deployment, '_wait_publication', lambda directory: None)
+    monkeypatch.setattr(deployment, '_website_health', lambda server, directory: None)
+    return env
+
+
+def test_uploaded_content_survives_publication_and_restores_without_old_config(website_environment):
+    env = website_environment
+    config = read_config(env.previous)
+    files = {'index.html':b'<h1>Uploaded</h1>','assets/site.css':b'h1 {color:blue}'}
+    uploaded = deployment.prepare(env.store,config,site_files=files,website_change=True)
+    with pytest.raises(OperationError,match='not been successfully applied'):
+        deployment.content_version(env.store,uploaded['revision'])
+    deployment.apply(env.store,uploaded['plan_id'])
+    assert deployment.content_version(env.store,uploaded['revision']) == files
+    config = read_config(env.pointer['current'])
+    assert config['website_content'] == uploaded['revision']
+    config['subscription']['name'] = 'New metadata'
+    published = deployment.prepare(env.store,config,publish_only=True)
+    env.calls.clear()
+    deployment.apply(env.store,published['plan_id'])
+    assert ('systemctl','reload','proxyhub-publisher.service') in env.calls
+    assert not any('restart' in call for call in env.calls)
+    assert (env.pointer['current']/'site/assets/site.css').read_bytes() == files['assets/site.css']
+    versions = deployment.content_versions(env.store,config)
+    assert [item['id'] for item in versions['versions']] == ['template',uploaded['revision']]
+    assert versions['versions'][1]['current'] is True
+    config['server']['node_name'] = 'Current node name'
+    config.pop('website_content')
+    template = deployment.prepare(env.store,config,website_change=True)
+    deployment.apply(env.store,template['plan_id'])
+    assert 'website_content' not in read_config(env.pointer['current'])
+    config['website_content'] = uploaded['revision']
+    restored = deployment.prepare(env.store,config,website_change=True)
+    deployment.apply(env.store,restored['plan_id'])
+    active = read_config(env.pointer['current'])
+    assert active['server']['node_name'] == 'Current node name'
+    assert active['subscription']['name'] == 'New metadata'
+    assert (env.pointer['current']/'site/index.html').read_bytes() == files['index.html']
+
+
+@pytest.mark.parametrize('mutation',['asset','extra','missing'])
+def test_uploaded_asset_changes_rejected_before_activation(website_environment,mutation):
+    env = website_environment
+    result = deployment.prepare(env.store,read_config(env.previous),site_files={
+        'index.html':b'Upload','assets/style.css':b'body {}'},website_change=True)
+    directory = env.root/'revisions'/result['revision']
+    if mutation == 'asset':
+        (directory/'site/assets/style.css').write_bytes(b'tampered')
+    elif mutation == 'extra':
+        (directory/'site/extra.txt').write_bytes(b'unlisted')
+    else:
+        (directory/'site/assets/style.css').unlink()
+    env.calls.clear()
+    with pytest.raises(OperationError):
+        deployment.apply(env.store,result['plan_id'])
+    assert env.calls == [] and env.pointer['current'] == env.previous
+
+
+def test_website_ack_failure_restores_previous_and_does_not_publish_history(website_environment,monkeypatch):
+    env = website_environment
+    result = deployment.prepare(env.store,read_config(env.previous),site_files={'index.html':b'new'},website_change=True)
+    def failure(*args):
+        raise OperationError('Website has not loaded the selected content')
+    monkeypatch.setattr(deployment,'_website_health',failure)
+    with pytest.raises(OperationError,match='not loaded'):
+        deployment.apply(env.store,result['plan_id'])
+    assert env.pointer['current'] == env.previous and env.store.pending() == []
+    assert env.store.inspect(result['plan_id'])['status'] == 'failed'
+    assert len(deployment.content_versions(env.store,read_config(env.previous))['versions']) == 1
+
+
+def test_interrupted_website_activation_recovers_previous(website_environment):
+    env = website_environment
+    result = deployment.prepare(env.store,read_config(env.previous),site_files={'index.html':b'new','a/x.css':b'x {}'},website_change=True)
+    directory = env.root/'revisions'/result['revision']
+    env.store.record(result['plan_id'],'activating',{'previous':str(env.previous),'candidate':str(directory),'activation':'full'})
+    env.pointer['current'] = directory
+    assert deployment.recover(env.store)['status'] == 'recovered'
+    assert env.pointer['current'] == env.previous
+    with pytest.raises(OperationError,match='not been successfully applied'):
+        deployment.content_version(env.store,result['revision'])
+
+
+def test_failed_website_prepare_cleans_only_its_candidate(website_environment,monkeypatch):
+    env = website_environment
+    before = set((env.root/'revisions').iterdir())
+    def fail(*args,**kwargs):
+        raise OperationError('runtime check failed')
+    monkeypatch.setattr(deployment,'run',fail)
+    with pytest.raises(OperationError,match='runtime check failed'):
+        deployment.prepare(env.store,read_config(env.previous),site_files={'index.html':b'new'})
+    assert set((env.root/'revisions').iterdir()) == before
+    assert env.store.db.execute('SELECT count(*) FROM plans').fetchone()[0] == 0
+
+
+def test_publication_cannot_restore_content(website_environment):
+    env = website_environment
+    config = read_config(env.previous)
+    config['website_content'] = 'b'*32
+    with pytest.raises(OperationError,match='cannot change website'):
+        deployment.prepare(env.store,config,publish_only=True)
+
+
+@pytest.mark.skipif(os.name != 'posix',reason='Real Unix directory modes')
+def test_nested_uploaded_assets_keep_runtime_access_under_private_umask(website_environment):
+    env = website_environment
+    previous = os.umask(0o077)
+    try:
+        result = deployment.prepare(env.store,read_config(env.previous),site_files={'index.html':b'new','a/b/style.css':b'x {}'})
+    finally:
+        os.umask(previous)
+    directory = env.root/'revisions'/result['revision']
+    deployment._check_runtime_permissions(directory)
+    assert stat.S_IMODE((directory/'site/a/b').stat().st_mode) == 0o755
+    assert stat.S_IMODE((directory/'site/a/b/style.css').stat().st_mode) == 0o644
+
+
 @pytest.mark.parametrize('field,value', [
     ('site_title', 'Changed title'), ('node_name', 'Changed node'),
     ('site_domain', 'new.example.test'), ('subscription_domain', 'newsub.example.test'),

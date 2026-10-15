@@ -29,9 +29,9 @@ def identifier(value):
 
 
 class OperationService:
-    def __init__(self, root=ROOT, *, jobs=None):
+    def __init__(self, root=ROOT, *, jobs=None, synchronous=False):
         self.root = Path(root)
-        self.jobs = jobs or Jobs(self.root/'plans')
+        self.jobs = None if synchronous else (jobs or Jobs(self.root/'plans'))
 
     @contextmanager
     def state(self):
@@ -86,6 +86,26 @@ class OperationService:
         if operation == 'ssh.inspect':
             shape(payload,('account','context'))
             return ssh_details(payload['account'],payload['context'])
+        if operation == 'website.content.versions':
+            shape(payload,())
+            with self.state() as store:
+                _, config, _, _ = self.snapshot(store,reject_pending=True)
+                return deployment.content_versions(store,config)
+        if operation == 'website.content.preview':
+            shape(payload,('plan_id',))
+            with self.state() as store:
+                with store.exclusive():
+                    kind, candidate = store.get(identifier(payload['plan_id']))
+                    if kind != 'deployment' or candidate.get('website_change') is not True:
+                        raise ManagementError('VALIDATION','此计划不是网站内容变更。')
+                    directory = deployment._managed_revision(deployment.ROOT/'revisions'/candidate['revision'])
+                    files = deployment._read_site(directory,{name:value for name,value in candidate['files'].items() if name.startswith('site/')})
+            from .site_content import preview_html
+            try:
+                html = preview_html(files)
+            except ValueError:
+                raise ManagementError('PREVIEW_UNAVAILABLE','静态预览超过大小或结构限制，无法显示；候选未改变，仍可确认应用后通过公网网站检查。') from None
+            return {'html':html,'file_count':len(files),'total_bytes':sum(map(len,files.values()))}
         if operation == 'subscription.reveal':
             shape(payload,('format',))
             with self.state() as store:
@@ -102,7 +122,7 @@ class OperationService:
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in ('ssh.append','website.update','proxy.update','subscription.update','certificate.import','certificate.renew'):
+            if payload['kind'] not in ('ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.import','certificate.renew'):
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -124,11 +144,32 @@ class OperationService:
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
             before = deepcopy(config)
+            site_files = None
             warnings, changes, impact = [], [], ['将重新加载网站、代理与订阅服务，现有连接可能短暂中断。']
             if kind == 'website.update':
                 shape(values,('site_title',))
+                if config.get('website_content') is not None:
+                    raise ManagementError('VALIDATION','上传网站的标题由 HTML 管理；如需默认页面，请先恢复默认模板。')
                 config['server']['site_title'] = values['site_title']
                 changes = [{'label':'网站标题','before':before['server']['site_title'],'after':values['site_title']}]
+            elif kind == 'website.content.upload':
+                shape(values,('archive_base64',))
+                from .site_content import decode_archive
+                site_files = decode_archive(values['archive_base64'])
+                changes = [{'label':'网站内容','before':config.get('website_content') or '默认模板','after':'新上传的静态网站'},
+                           {'label':'文件数','before':None,'after':len(site_files)},
+                           {'label':'内容字节数','before':None,'after':sum(map(len,site_files.values()))}]
+                warnings = ['仅更换静态内容，沿用当前域名、证书、REALITY 与订阅配置。','隔离预览禁用脚本和外部资源；应用后请验证公网网站和真实代理请求。']
+            elif kind == 'website.content.restore':
+                shape(values,('version_id',))
+                version = values['version_id']
+                if version == 'template':
+                    config.pop('website_content',None)
+                else:
+                    deployment.content_version(store,version)
+                    config['website_content'] = version
+                changes = [{'label':'网站内容版本','before':before.get('website_content') or '默认模板','after':version}]
+                warnings = ['恢复仅改变内容，沿用当前域名、证书、REALITY 与订阅配置。','恢复默认模板时使用当前网站标题，不恢复历史基础配置。']
             elif kind == 'proxy.update':
                 shape(values,('node_name','public_address'))
                 for key,label in (('node_name','节点名称'),('public_address','客户端连接地址')):
@@ -172,7 +213,10 @@ class OperationService:
                 ownership = ('此证书已有受管 HTTP-01 签发记录，保留已验证的自动续期归属。'
                              if managed_acme(config['server']) else '导入证书由原签发流程维护，不接管自动续期。')
                 warnings = [ownership,'私钥不进入预览或任务结果。']
-            result = deployment.prepare(store,config,expected_revision=base_revision,publish_only=kind=='subscription.update')
+            options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
+            if kind.startswith('website.content.'):
+                options.update(site_files=site_files,website_change=True)
+            result = deployment.prepare(store,config,**options)
             return self.preview(result['plan_id'],kind,base_revision,changes,impact,warnings)
 
     def _ssh_plan(self, store, base_revision, values):
@@ -200,6 +244,7 @@ class OperationService:
     def preview(identity,kind,revision,changes,impact,warnings):
         return {'plan_id':identity,'kind':kind,'base_revision':revision,
                 'summary':{'ssh.append':'追加 SSH 公钥','website.update':'更新网站标题','proxy.update':'更新 REALITY 节点',
+                           'website.content.upload':'发布网站内容','website.content.restore':'恢复网站内容',
                            'subscription.update':'发布订阅变更','certificate.import':'替换绑定证书','certificate.renew':'检查并更新证书'}[kind],
                 'changes':changes,'impact':impact,'warnings':warnings}
 
@@ -249,4 +294,5 @@ class OperationService:
             return deployment.recover(store)
 
     def close(self):
-        self.jobs.close()
+        if self.jobs is not None:
+            self.jobs.close()

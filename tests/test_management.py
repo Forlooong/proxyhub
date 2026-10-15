@@ -91,6 +91,82 @@ def assert_private_fields_absent(value, config):
         assert secret not in encoded
 
 
+def test_website_upload_and_restore_share_existing_plan_contract(environment,monkeypatch):
+    import base64
+    import io
+    import zipfile
+    env = environment
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive,'w') as output:
+        output.writestr('index.html','<h1>Upload</h1>')
+    result = env.service.create_plan('website.content.upload',0,{'archive_base64':base64.b64encode(archive.getvalue()).decode()})
+    config, options = env.prepared[-1]
+    assert options['site_files'] == {'index.html':b'<h1>Upload</h1>'}
+    assert options['website_change'] is True and options['publish_only'] is False
+    assert_private_fields_absent(result,env.config)
+    monkeypatch.setattr(deployment,'content_version',lambda store,version:{'index.html':b'old'})
+    env.service.create_plan('website.content.restore',0,{'version_id':'b'*32})
+    restored,options = env.prepared[-1]
+    assert restored['server'] == env.config['server'] and restored['subscription'] == env.config['subscription']
+    assert restored['website_content'] == 'b'*32 and options['site_files'] is None
+    env.config['website_content'] = 'b'*32
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    env.service.create_plan('website.content.restore',0,{'version_id':'template'})
+    assert 'website_content' not in env.prepared[-1][0]
+    with pytest.raises(ManagementError,match='HTML'):
+        env.service.create_plan('website.update',0,{'site_title':'Cannot change uploaded HTML'})
+
+
+def test_website_preview_rejects_stale_and_unrelated_plans(environment):
+    from proxyhub.core import digest
+    env = environment
+    (env.directory/'site').mkdir()
+    body = b'<h1>Hello</h1><script>secretScript()</script>'
+    (env.directory/'site/index.html').write_bytes(body)
+    with env.service.state() as store:
+        identity = store.plan('deployment',{'revision':env.directory.name,'website_change':True,
+                                          'files':{'site/index.html':digest(body)}})
+        unrelated = store.plan('ssh-append',{})
+    result = env.service.handle('website.content.preview',{'plan_id':identity})
+    assert 'Hello' in result['html'] and '<script>' not in result['html']
+    assert result['file_count'] == 1
+    assert_private_fields_absent(result,env.config)
+    with pytest.raises(ManagementError):
+        env.service.handle('website.content.preview',{'plan_id':unrelated})
+    with env.service.state() as store:
+        store.commit(unrelated)
+    with pytest.raises(ManagementError) as error:
+        env.service.handle('website.content.preview',{'plan_id':identity})
+    assert error.value.code == 'STALE_REVISION'
+
+
+def test_oversized_website_preview_explains_that_apply_remains_available(environment,monkeypatch):
+    from proxyhub import site_content
+    from proxyhub.core import digest
+    env = environment
+    (env.directory/'site').mkdir()
+    (env.directory/'site/index.html').write_bytes(b'page')
+    with env.service.state() as store:
+        identity = store.plan('deployment',{'revision':env.directory.name,'website_change':True,
+                                          'files':{'site/index.html':digest(b'page')}})
+    def too_large(files):
+        raise ValueError('private content')
+    monkeypatch.setattr(site_content,'preview_html',too_large)
+    with pytest.raises(ManagementError) as error:
+        env.service.handle('website.content.preview',{'plan_id':identity})
+    assert error.value.code == 'PREVIEW_UNAVAILABLE' and '仍可' in str(error.value)
+    assert 'private content' not in str(error.value)
+
+
+def test_synchronous_website_service_does_not_recover_manager_jobs(environment,monkeypatch):
+    def forbidden(*args):
+        pytest.fail('Synchronous CLI must not open the manager job queue')
+    monkeypatch.setattr(management,'Jobs',forbidden)
+    service = management.OperationService(environment.root,synchronous=True)
+    assert service.jobs is None
+    service.close()
+
+
 def test_overview_projects_only_public_state(environment):
     env = environment
     result = env.service.handle('overview',{})

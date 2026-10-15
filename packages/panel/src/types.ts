@@ -15,7 +15,7 @@ export type Preview = {
 export type Overview = {
   revision: number;
   server: {hostname: string; os: string; architecture: string; memory_total_bytes: number | null; accounts: string[]; ssh_context: SSHContext};
-  website: {id: string; domain: string; title: string; url: string};
+  website: {id: string; domain: string; title: string; url: string; content_version: string | null};
   certificate: {id: string; domains: string[]; not_after: string | null; sha256: string | null; automatic_renewal: boolean; consumers: string[]; status?: 'valid' | 'invalid'; error?: string | null};
   proxy: {id: string; name: string; protocol: string; public_address: string; port: number; sni: string; target: string; verification: string};
   subscription: {id: string; name: string; domain: string; update_interval_hours: number; userinfo: Record<string, number>; reset_day: number | null; reset_at: number | null; overrides: JsonObject; traffic_source: string};

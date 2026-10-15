@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 from pathlib import Path
 import secrets
@@ -28,7 +29,16 @@ def parser() -> argparse.ArgumentParser:
     ssh.add_argument('--authorized-keys-file', required=True)
     for argument in ('addr', 'host', 'laddr', 'lport'):
         ssh.add_argument('--'+argument, required=True)
-    site = modules.add_parser('site', help='Website certificate operations').add_subparsers(dest='operation')
+    site = modules.add_parser('site', help='Website content and certificate operations').add_subparsers(dest='operation')
+    content = site.add_parser('content', help='Preview, version and restore static website content').add_subparsers(dest='action')
+    upload = content.add_parser('upload', help='Prepare a static ZIP upload; apply the returned plan explicitly')
+    upload.add_argument('--archive', type=Path, required=True)
+    content.add_parser('versions', help='List website content versions and the current version')
+    restore = content.add_parser('restore', help='Prepare restoring an uploaded version or template')
+    restore.add_argument('--version', required=True)
+    preview = content.add_parser('preview', help='Write a prepared plan HTML preview to a private file')
+    preview.add_argument('--plan-id', required=True)
+    preview.add_argument('--output', type=Path, required=True)
     certificate = site.add_parser('certificate', help='Issue/import a versioned certificate').add_subparsers(dest='action')
     issue = certificate.add_parser('issue', help='HTTP-01 initial issue; port 80 must be free')
     issue.add_argument('--domain', action='append', required=True)
@@ -111,6 +121,30 @@ def execute(args) -> dict:
     if args.module == 'host' and args.operation == 'enable-key-auth':
         from .host.policy import enable_key_auth
         return enable_key_auth(apply=args.apply)
+    if args.module == 'site' and args.operation == 'content':
+        from .management import OperationService
+        service = OperationService(synchronous=True)
+        try:
+            if args.action == 'versions':
+                return service.handle('website.content.versions', {})
+            if args.action == 'preview':
+                result = service.handle('website.content.preview', {'plan_id': args.plan_id})
+                atomic_write(args.output, result['html'].encode('utf-8'), 0o600)
+                return {'status': 'written', 'private_preview': str(args.output),
+                        'file_count': result['file_count'], 'total_bytes': result['total_bytes']}
+            if args.action == 'upload':
+                with args.archive.open('rb') as source:
+                    archive = source.read(180 * 1024 + 1)
+                if not archive or len(archive) > 180 * 1024:
+                    raise OperationError('ZIP archive must be nonempty and no larger than 180 KiB')
+                kind, values = 'website.content.upload', {'archive_base64': base64.b64encode(archive).decode('ascii')}
+            else:
+                kind, values = 'website.content.restore', {'version_id': args.version}
+            with service.state() as state:
+                revision = state.revision
+            return service.create_plan(kind, revision, values)
+        finally:
+            service.close()
     if args.module == 'site':
         from .certificates import import_pair, issue
         if args.action == 'issue':
@@ -191,7 +225,7 @@ def main(argv=None) -> int:
         _help(root,[args.module])
         return 0
     if args.module == 'site' and args.action is None:
-        _help(root,['site','certificate'])
+        _help(root,['site',args.operation])
         return 0
     try:
         print(json.dumps(execute(args), ensure_ascii=False, indent=2))

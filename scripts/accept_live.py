@@ -4,6 +4,7 @@ No system proxy is changed. The temporary Mihomo process is always stopped.
 The output contains no host, token, key, UUID or subscription body.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -18,6 +19,7 @@ parser.add_argument('--config', type=Path, required=True)
 parser.add_argument('--mihomo', type=Path, required=True)
 parser.add_argument('--work', type=Path, required=True)
 parser.add_argument('--report', type=Path, required=True)
+parser.add_argument('--website-sha256', help='Expected index hash for an uploaded static website')
 args = parser.parse_args()
 config = json.loads(args.config.read_text(encoding='utf-8'))
 server = config['server']
@@ -37,7 +39,10 @@ process = None
 try:
     response = session.get(site, timeout=25)
     response.raise_for_status()
-    assert 'ProxyHub managed website' in response.text
+    if args.website_sha256:
+        assert hashlib.sha256(response.content).hexdigest() == args.website_sha256
+    else:
+        assert 'ProxyHub managed website' in response.text
     report['website_https'] = True
     response = session.get(url, timeout=25)
     response.raise_for_status()

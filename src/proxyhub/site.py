@@ -153,7 +153,12 @@ stream {{
 
 http {{
     default_type application/octet-stream;
-    types {{ text/html html; text/css css; image/svg+xml svg; }}
+    types {{
+        text/html html htm; text/css css; application/javascript js;
+        application/json json; text/plain txt; image/svg+xml svg;
+        image/png png; image/jpeg jpg jpeg; image/gif gif; image/webp webp;
+        image/x-icon ico; font/woff woff; font/woff2 woff2; font/ttf ttf; font/otf otf;
+    }}
     charset utf-8;
     server_tokens off;
     access_log off;
@@ -193,7 +198,7 @@ http {{
         index index.html;
         add_header X-Content-Type-Options nosniff always;
         add_header Referrer-Policy no-referrer always;
-        add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
         location / {{
             limit_except GET {{ deny all; }}
             try_files $uri $uri/ =404;

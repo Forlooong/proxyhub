@@ -104,7 +104,8 @@ def overview(config, revision, jobs, root):
     return {'revision':revision,
             'server':{'hostname':socket.gethostname(),'os':os_name,'architecture':platform.machine(),
                       'memory_total_bytes':total,'accounts':accounts(),'ssh_context':defaults},
-            'website':{'id':'default','domain':server['site_domain'],'title':server['site_title'],'url':'https://'+server['site_domain']+port},
+            'website':{'id':'default','domain':server['site_domain'],'title':server['site_title'],'url':'https://'+server['site_domain']+port,
+                       'content_version':config.get('website_content')},
             'certificate':{'id':Path(server['certificate_path']).parent.name,'domains':certificate['domains'],
                            'not_after':certificate['not_after'],'sha256':certificate['sha256'],
                            'status':certificate['status'],'error':certificate['error'],
@@ -119,5 +120,6 @@ def overview(config, revision, jobs, root):
             'services':status,'capabilities':[
                 {'name':'单网站 / REALITY / 单订阅','available':True,'reason':'当前已接入的管理范围'},
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
-                {'name':'多站点、内容上传、HY2、外部目标、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
+                {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'在当前单站点复用部署计划与回滚'},
+                {'name':'多站点、HY2、外部目标、规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
             'recent_jobs':jobs.list()['jobs'][:5]}
