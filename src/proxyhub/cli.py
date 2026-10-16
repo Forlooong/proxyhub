@@ -85,6 +85,22 @@ def parser() -> argparse.ArgumentParser:
         command = certificate.add_parser(action, help='Prepare certificate '+action)
         command.add_argument('--certificate-id', required=True)
     proxy = modules.add_parser('proxy', help='Proxy nodes, REALITY entry migration and HY2').add_subparsers(dest='operation')
+    node = proxy.add_parser('node', help='Manage independent protocol nodes without changing existing entries').add_subparsers(dest='action')
+    node.add_parser('list', help='List independent protocol nodes without credentials')
+    for action in ('create', 'update'):
+        command = node.add_parser(action, help='Prepare node '+action+'; apply the returned plan explicitly')
+        if action == 'create':
+            command.add_argument('--protocol', required=True, choices=('vless','ss','trojan','tuic','anytls','vmess','socks5'))
+        else:
+            command.add_argument('--node-id', required=True)
+        command.add_argument('--name', required=action == 'create')
+        command.add_argument('--port', type=int, required=action == 'create')
+        source = command.add_mutually_exclusive_group(required=action == 'create')
+        source.add_argument('--options', help='Protocol options as a JSON object; credentials are generated automatically')
+        source.add_argument('--options-file', type=Path, help='Read a JSON options object locally; no file path is sent to the manager')
+    for action in ('enable', 'disable', 'delete'):
+        command = node.add_parser(action, help='Prepare node '+action)
+        command.add_argument('--node-id', required=True)
     reality = proxy.add_parser('reality', help='Manage REALITY targets while retaining existing entries').add_subparsers(dest='action')
     reality.add_parser('list', help='List primary and retained REALITY entries')
     migrate = reality.add_parser('migrate', help='Prepare a new REALITY entry and retain the old one')
@@ -197,6 +213,25 @@ def execute(args) -> dict:
         from .management import OperationService
         service = OperationService(synchronous=True)
         try:
+            if args.operation == 'node':
+                if args.action == 'list':
+                    return service.handle('nodes.resources', {})
+                values = {field:getattr(args,field) for field in ('node_id','protocol','name','port') if getattr(args,field,None) is not None}
+                options = getattr(args,'options',None)
+                options_file = getattr(args,'options_file',None)
+                if options_file:
+                    with options_file.open('rb') as source:
+                        content = source.read(16 * 1024 + 1)
+                    if len(content) > 16 * 1024:
+                        raise OperationError('Options JSON exceeds 16 KiB')
+                    options = content.decode('utf-8')
+                if options is not None:
+                    from .rpc import decode_json
+                    parsed = decode_json(options.encode('utf-8'),16 * 1024)
+                    if not isinstance(parsed,dict):
+                        raise OperationError('Node options must be a JSON object')
+                    values['options'] = parsed
+                return _site_plan(service,'nodes.'+args.action,values)
             if args.operation == 'hy2':
                 if args.action == 'list':
                     return service.handle('hy2.resources', {})

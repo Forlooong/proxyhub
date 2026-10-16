@@ -2,7 +2,7 @@
 
 独立、模块化的 VPS 与代理服务管理项目。提供命令行和管理面板，再逐步加入规则管理与更多协议。
 
-当前版本为 `0.6.0a1`：在已验收的阶段 2a 内容生命周期、2b 多站点与证书依赖、2c REALITY 新旧 SNI 迁移基础上，阶段 **2d 本机 HY2 生命周期与协议能力矩阵**增量已通过专用 VPS 验收。HY2 使用独立 IPv4 UDP 监听及可信证书，与现有 TCP 服务共存；REALITY/HY2 的公网 TCP 请求及应用 UDP 回显、证书切换、失败恢复均通过。完整阶段 2 与首版发行仍未完成；审批历史、完整范围及后续顺序见[总方案第 10 节](docs/superpowers/specs/2026-10-14-proxyhub-design.md#10-实施阶段和交付门槛)。
+当前版本为 `0.7.0a1`：阶段 2 已按明确支持矩阵收口，新增 VLESS 其余选定传输、Shadowsocks AEAD/2022、Trojan、TUIC v5、AnyTLS、VMess 和 SOCKS5 的完整受管生命周期。专用 VPS 的 45 组连接、个人电脑下载订阅后的 10 个入口、证书与失败恢复验收通过，原 REALITY/HY2、网站及订阅保留。锁定 Mihomo 不支持 Trojan H2，H2 UDP 未纳入支持；详见[本次验收](docs/phase2-protocols-acceptance.md)及[能力矩阵](docs/superpowers/specs/2026-10-14-proxyhub-design.md#6-proxy-与-rules)。完整首版仍未完成，后续进入阶段 3 订阅与规则。
 
 ## 当前能力
 
@@ -10,11 +10,12 @@
 - **网站**：创建、选择、启停和删除独立静态网站，绑定/解绑域名，逐站上传 ZIP、隔离预览及恢复内容版本/默认模板。Nginx SNI 分流共用 TCP 443；未被 REALITY 入口引用的域名直达对应内部 HTTPS 监听，默认网站和首域名按旧配置兼容保留。
 - **REALITY**：选择本机受管网站或外部 HTTPS 443 目标，地址与 SNI 分开校验；检查 DNS、固定公网 IP、TLS 1.3/X25519、证书与回环边界。迁移启动独立新入口并保留旧入口进程，支持切回保留入口及显式退役；不能退役主入口或最后一个入口。
 - **HY2**：创建、更新、启用或停用一个稳定本机节点，默认独立 IPv4 UDP 443。显式绑定证书与 SNI，自动生成并保留随机密码；停用保留凭据和证书依赖，从订阅移除条目。启停或更新只调整 HY2 和订阅发布器，原 REALITY 入口与网站进程保留。
-- **证书**：通过 HTTP-01 申请或导入，按稳定绑定 ID 替换与续期，证书材料按版本保存。列出网站、订阅、HY2 及所有存续 REALITY 入口的间接消费者，保护仍被引用的资源。HY2 证书材料路径变化时重启其独立实例，分别验证可信链/名称与实际加载指纹，失败恢复旧部署。
-- **订阅**：由唯一 TypeScript 生成器输出 REALITY 当前主入口及已启用 HY2 的 YAML 和 URI/Base64；手选组默认 REALITY 优先。正文、响应头和访问路径作为同一发布版本。手工流量信息与重置字段分别保存，元数据更新不依赖握手目标在线。
-- **变更**：准备不可变候选、执行核心配置检查、显式 `apply`；保留激活日志和失败恢复入口。网站与证书使用 Web 激活，重载 Nginx 与订阅发布器，保留 REALITY 进程；仅在 HY2 实际配置或证书路径变化时调整 HY2。独立发布进程提供最后一份有效订阅。
+- **独立节点**：最多 32 个稳定资源，支持 VLESS、VMess、Trojan、六种 SS 方法、TUIC v5、AnyTLS 与认证 SOCKS5。独立 IPv4 监听、随机凭据和证书/REALITY 目标依赖；创建、更新、启停和先停后删均经计划，更新保留凭据，只调整相应实例。
+- **证书**：通过 HTTP-01 申请或导入，按稳定绑定 ID 替换与续期。列出网站、订阅、HY2、独立节点及 REALITY 目标的直接/间接消费者，停用仍保留依赖。材料变化只重启使用它的代理实例，分别验证可信链/名称与不可变运行配置的叶指纹，失败恢复旧材料。
+- **订阅**：唯一 TypeScript 生成器依次输出原 REALITY、启用 HY2 和独立节点的 YAML、URI/Base64，手选组保持 REALITY 优先，用户覆盖保留。H2 的 Mihomo YAML 仅承诺 TCP；存在 `udp:false` 节点时默认 rule 末尾拒绝，避免意外 DIRECT。原始 URI 导入器能力边界另行说明，不能代替 YAML 验收。
+- **变更**：准备不可变候选、执行核心检查、显式 `apply`，保留激活日志和恢复入口。网站/证书重载 Nginx 与发布器；节点操作仅调整变化实例和发布，其他入口继续运行。独立发布进程提供最后一份有效订阅。
 - **命令**：仅新增 `proxyhub` 和 `proxyhub-*` 服务；不覆盖 `sb`、`sing-box`、`yuju`、`subboost` 或 shell 内置 `help`，端口及资源冲突会停止操作。
-- **面板**：经 SSH 隧道访问，低权限网关与 root 管理器分离；支持多站点及证书管理、逐站内容上传/预览/恢复、REALITY 迁移/切回/退役、HY2 生命周期、订阅元数据与配置覆盖、公钥追加。变更需先预览，旧版本计划不可覆盖新配置，见[面板手册](docs/panel.md)。
+- **面板**：经 SSH 隧道访问，低权限网关与 root 管理器分离；支持多站点、证书依赖、内容生命周期、REALITY 迁移、HY2 与其余节点生命周期、订阅元数据/覆盖、公钥追加。与 CLI 共用类型化操作；旧版本计划不可覆盖新配置，见[面板手册](docs/panel.md)。
 
 当前安装脚本只面向 **Debian 12 amd64、systemd、root** 的专用验收环境。帮助与纯配置测试可在 Windows/Linux 运行。Ubuntu、其他发行版和 arm64 的完整安装验收尚未完成。
 
@@ -31,8 +32,9 @@
 | 阶段 2b 多站点与证书依赖 | 双站公网 HTTPS、原 REALITY/订阅、依赖保护、冲突预检及新消费者失败恢复通过；346 项 Linux 相关测试、125 项 subtests 通过，见[阶段 2b 验收记录](docs/phase2b-multisite-acceptance.md) |
 | 阶段 2c REALITY 目标与 SNI 迁移 | 本机/外部目标真实代理、新旧 SNI 共存、旧长连接保留、显式退役、失败回滚及真实进程中断恢复通过；377 项 Linux 相关测试、125 项 subtests 通过，见[阶段 2c 验收记录](docs/phase2c-reality-acceptance.md) |
 | 阶段 2d HY2 与协议能力矩阵 | 增量通过：真实面板生命周期、双协议 IPv4 TCP/UDP 请求、证书切换与信任失败回滚、依赖保护及进程中断恢复；Linux 相关 483 项、125 项 subtests 通过，见[阶段 2d 验收记录](docs/phase2d-hy2-acceptance.md) |
+| 阶段 2 其余选定协议 | 45 组 TCP/HTTPS、40 组 UDP 转发与 5 组关闭边界、个人电脑 10 个入口、六项故障演练通过；Linux 589 个不同测试及 125 项 subtests 通过，见[协议收口验收](docs/phase2-protocols-acceptance.md) |
 
-配置检查不代表真实客户端请求通过。本次 HY2 仅启用 IPv4，公网 IPv6 未验证。Clash Verge Rev 2.5.8 的 GUI 导入与显示、1 核 1GB 资源指标仍待专门验收。
+当前受管代理仅启用 IPv4，公网 IPv6 未验证。Trojan H2 明确拒绝，VLESS/VMess H2 的 UDP 未通过锁定 Mihomo 验收，不计为支持。Clash Verge Rev 2.5.8 GUI 导入与显示、1 核 1GB 资源指标仍待专门验收。
 
 ## 开始使用
 
@@ -84,15 +86,16 @@ flowchart LR
     A -->|订阅 SNI| T[127.0.0.1:8444 · 订阅 TLS]
     T --> S[127.0.0.1:18890 · 只读发布器]
     H[公网 IPv4 UDP 443 · 独立 HY2] --> P
+    E[独立协议监听 · 受管节点实例] --> P
 ```
 
-TCP 80 用于 HTTP-01 和 HTTPS 跳转。示意图展示迁移共存期；HY2 仅在创建并应用后启动，不启用 IPv6 监听或网站 HTTP/3。目标探测通过不能代替真实客户端验证，也不保证外部目标持续健康。升级须运行 `proxyhub install-services` 安装 REALITY 模板与独立 HY2 单元，该命令不启动新入口或重启现有公网服务。安装目录为 `/opt/proxyhub`，私有状态位于 `/var/lib/proxyhub`；新命令为 `/usr/local/bin/proxyhub`。运行时内部命令只在 `/opt/proxyhub/bin` 使用，不替换全局同名程序。操作参数见[面板手册](docs/panel.md)。
+TCP 80 用于 HTTP-01 和 HTTPS 跳转。升级须运行 `proxyhub install-services` 安装自有 REALITY、HY2 与 `proxyhub-node@.service` 单元；该命令不启动新入口或重启现有公网服务，节点仅在显式应用计划后启动。安装目录为 `/opt/proxyhub`，私有状态位于 `/var/lib/proxyhub`；新命令为 `/usr/local/bin/proxyhub`。运行时内部命令只在 `/opt/proxyhub/bin` 使用，不替换全局同名程序。操作参数见[面板手册](docs/panel.md)。
 
-从 `0.5.0a1` 升级时，须在旧有效 bundle 仍为当前版本、首次应用 HY2 前重启一次 publisher，以加载支持 HY2 的新校验器；manager/panel 也为代码升级重启，REALITY 新旧实例与 Nginx 保留。后续 HY2 操作只 reload publisher。证书归档仍为 root 专有目录 `0700`、私钥 `0600`，所需 PEM 嵌入 `0640 root:proxy` 的 `hy2.json`，不放宽归档权限；升级步骤及秘密材料边界见[面板手册](docs/panel.md#安装与访问)。
+从 `0.6.0a1` 升级时，须在旧有效 bundle 仍为当前版本、首次应用额外协议前重启一次 publisher，加载新 URI 校验器；manager/panel 同步更新代码，原 REALITY/HY2 与 Nginx 保留。后续节点操作仅 reload publisher。证书归档仍为 root 专有目录 `0700`、私钥 `0600`，所需 PEM 嵌入 `0640 root:proxyhub-proxy` 的 `hy2.json` 或 `nodes/<id>.json`，不放宽归档权限。
 
 ## 后续阶段
 
-阶段 2b、2c、2d 增量已通过，下一步继续收口阶段 2 其余选定协议门槛，完成后再进入订阅与规则阶段。各协议已实现、待实现和不支持边界见[总方案协议矩阵](docs/superpowers/specs/2026-10-14-proxyhub-design.md#6-proxy-与-rules)。完整 Host 初始化、SSH 防失联、CLI 帮助契约及发行验收也已在总方案明确归属，不能以现有公钥追加和面板代替。
+阶段 2 已按能力矩阵明确支持的本机范围通过验收；下一阶段是订阅与规则。不把 Trojan H2、H2 UDP、外部 URI 导入或独立 Direct 转发标为已实现。完整 Host 初始化、SSH 防失联、CLI 帮助契约与发行验收仍按[总方案](docs/superpowers/specs/2026-10-14-proxyhub-design.md#10-实施阶段和交付门槛)承接。
 
 多订阅、MRS 规则流水线、共享流量账户、自动采集与周期重置尚未交付。当前默认 sing-box 包不含 V2Ray API，因此没有把手工额度显示标为自动计量；当前 `reset_day/reset_at` 也不会触发自动重置。
 

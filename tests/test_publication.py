@@ -105,12 +105,14 @@ def test_invalid_profile_rejected(profile, field, value):
         build_bundle([profile], "one")
 
 
-def test_raw_subscription_accepts_only_generated_reality_and_hy2_protocols(profile):
-    body = 'vless://fixture-one\nhysteria2://fixture-two\n'
+def test_raw_subscription_accepts_only_generated_protocols(profile):
+    body = ''.join(f'{protocol}://fixture\n' for protocol in
+                   ('vless', 'hysteria2', 'ss', 'trojan', 'vmess', 'socks5', 'tuic', 'anytls'))
     profile['raw'] = base64.b64encode(body.encode()).decode()
     bundle = build_bundle([profile], 'two-protocols')
     assert validate_bundle(bundle) == bundle
-    for line in ('hy2://unsupported-alias', 'trojan://unsupported', 'https://example.test', ''):
+    for line in ('hy2://unsupported-alias', 'ssr://unsupported', 'http://unsupported',
+                 'socks4://unsupported', 'direct://unsupported', 'https://example.test', ''):
         profile['raw'] = base64.b64encode((body + line + '\n').encode()).decode()
         with pytest.raises(PublicationError):
             build_bundle([profile], 'bad-protocol')

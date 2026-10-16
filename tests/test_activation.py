@@ -311,13 +311,18 @@ def test_reality_instance_template_is_isolated_from_legacy_activation():
     assert 'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/sing-box.json\n' in legacy
 
 
-def test_hy2_service_is_low_privilege_and_isolated_from_legacy_activation():
+@pytest.mark.parametrize(('unit', 'config'), [
+    ('proxyhub-hy2.service', 'hy2.json'),
+    ('proxyhub-node@.service', 'nodes/%i.json'),
+])
+def test_extra_proxy_service_is_low_privilege_and_isolated_from_legacy_activation(unit, config):
     from proxyhub.installer import UNITS, units
-    definition = units()['proxyhub-hy2.service']
-    assert 'proxyhub-hy2.service' not in UNITS
+    definition = units()[unit]
+    assert UNITS == ('proxyhub-proxy.service', 'proxyhub-publisher.service', 'proxyhub-nginx.service')
+    assert unit not in UNITS
     assert definition.startswith('# Managed by ProxyHub\n')
     assert 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n' in definition
-    assert 'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/hy2.json\n' in definition
+    assert f'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/{config}\n' in definition
     assert 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n' in definition
     assert 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n' in definition
     for restriction in ('NoNewPrivileges=yes', 'PrivateTmp=yes', 'ProtectHome=yes', 'ProtectSystem=strict'):

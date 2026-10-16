@@ -177,6 +177,51 @@ def test_hy2_overview_reports_binding_and_actual_service_state(environment):
     assert_private_fields_absent(result,config)
 
 
+@pytest.mark.parametrize('kind',['nodes.create','nodes.update','nodes.enable','nodes.disable','nodes.delete'])
+def test_protocol_node_plans_scope_one_node_and_never_return_credentials(environment,kind):
+    from proxyhub import nodes
+    env = environment
+    config = deepcopy(env.config)
+    values = {'protocol':'ss','name':'Independent SS','port':5443,'options':{'method':'aes-256-gcm'}}
+    if kind != 'nodes.create':
+        config = nodes.change(config,'nodes.create',values)
+        identity = config['nodes'][0]['id']
+        if kind in {'nodes.enable','nodes.delete'}:
+            config = nodes.change(config,'nodes.disable',{'node_id':identity})
+        values = {'node_id':identity,**({'name':'Renamed SS'} if kind == 'nodes.update' else {})}
+    (env.directory/'config.json').write_bytes(canonical(config))
+    job = finish_job(env.service,'plan.create',{'kind':kind,'base_revision':0,'values':values})
+    assert job['status'] == 'succeeded'
+    candidate, options = env.prepared[0]
+    identity = candidate['nodes'][0]['id'] if kind == 'nodes.create' else values['node_id']
+    assert options == {'expected_revision':0,'node_operation':{'kind':kind.split('.')[1],'node_id':identity}}
+    assert all(candidate[key] == config[key] for key in ('server','subscription','overrides'))
+    resources = env.service.handle('nodes.resources',{})
+    assert resources['revision'] == 0
+    encoded = json.dumps([job,resources])
+    assert 'credentials' not in encoded
+    for selected in candidate.get('nodes',[]) + config.get('nodes',[]):
+        for secret in selected['credentials'].values():
+            assert secret not in encoded
+    assert_private_fields_absent([job,resources],config)
+
+
+def test_protocol_node_overview_reports_service_and_certificate_consumer(environment):
+    from proxyhub import nodes
+    env = environment
+    config = nodes.change(env.config,'nodes.create',{'protocol':'tuic','name':'TUIC','port':5443,
+        'options':{'sni':'site.example.test','certificate_id':'default'}})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    result = env.service.handle('overview',{})
+    identity = config['nodes'][0]['id']
+    assert result['nodes']['nodes'][0]['id'] == identity
+    assert {'name':'proxyhub-node@'+identity,'status':'active'} in result['services']
+    assert any(item['id'] == identity for item in result['certificates'][0]['consumers'])
+    assert 'credentials' not in json.dumps(result)
+    for secret in config['nodes'][0]['credentials'].values():
+        assert secret not in json.dumps(result)
+
+
 def test_website_upload_and_restore_share_existing_plan_contract(environment,monkeypatch):
     import base64
     import io

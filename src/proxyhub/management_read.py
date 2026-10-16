@@ -68,7 +68,7 @@ def web_resources(config):
     server = config['server']
     certificates = []
     for binding in web['certificates']:
-        users = consumers(web,server,binding['id'],config.get('reality'),config.get('hy2'))
+        users = consumers(web,server,binding['id'],config.get('reality'),config.get('hy2'),config.get('nodes'))
         domains = list(dict.fromkeys(binding['domains']+[item['domain'] for item in users if item['domain']]))
         try:
             details = validate_certificate(binding['certificate_path'],binding['key_path'],domains)
@@ -84,15 +84,17 @@ def web_resources(config):
     suffix = '' if server['public_port']==443 else ':'+str(server['public_port'])
     sites = [{**{key:site[key] for key in ('id','listener_id','tls_port','domains','title','enabled','certificate_id','content_version')},
               'url':'https://'+site['domains'][0]+suffix if site['enabled'] else None,
-              'dependencies':site_dependencies(web,server,site['id'],config.get('reality'))} for site in web['sites']]
+              'dependencies':site_dependencies(web,server,site['id'],config.get('reality'),nodes=config.get('nodes'))} for site in web['sites']]
     return {'websites':sites,'certificates':certificates}
 
 
 def overview(config, revision, jobs, root):
     from .reality import public_resources
     from .hy2 import public_resources as hy2_resources
+    from .nodes import public_resources as node_resources
     reality = public_resources(config)
     hy2 = hy2_resources(config)
+    nodes = node_resources(config)
     endpoint = next(entry for entry in reality['endpoints'] if entry['primary'])
     server, sub = config['server'], config['subscription']
     resources = web_resources(config)
@@ -104,6 +106,7 @@ def overview(config, revision, jobs, root):
              for entry in reality['endpoints']]
     if hy2['node'] is not None:
         units.append('proxyhub-hy2')
+    units.extend('proxyhub-node@'+node['id'] for node in nodes['nodes'])
     for unit in (*units,'proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
         try:
             value = run(['systemctl','show',unit,'-p','ActiveState','--value'],timeout=5).strip()
@@ -145,6 +148,7 @@ def overview(config, revision, jobs, root):
                      'target':endpoint['address']+':'+str(endpoint['port']),'verification':'请使用客户端验证当前连接；服务运行不等于真实代理请求通过'},
             'reality':reality,
             'hy2':hy2,
+            'nodes':nodes,
             'subscription':{'id':sub['id'],'name':sub['name'],'domain':server['subscription_domain'],
                             'update_interval_hours':sub['update_interval_hours'],'userinfo':sub['userinfo'],
                             'reset_day':sub.get('reset_day'),'reset_at':sub.get('reset_at'),
@@ -155,5 +159,6 @@ def overview(config, revision, jobs, root):
                 {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
                 {'name':'REALITY 本机/外部目标与 SNI 迁移','available':True,'reason':'独立新旧入口、目标预检与显式退役'},
                 {'name':'独立 UDP HY2 节点','available':True,'reason':'显式启停，绑定受管证书并加入现有订阅'},
+                {'name':'独立多协议节点','available':True,'reason':'按能力矩阵管理 VLESS、Shadowsocks、Trojan、TUIC、AnyTLS、VMess 和认证 SOCKS5；不支持的传输明确拒绝'},
                 {'name':'规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
             **resources,'recent_jobs':jobs.list()['jobs'][:5]}

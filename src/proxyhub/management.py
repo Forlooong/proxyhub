@@ -15,7 +15,7 @@ from .management_read import overview, ssh_details
 from .management_read import web_resources
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, sync_default
-from . import reality, hy2
+from . import reality, hy2, nodes
 
 ROOT = Path('/var/lib/proxyhub')
 
@@ -110,6 +110,11 @@ class OperationService:
             with self.state() as store:
                 _, config, revision, _ = self.snapshot(store,reject_pending=True)
                 return {'revision':revision,**hy2.public_resources(config)}
+        if operation == 'nodes.resources':
+            shape(payload,())
+            with self.state() as store:
+                _, config, revision, _ = self.snapshot(store,reject_pending=True)
+                return {'revision':revision,**nodes.public_resources(config)}
         if operation == 'website.content.preview':
             shape(payload,('plan_id',))
             with self.state() as store:
@@ -142,7 +147,7 @@ class OperationService:
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in management_web.KINDS | reality.KINDS | hy2.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
+            if payload['kind'] not in management_web.KINDS | reality.KINDS | hy2.KINDS | nodes.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -163,6 +168,31 @@ class OperationService:
                     directory, config = self.active()
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
+            if kind in nodes.KINDS:
+                before = nodes.public_resources(config)['nodes']
+                candidate = nodes.change(config,kind,values)
+                after = nodes.public_resources(candidate)['nodes']
+                identity = next(entry['id'] for entry in after if entry['id'] not in {item['id'] for item in before}) if kind == 'nodes.create' else values['node_id']
+                old = next((entry for entry in before if entry['id'] == identity),None)
+                new = next((entry for entry in after if entry['id'] == identity),None)
+                prepared = deployment.prepare(store,candidate,expected_revision=base_revision,
+                    node_operation={'kind':kind.removeprefix('nodes.'),'node_id':identity})
+                changes = [{'label':label,'before':old.get(key) if old else None,'after':new.get(key) if new else None}
+                           for key,label in (('name','节点名称'),('protocol','协议'),('port','独立监听端口'),
+                                             ('options','协议与传输选项'),('enabled','启用状态'))
+                           if old is None or new is None or old.get(key) != new.get(key)]
+                warnings = ['更新或停用会中断所选独立节点的连接；删除前必须先停用。应用后刷新订阅并验证真实客户端请求。',
+                            '公网端口需能从客户端访问；服务运行和配置校验不代表真实连接已通过。']
+                selected = new or old
+                if selected and selected['options'].get('transport') == 'h2':
+                    warnings.insert(0,'锁定 Mihomo 的 H2 UDP 未通过验收；YAML 不声明 UDP 支持，仅承诺 H2 TCP。')
+                if selected and (selected['protocol'] == 'socks5' or (not selected['options'].get('tls') and
+                        (selected['protocol'] == 'vless' or (selected['protocol'] == 'vmess' and selected['options'].get('security') == 'none')))):
+                    warnings.insert(0,'此节点的传输未加密，请仅在可信网络使用；认证凭据仍会生成并保留。')
+                if selected and selected['protocol'] == 'socks5' and not selected['options'].get('auth'):
+                    warnings.insert(0,'此 SOCKS5 节点未启用认证，所有能够访问该端口的客户端均可使用。')
+                return self.preview(prepared['plan_id'],kind,base_revision,changes,
+                    ['仅调整所选独立节点和关联订阅；现有 REALITY、HY2、网站服务保持运行。'],warnings)
             if kind in hy2.KINDS:
                 before = hy2.public_resources(config)['node']
                 candidate = hy2.change(config,kind,values)
@@ -207,7 +237,7 @@ class OperationService:
                 result = management_web.change(config,kind,values,self.root)
                 prepared = deployment.prepare(store,result['config'],expected_revision=base_revision,web_only=True)
                 return self.preview(prepared['plan_id'],kind,base_revision,result['changes'],
-                                    ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 所用证书材料变化时重启 HY2，相关连接会中断。'],result['warnings'])
+                                    ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。'],result['warnings'])
             if kind == 'certificate.issue' or (kind == 'certificate.renew' and ('web' in config or values)):
                 return self._acme_plan(store,directory,config,kind,base_revision,values)
             before = deepcopy(config)
@@ -276,7 +306,7 @@ class OperationService:
             options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
             if kind.startswith('website.'):
                 options.update(site_id=site_id,web_only=True)
-                impact = ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 所用证书材料变化时重启 HY2，相关连接会中断。']
+                impact = ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。']
             if kind.startswith('website.content.'):
                 options.update(site_files=site_files,website_change=True)
             result = deployment.prepare(store,config,**options)
@@ -315,7 +345,7 @@ class OperationService:
         return self.preview(plan,kind,base_revision,
                             [{'label':'证书绑定','before':None if action=='issue' else identity,'after':identity},
                              {'label':'域名','before':None,'after':domains}],
-                            ['申请成功后才保存绑定；证书变化时更新消费者并核对实际指纹。保留 REALITY 进程，启用 HY2 所用材料变化时会重启 HY2 并中断其连接。'],
+                            ['申请成功后才保存绑定；证书变化时更新消费者并核对实际指纹。保留 REALITY 进程，启用 HY2 或独立节点所用材料变化时重启相应节点并中断其连接。'],
                             ['HTTP-01 要求所有 A/AAAA 正确指向本机且公网 TCP 80 可达。','签发失败不会替换当前有效配置；手工证书不会自动接管续期。'])
 
     def _ssh_plan(self, store, base_revision, values):
@@ -345,6 +375,8 @@ class OperationService:
                 'summary':{'ssh.append':'追加 SSH 公钥','website.update':'更新网站标题','proxy.update':'更新 REALITY 节点',
                            'reality.migrate':'新增 REALITY 目标与迁移入口','reality.select':'选择当前发布入口','reality.retire':'显式退役旧入口',
                            'hy2.create':'创建 HY2 节点','hy2.update':'更新 HY2 节点','hy2.enable':'启用 HY2 节点','hy2.disable':'停用 HY2 节点',
+                           'nodes.create':'创建独立协议节点','nodes.update':'更新独立协议节点','nodes.enable':'启用独立协议节点',
+                           'nodes.disable':'停用独立协议节点','nodes.delete':'删除独立协议节点',
                            'website.create':'创建网站','website.enable':'启用网站','website.disable':'停用网站','website.delete':'删除网站',
                            'website.domain.bind':'绑定网站域名','website.domain.unbind':'解绑网站域名','website.certificate.bind':'更换网站证书绑定',
                            'certificate.add':'新增证书绑定','certificate.issue':'申请新证书绑定','certificate.delete':'删除证书绑定',

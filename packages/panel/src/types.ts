@@ -29,6 +29,10 @@ export type Hy2Node = {
   id: string; listener_id: string; enabled: boolean; name: string; port: number;
   server_name: string; certificate_id: string;
 };
+export type ProtocolNode = {
+  id: string; listener_id: string; protocol: 'vless' | 'ss' | 'trojan' | 'tuic' | 'anytls' | 'vmess' | 'socks5';
+  enabled: boolean; name: string; port: number; options: JsonObject;
+};
 export type Overview = {
   revision: number;
   server: {hostname: string; os: string; architecture: string; memory_total_bytes: number | null; accounts: string[]; ssh_context: SSHContext};
@@ -39,6 +43,7 @@ export type Overview = {
   proxy: {id: string; name: string; protocol: string; public_address: string; port: number; sni: string; target: string; verification: string};
   reality: {node_id: string; primary_endpoint_id: string; endpoints: RealityEndpoint[]};
   hy2: {node: Hy2Node | null};
+  nodes: {nodes: ProtocolNode[]};
   subscription: {id: string; name: string; domain: string; update_interval_hours: number; userinfo: Record<string, number>; reset_day: number | null; reset_at: number | null; overrides: JsonObject; traffic_source: string};
   services: {name: string; status: string}[];
   capabilities: {name: string; available: boolean; reason: string}[];

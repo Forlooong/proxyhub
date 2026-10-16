@@ -14,7 +14,7 @@ OPERATIONS = frozenset({
     "overview", "jobs.list", "job.get", "ssh.inspect", "plan.create",
     "plan.apply", "subscription.reveal", "deployment.recover",
     "website.content.versions", "website.content.preview",
-    "web.resources", "reality.resources", "hy2.resources",
+    "web.resources", "reality.resources", "hy2.resources", "nodes.resources",
 })
 
 

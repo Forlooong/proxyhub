@@ -2,6 +2,7 @@
 from copy import deepcopy
 import json
 import socket
+import ssl
 
 import pytest
 
@@ -290,7 +291,11 @@ def test_hy2_health_requires_both_pki_name_and_selected_leaf(hy2_environment, mo
     env = hy2_environment
     config = create(env)
     probes = []
-    fingerprint = deployment._certificate_bindings(config)[CERTIFICATE]['sha256']
+    fingerprint = 'c' * 64
+    def runtime_fingerprint(path):
+        assert path == env.pointer['current'] / 'hy2.json'
+        return fingerprint
+    monkeypatch.setattr(deployment, '_runtime_fingerprint', runtime_fingerprint)
     def probe(snapshot, fingerprint=None):
         assert snapshot == config
         probes.append(fingerprint)
@@ -303,6 +308,67 @@ def test_hy2_health_requires_both_pki_name_and_selected_leaf(hy2_environment, mo
     else:
         deployment._hy2_health(config, env.pointer['current'])
     assert probes == ([None] if failure == 'trust' else [None, fingerprint])
+
+
+def test_runtime_fingerprint_uses_first_immutable_leaf(tmp_path):
+    leaf = b'\x30\x03\x02\x01\x01'
+    chain = b'\x30\x03\x02\x01\x02'
+    path = tmp_path / 'runtime.json'
+    path.write_text(json.dumps({'inbounds': [{'tls': {'certificate': (
+        ssl.DER_cert_to_PEM_cert(leaf) + ssl.DER_cert_to_PEM_cert(chain)).splitlines()}}]}))
+    assert deployment._runtime_fingerprint(path) == deployment.digest(leaf)
+    path.write_text(json.dumps({'inbounds': [{'tls': {'certificate': ['invalid-secret-marker']}}]}))
+    with pytest.raises(OperationError, match='^Immutable runtime certificate is invalid$'):
+        deployment._runtime_fingerprint(path)
+
+
+def test_same_path_certificate_change_restarts_only_hy2(hy2_environment, monkeypatch):
+    env = hy2_environment
+    before = create(env)
+    previous = env.pointer['current']
+    config = deepcopy(before)
+    config['web']['sites'][1]['title'] = 'Unrelated website edit after same-path certificate replacement'
+    monkeypatch.setattr(deployment, '_certificate_material', lambda path:
+                        ['NEW-KEY'] if path.endswith('privkey.pem') else ['NEW-CERTIFICATE'])
+    prepared = deployment.prepare(env.store, config, web_only=True)
+    directory = env.root / 'revisions' / prepared['revision']
+    assert get_certificate(before['web'], CERTIFICATE) == get_certificate(config['web'], CERTIFICATE)
+    assert (previous / 'hy2.json').read_bytes() != (directory / 'hy2.json').read_bytes()
+    env.calls.clear()
+    deployment.apply(env.store, prepared['plan_id'])
+    assert ('systemctl', 'restart', 'proxyhub-hy2.service') in env.calls
+    assert not any('restart' in call and 'proxyhub-hy2.service' not in call for call in env.calls)
+    assert env.hy2_health[-1] == (read_config(directory), directory)
+
+
+def test_failed_same_path_certificate_change_restores_old_embedded_leaf(hy2_environment, monkeypatch):
+    env = hy2_environment
+    old_leaf, new_leaf = b'\x30\x03\x02\x01\x01', b'\x30\x03\x02\x01\x02'
+    source = {'certificate': ssl.DER_cert_to_PEM_cert(old_leaf).splitlines()}
+    monkeypatch.setattr(deployment, '_certificate_material', lambda path:
+                        ['KEY-FIXTURE'] if path.endswith('privkey.pem') else source['certificate'])
+    before = create(env)
+    previous = env.pointer['current']
+    source['certificate'] = ssl.DER_cert_to_PEM_cert(new_leaf).splitlines()
+    config = hy2.change(before, 'hy2.update', {'name': 'Failed same-path PEM candidate'})
+    prepared, candidate = prepare(env, config, 'update')
+    assert get_certificate(before['web'], CERTIFICATE) == get_certificate(config['web'], CERTIFICATE)
+    probes = []
+    def probe(snapshot, fingerprint=None):
+        probes.append((env.pointer['current'], fingerprint))
+    def health(snapshot, directory):
+        deployment._hy2_health(snapshot, directory)
+        if directory == candidate:
+            raise OperationError('Injected post-load failure')
+    monkeypatch.setattr(deployment, '_hy2_probe', probe)
+    monkeypatch.setattr(deployment, '_wait_hy2_health', health)
+    with pytest.raises(OperationError, match='Injected post-load failure'):
+        deployment.apply(env.store, prepared['plan_id'])
+    assert probes == [(candidate, None), (candidate, deployment.digest(new_leaf)),
+                      (previous, None), (previous, deployment.digest(old_leaf))]
+    assert source['certificate'] == ssl.DER_cert_to_PEM_cert(new_leaf).splitlines()
+    assert env.pointer['current'] == previous and env.store.pending() == []
+    assert env.store.inspect(prepared['plan_id'])['status'] == 'failed'
 
 
 def test_hy2_probe_reaches_configured_publisher_when_proxy_uses_host_authority(hy2_environment, monkeypatch):

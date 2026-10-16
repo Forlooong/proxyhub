@@ -196,6 +196,57 @@ def test_hy2_failure_closes_service_and_redacts_details(content_service, capsys)
     assert content_service.closed
 
 
+@pytest.mark.parametrize('arguments', [
+    ['proxy','node'], ['help','proxy','node'], ['help','proxy','node','create'],
+    ['help','proxy','node','update'], ['help','proxy','node','enable'],
+    ['help','proxy','node','disable'], ['help','proxy','node','delete'],
+])
+def test_protocol_node_help_does_not_require_root_or_state(arguments, capsys, monkeypatch):
+    monkeypatch.setattr('proxyhub.cli.require_root', lambda: pytest.fail('help must not require root'))
+    assert main(arguments) == 0
+    assert 'usage:' in capsys.readouterr().out
+
+
+def test_protocol_node_list_uses_redacted_resources(content_service, capsys):
+    content_service.result = {'revision':7,'nodes':[]}
+    assert main(['proxy','node','list']) == 0
+    assert content_service.calls == [('nodes.resources',{})] and content_service.closed
+
+
+@pytest.mark.parametrize(('arguments','values'), [
+    (['create','--protocol','ss','--name','SS','--port','5443','--options','{"method":"aes-256-gcm"}'],
+     {'protocol':'ss','name':'SS','port':5443,'options':{'method':'aes-256-gcm'}}),
+    (['update','--node-id','node-1','--name','Renamed'],{'node_id':'node-1','name':'Renamed'}),
+    (['enable','--node-id','node-1'],{'node_id':'node-1'}),
+    (['disable','--node-id','node-1'],{'node_id':'node-1'}),
+    (['delete','--node-id','node-1'],{'node_id':'node-1'}),
+])
+def test_protocol_node_changes_prepare_without_applying(arguments,values,content_service,capsys):
+    assert main(['proxy','node',*arguments]) == 0
+    assert content_service.calls == [('nodes.'+arguments[0],7,values)] and content_service.closed
+
+
+def test_protocol_node_options_file_is_read_locally(tmp_path,content_service,capsys):
+    source = tmp_path/'options.json'
+    source.write_text('{"auth":true,"udp":false}',encoding='utf-8')
+    assert main(['proxy','node','create','--protocol','socks5','--name','Socks','--port','5443','--options-file',str(source)]) == 0
+    assert content_service.calls == [('nodes.create',7,{'protocol':'socks5','name':'Socks','port':5443,'options':{'auth':True,'udp':False}})]
+    assert str(source) not in capsys.readouterr().out and content_service.closed
+
+
+@pytest.mark.parametrize('text',['[]','{"tls":true,"tls":false}','{"value":NaN}','{'])
+def test_protocol_node_options_reject_invalid_json_without_plan(text,content_service,capsys):
+    assert main(['proxy','node','update','--node-id','node-1','--options',text]) == 1
+    assert content_service.calls == [] and content_service.closed
+
+
+def test_protocol_node_options_file_is_bounded_before_plan(tmp_path,content_service,capsys):
+    source = tmp_path/'options.json'
+    source.write_bytes(b'x'*(16*1024+1))
+    assert main(['proxy','node','update','--node-id','node-1','--options-file',str(source)]) == 1
+    assert content_service.calls == [] and content_service.closed
+
+
 def test_content_upload_prepares_with_current_revision(tmp_path, content_service, capsys):
     import base64
     import json

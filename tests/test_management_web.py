@@ -287,3 +287,67 @@ def test_local_address_inspection_excludes_loopback_private_and_link_local(monke
     monkeypatch.setattr(management_web.subprocess, 'run', lambda *args, **kwargs:
                         SimpleNamespace(returncode=0, stdout=json.dumps(payload).encode()))
     assert management_web._local_addresses() == {ipaddress.ip_address('2001:4860:4860::8888')}
+
+
+def test_disabled_independent_protocol_node_protects_certificate_binding(configured, tmp_path):
+    from proxyhub import nodes
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': 'anytls', 'name': 'Kept AnyTLS', 'port': 20001,
+        'options': {'sni': 'alias.example.test', 'certificate_id': CERTIFICATE}})
+    node = config['nodes'][0]
+    node['enabled'] = False
+    get_site(config['web'], SITE).update(enabled=False, domains=[], certificate_id=None)
+    with pytest.raises(ManagementError, match='Kept AnyTLS') as caught:
+        change(config, 'certificate.delete', {'certificate_id': CERTIFICATE}, tmp_path)
+    assert caught.value.code == 'DEPENDENCY'
+    assert node['credentials']['password'] not in str(caught.value)
+    config['nodes'] = []
+    deleted = change(config, 'certificate.delete', {'certificate_id': CERTIFICATE}, tmp_path)
+    assert all(certificate['id'] != CERTIFICATE for certificate in deleted['config']['web']['certificates'])
+
+
+@pytest.mark.parametrize('kind,values', [
+    ('website.disable', {'site_id': SITE}),
+    ('website.delete', {'site_id': SITE}),
+    ('website.domain.unbind', {'site_id': SITE, 'domain': 'second.example.test'}),
+])
+def test_disabled_protocol_reality_node_is_named_in_site_dependency(migrating, tmp_path, kind, values):
+    from proxyhub import nodes
+    config = nodes.change(migrating, 'nodes.create', {
+        'protocol': 'vless', 'name': 'Kept VLESS', 'port': 20001,
+        'options': {'tls_mode': 'reality', 'sni': 'second.example.test', 'reality_target_id': '1' * 32}})
+    config['nodes'][0]['enabled'] = False
+    with pytest.raises(ManagementError) as caught:
+        change(config, kind, values, tmp_path)
+    assert caught.value.code == 'DEPENDENCY'
+    assert config['nodes'][0]['id'] in str(caught.value) and 'Kept VLESS' in str(caught.value)
+
+
+def test_protocol_certificate_replacement_requires_every_node_sni(configured, tmp_path, monkeypatch):
+    from proxyhub import nodes
+    certificate = get_certificate(configured['web'], CERTIFICATE)
+    certificate['domains'].append('future.example.test')
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': 'anytls', 'name': 'Future AnyTLS', 'port': 20001,
+        'options': {'sni': 'future.example.test', 'certificate_id': CERTIFICATE}})
+    config['nodes'][0]['enabled'] = False
+    get_certificate(config['web'], CERTIFICATE)['domains'].remove('future.example.test')
+    checked = []
+    def imported(values, required, root):
+        checked.extend(required)
+        return {'certificate_path': certificate['certificate_path'], 'key_path': certificate['key_path'],
+                'sha256': 'e' * 64, 'not_after': '2030-01-01'}
+    monkeypatch.setattr(management_web, '_import', imported)
+    change(config, 'certificate.import', {'certificate_id': CERTIFICATE,
+            'certificate_pem': 'PUBLIC', 'private_key_pem': 'PRIVATE'}, tmp_path)
+    assert checked == ['second.example.test', 'alias.example.test', 'future.example.test']
+
+
+def test_website_allocator_skips_retained_protocol_tcp_port(configured, tmp_path):
+    from proxyhub import nodes
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': 'socks5', 'name': 'Kept SOCKS', 'port': 8446, 'options': {}})
+    config['nodes'][0]['enabled'] = False
+    result = change(config, 'website.create', {'title': 'Third', 'domain': 'alias.example.test',
+                    'certificate_id': CERTIFICATE}, tmp_path)
+    assert result['config']['web']['sites'][-1]['tls_port'] == 8447

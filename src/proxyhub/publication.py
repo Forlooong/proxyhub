@@ -103,7 +103,8 @@ def _profile(value: Any) -> dict:
         decoded = base64.b64decode(raw_body, validate=True).decode("utf-8")
     except (binascii.Error, ValueError, UnicodeError) as exc:
         raise PublicationError("Invalid raw subscription encoding") from exc
-    if not decoded.splitlines() or any(not line.startswith(("vless://", "hysteria2://")) for line in decoded.splitlines()):
+    protocols = ("vless://", "hysteria2://", "ss://", "trojan://", "vmess://", "socks5://", "tuic://", "anytls://")
+    if not decoded.splitlines() or any(not line.startswith(protocols) for line in decoded.splitlines()):
         raise PublicationError("Unsupported raw subscription protocol")
     responses = {}
     for format_name, suffix, content_type, body in (

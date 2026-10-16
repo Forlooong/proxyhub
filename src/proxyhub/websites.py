@@ -164,9 +164,25 @@ def sync_default(config: Mapping) -> dict:
     return result
 
 
+def _node_site(web, reality, node):
+    """Inspect an already validated node without recursing into resource validation."""
+    options = node['options']
+    if options.get('tls_mode') != 'reality':
+        return None
+    target_id = options['reality_target_id']
+    if reality is None:
+        if target_id != 'default':
+            raise ValueError('Unknown node REALITY target')
+        return get_site(web, 'default')
+    target = next((target for target in reality['targets'] if target['id'] == target_id), None)
+    if target is None:
+        raise ValueError('Unknown node REALITY target')
+    return get_site(web, target['site_id']) if target['type'] == 'site' else None
+
+
 def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | None = None,
-              hy2: dict | None = None) -> list[dict]:
-    """Describe binding dependencies, including disabled sites and HY2."""
+              hy2: dict | None = None, nodes: list | None = None) -> list[dict]:
+    """Describe binding dependencies, including disabled sites and protocol nodes."""
     get_certificate(web, certificate_id)
     result = []
     for site in web['sites']:
@@ -196,23 +212,42 @@ def consumers(web: dict, server: Mapping, certificate_id: str, reality: dict | N
     if hy2 is not None and hy2['certificate_id'] == certificate_id:
         result.append({'kind': 'hy2', 'id': hy2['id'], 'label': hy2['name'] + ' HY2',
                        'domain': hy2['server_name'], 'port': hy2['port'], 'enabled': hy2['enabled']})
+    for node in nodes or []:
+        options = node['options']
+        if not options.get('tls'):
+            continue
+        indirect = options.get('tls_mode') == 'reality'
+        site = _node_site(web, reality, node) if indirect else None
+        bound = site['certificate_id'] if site is not None else options.get('certificate_id')
+        if bound == certificate_id:
+            result.append({'kind': 'node', 'id': node['id'],
+                           'label': node['name'] + ' ' + node['protocol'].upper()
+                                    + (' REALITY 本机握手目标（间接）' if indirect else ' TLS'),
+                           'domain': options['sni'], 'port': node['port'], 'enabled': node['enabled']})
     return result
 
 
 def site_dependencies(web: dict, server: Mapping, site_id: str, reality: dict | None = None,
-                      domain: str | None = None) -> list[str]:
+                      domain: str | None = None, nodes: list | None = None) -> list[str]:
     site = get_site(web, site_id)
+    result = []
     if reality is None:
         if site['id'] == 'default' and domain in (None, server['site_domain']):
-            return ['REALITY 节点 local-reality 引用网站 default、域名 ' + server['site_domain']
-                    + ' 与内部监听 ' + site['listener_id']]
-        return []
-    targets = {target['id']: target for target in reality['targets']}
-    result = []
-    for endpoint in reality['endpoints']:
-        target = targets[endpoint['target_id']]
-        if (target['type'] == 'site' and target['site_id'] == site_id
-                and domain in (None, target['server_name'])):
-            result.append('REALITY 入口 ' + endpoint['id'] + ' 引用网站 ' + site_id + '、域名 '
-                          + target['server_name'] + ' 与内部监听 ' + site['listener_id'])
+            result.append('REALITY 节点 local-reality 引用网站 default、域名 ' + server['site_domain']
+                          + ' 与内部监听 ' + site['listener_id'])
+    else:
+        targets = {target['id']: target for target in reality['targets']}
+        for endpoint in reality['endpoints']:
+            target = targets[endpoint['target_id']]
+            if (target['type'] == 'site' and target['site_id'] == site_id
+                    and domain in (None, target['server_name'])):
+                result.append('REALITY 入口 ' + endpoint['id'] + ' 引用网站 ' + site_id + '、域名 '
+                              + target['server_name'] + ' 与内部监听 ' + site['listener_id'])
+    for node in nodes or []:
+        target_site = _node_site(web, reality, node)
+        if (target_site is not None and target_site['id'] == site_id
+                and domain in (None, node['options']['sni'])):
+            result.append('REALITY 节点 ' + node['id'] + '（' + node['name'] + '）引用网站 '
+                          + site_id + '、域名 ' + node['options']['sni']
+                          + ' 与内部监听 ' + site['listener_id'])
     return result

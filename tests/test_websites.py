@@ -191,6 +191,55 @@ def test_hy2_depends_on_certificate_without_a_website_binding(configured, enable
     assert site_dependencies(web, server, SITE) == []
 
 
+@pytest.mark.parametrize('enabled', [True, False])
+def test_protocol_certificate_consumer_does_not_require_a_website(configured, enabled):
+    from proxyhub import nodes
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': 'anytls', 'name': 'Independent AnyTLS', 'port': 20001,
+        'options': {'sni': 'future.example.test', 'certificate_id': CERTIFICATE}})
+    node = config['nodes'][0]
+    node['enabled'] = enabled
+    get_site(config['web'], SITE).update(enabled=False, domains=[], certificate_id=None)
+    public = nodes.public_resources(config)['nodes']
+    found = consumers(config['web'], config['server'], CERTIFICATE, nodes=public)
+    assert found == [{'kind': 'node', 'id': node['id'], 'label': 'Independent AnyTLS ANYTLS TLS',
+                      'domain': 'future.example.test', 'port': 20001, 'enabled': enabled}]
+    assert site_dependencies(config['web'], config['server'], SITE, nodes=public) == []
+    assert 'credentials' not in str(found)
+
+
+def test_retained_protocol_reality_consumer_protects_exact_site_domain_and_certificate(configured):
+    from proxyhub import nodes, reality
+    config = reality.change(configured, 'reality.migrate',
+                            {'type': 'site', 'site_id': SITE, 'sni': 'second.example.test'})
+    target = config['reality']['targets'][-1]
+    config = nodes.change(config, 'nodes.create', {
+        'protocol': 'vless', 'name': 'Extra REALITY', 'port': 20001,
+        'options': {'tls_mode': 'reality', 'sni': 'second.example.test', 'reality_target_id': target['id']}})
+    node = config['nodes'][0]
+    node['enabled'] = False
+    web, server, registry = config['web'], config['server'], config['reality']
+    public = nodes.public_resources(config)['nodes']
+    dependencies = site_dependencies(web, server, SITE, registry, nodes=public)
+    assert any(node['id'] in value and 'second.example.test' in value for value in dependencies)
+    assert site_dependencies(web, server, SITE, registry, 'alias.example.test', public) == []
+    found = [item for item in consumers(web, server, CERTIFICATE, registry, nodes=public) if item['kind'] == 'node']
+    assert len(found) == 1 and found[0]['id'] == node['id'] and found[0]['enabled'] is False
+    assert '间接' in found[0]['label'] and found[0]['port'] == 20001
+
+
+def test_legacy_target_protocol_dependency_needs_no_registry_or_credentials(configured):
+    from proxyhub import nodes
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': 'vless', 'name': 'Legacy target', 'port': 20001,
+        'options': {'tls_mode': 'reality', 'sni': 'site.example.test', 'reality_target_id': 'default'}})
+    public = nodes.public_resources(config)['nodes']
+    assert any(public[0]['id'] in value for value in site_dependencies(
+        config['web'], config['server'], 'default', nodes=public))
+    assert any(item['id'] == public[0]['id'] for item in consumers(
+        config['web'], config['server'], 'default', nodes=public))
+
+
 def test_resource_ids_do_not_depend_on_domain_or_certificate_material(configured):
     original = deepcopy(configured)
     second = get_site(configured['web'], SITE)

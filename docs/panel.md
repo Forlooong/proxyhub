@@ -1,6 +1,6 @@
 # 管理面板
 
-`0.6.0a1` 在现有中文管理面板中加入独立 HY2 的创建、更新、启用和停用，保留 REALITY 新旧 SNI 迁移、多站点、证书依赖、内容上传、隔离预览和逐站恢复。阶段 2d 增量已通过专用 VPS 与真实浏览器验收，完整阶段 2 仍须收口其余选定协议门槛。默认浅色界面、自托管 IBM Plex 字体、可点击资源关系图、变更抽屉和任务记录；深色模式与移动端布局同时提供。设计取舍见 [面板设计记录](../packages/panel/DESIGN.md)，历史内容验证见[阶段 2a 验收记录](phase2a-content-acceptance.md)。
+`0.7.0a1` 加入其余选定协议的独立节点生命周期、传输选择及证书/REALITY 目标依赖，保留 HY2、多站点、内容历史和新旧 SNI。阶段 2 已在明确支持范围通过专用 VPS 与真实浏览器验收，限制与证据见[协议收口记录](phase2-protocols-acceptance.md)。界面保留浅/深色、自托管字体、资源关系图、变更抽屉和移动布局；设计取舍见[面板设计记录](../packages/panel/DESIGN.md)。
 
 ## 安装与访问
 
@@ -21,16 +21,16 @@ proxyhub panel install
 proxyhub panel access
 ```
 
-`install-services` 更新自有单元定义但不重启公网服务。从旧版本升级到 `0.6.0a1` 后也须执行此命令，以安装 `proxyhub-reality@.service` 模板和 `proxyhub-hy2.service`；安装不会启动新入口，只在显式应用对应计划时启动。面板安装只启动 `proxyhub-manager.service` 与 `proxyhub-panel.service`。重复安装保留现有登录凭据；碰到非自有账户、单元或路径时拒绝覆盖。
+`install-services` 更新自有单元定义但不重启公网服务。升级到 `0.7.0a1` 后也须执行，以安装 REALITY、HY2 和 `proxyhub-node@.service` 单元；新入口只在显式应用对应计划时启动。面板安装只启动管理器与网关，重复安装保留登录凭据；碰到非自有账户、单元或路径时拒绝覆盖。
 
-**从 `0.5.0a1` 升级到 `0.6.0a1` 时，须在首次应用 HY2 计划前重启一次发布器。** 旧常驻 Python 发布进程仍使用仅接受 VLESS 的旧校验器，仅发送 reload 不会加载新代码，会拒绝含 HY2 的 bundle。更新应用文件与单元后，在旧有效 bundle 仍为当前发布版本时，先重启发布器加载新代码；管理器和面板也为本次代码升级重启。此步骤保留 REALITY 新旧实例和 Nginx，不得笼统记为全部服务 PID 全程不变：
+**从 `0.6.0a1` 升级时，须在首次应用额外协议前重启一次发布器。** 常驻 Python 进程仅 reload 不会加载新校验代码；先在旧有效 bundle 仍为当前版本时加载支持额外 URI 的校验器，再应用新节点。更早版本加入 HY2 时也有同样要求。管理器与面板同步更新代码，原 REALITY/HY2 与 Nginx 保留，不得记为全部 PID 全程不变：
 
 ```sh
 systemctl restart proxyhub-publisher.service
 systemctl restart proxyhub-manager.service proxyhub-panel.service
 ```
 
-上述是代码升级步骤。后续 HY2 创建、更新与启停通过 reload 发布器加载新 bundle，不再为每次操作重启发布器；未修改的 REALITY 实例及其长连接保留。
+上述是代码升级步骤。后续 HY2 或独立节点操作仅 reload 发布器；未修改的代理实例及长连接保留。
 
 **从阶段 2a 升级后，须先显式激活一次 Web 配置，再申请新增域名的 HTTP-01 证书。** 此次激活以 `web_only` 归一化旧配置，保留默认网站及内容历史，并加载新的 TCP 80 默认挑战入口；仅更新应用文件或重启面板不会生效。本次部署按此顺序执行。手动升级可先列出资源，再为默认网站重新绑定其当前证书并应用返回的计划：
 
@@ -56,8 +56,8 @@ ssh -N -L 127.0.0.1:18765:127.0.0.1:18765 -p <SSH_PORT> root@<VPS>
 | --- | --- | --- |
 | 总览 | 查看资源关系、当前版本、服务状态、最近任务 | 不显示虚构利用率或流量 |
 | 服务器 | 选择账号和连接上下文、读取生效授权路径、预览并追加公钥 | 不关闭密码登录；第二个 SSH 会话需独立验证；sshd 转发策略不代表每把公钥都允许隧道 |
-| 网站与证书 | 创建、选择、启用、停用和删除网站，绑定/解绑域名，更换证书绑定；逐站上传 ZIP、隔离预览和恢复内容；申请、导入、替换、续期和删除证书，查看消费者 | 所有存续 REALITY 入口及停用 HY2 的证书绑定均参与依赖保护；默认网站按旧配置兼容保留；已有内部监听不变；上传内容时禁用模板标题编辑；证书异常仍可进入修复流程 |
-| 代理服务 | 修改 REALITY 名称与连接地址，迁移 SNI、切回或退役保留入口；创建、更新、启用或停用 HY2，选择其 SNI 和证书 | 外部 REALITY 目标仅 HTTPS 443，主入口或最后一个入口不能退役；HY2 仅一个独立 IPv4 UDP 资源；没有节点凭据轮换、HY2 删除或高级参数 |
+| 网站与证书 | 创建、选择、启用、停用和删除网站，绑定/解绑域名，更换证书绑定；逐站上传 ZIP、隔离预览和恢复内容；申请、导入、替换、续期和删除证书，查看消费者 | 所有存续 REALITY 入口、HY2 与独立节点（包括停用资源）的直接或间接证书依赖均参与保护；默认网站按旧配置兼容保留；已有内部监听不变；上传内容时禁用模板标题编辑；证书异常仍可进入修复流程 |
+| 代理服务 | 修改 REALITY 名称与连接地址，迁移 SNI、切回或退役保留入口；创建、更新、启用或停用 HY2；创建、更新、启停和删除七种协议的独立节点，选择证书或 REALITY 目标 | 独立节点最多 32 个，须先停用再删除；协议与凭据不可修改；[传输与 H2 UDP 边界](phase2-protocols-acceptance.md)以验收记录为准；外部 REALITY 目标仅 HTTPS 443，主入口或最后一个入口不能退役；HY2 仅一个独立 IPv4 UDP 资源，不支持删除或高级参数 |
 | 订阅 | 修改名称、刷新间隔、手工额度、到期、重置记录和 JSON 配置覆盖；显式查看/复制链接及最终 YAML | 覆盖层经过唯一生成器校验；重置记录不会自动计量或触发归零；没有多订阅归属计费 |
 | 任务 | 查看排队、执行、成功、失败、中断记录；恢复未完成部署 | 中断任务不会自动重放输入；只保留最近 200 条完成记录，列表展示最近 30 条 |
 
@@ -159,6 +159,45 @@ proxyhub apply <ENABLE_PLAN_ID>
 
 应用中的本机健康检查使用锁定 Mihomo 经认证 QUIC 访问受控本机目标，并分别验证可信链/名称和实际证书指纹；这不能代替公网、应用 UDP 或指定 GUI 的真实请求验收。本次已另行通过真实面板 HY2 生命周期、CLI 可信证书与 SNI 切换、REALITY/HY2 公网 TCP 请求及经 SOCKS 的 UDP 回显；同一旧 REALITY CONNECT 长连接跨升级、失败、启停、证书切换和恢复保持可用。自签名证书实际加载后的信任失败回滚、停用 HY2 的证书依赖保护及真实进程中断恢复均通过，390/1440 宽度无溢出、console 无错误。两 REALITY 与 Nginx PID 保持部署前基线；publisher 为代码升级重启一次，此后只 reload 且 PID 不变，manager/panel 也为升级重启。公网 IPv6 与指定 GUI 客户端尚未验收，详细证据见[阶段 2d 验收](phase2d-hy2-acceptance.md)。其余选定协议的产品状态见[总方案协议矩阵](superpowers/specs/2026-10-14-proxyhub-design.md#6-proxy-与-rules)。
 
+## 独立协议节点
+
+“代理服务”的“独立协议节点”提供创建、编辑、启用、停用和删除，最多保存 32 个资源。每个节点有稳定编号和独立 IPv4 公网监听；TCP 节点不复用网站 TCP 443 或 REALITY 内部端口，SS 使用同端口 TCP/UDP，TUIC 使用 UDP。SOCKS5 的 UDP 通过 association 协商转发，实际 UDP 端口由服务协商；配置中的同号 UDP 端口仍保留用于冲突检查。已停用节点仍保留名称、端口、凭据和依赖；删除前必须先停用。操作不会自动修改防火墙。
+
+| 协议 | 可创建的传输与选项 | 当前边界 |
+| --- | --- | --- |
+| VLESS | TCP、WS、H2、HTTPUpgrade；证书 TLS 或现有 REALITY 目标；TCP 可选 Vision | REALITY 只提供 TCP/H2；Vision 必须 TCP+TLS；锁定 Mihomo 的 H2 仅承诺 TCP；新建 gRPC 不提供 |
+| Shadowsocks | 三种 AEAD 和三种 2022 方法，TCP/UDP 同端口 | 不提供插件；更新沿用密钥，方法与密钥长度不兼容会拒绝 |
+| Trojan | 可信证书 TLS，TCP、WS、HTTPUpgrade | 锁定 Mihomo 不支持 Trojan H2，明确拒绝；新建 gRPC 不提供 |
+| TUIC | v5，可信证书 TLS，bbr/cubic/new_reno，native/quic UDP 转发 | 不转换 v4 token，不关闭证书验证 |
+| AnyTLS | 可信证书 TLS TCP | 不提供 REALITY 或 HTTP 传输 |
+| VMess | AEAD TCP、HTTP/1 头、WS、H2、HTTPUpgrade | 固定 alterId=0；HTTP/1 头必须 TLS 关闭且 security=none；锁定 Mihomo 的 H2 仅承诺 TCP；不提供 QUIC/gRPC |
+| SOCKS5 | 用户名/密码认证，TCP 和可选 UDP | 本身不加密，不提供 SOCKS4/TLS 包装；面板只创建带认证节点 |
+
+锁定 Mihomo 的 H2 UDP 未通过验收；YAML 不声明 UDP 支持，仅承诺 H2 TCP。面板在选择 H2、节点详情和变更预览中显示该边界。配置包含 `udp: false` 节点时，在默认 `rule` 模式的代理匹配规则之后追加 `MATCH,REJECT`，防止不支持 UDP 的代理被跳过后落入默认 DIRECT；用户显式选择 `global` 或 `direct` 模式不属于该规则的范围。同一服务端经锁定 sing-box 客户端已通过 H2 TCP/UDP 验证，不能据此推断 Mihomo 的 UDP 也通过验收。服务端保持原 H2 配置，不会自动替换为 TCP 传输。
+
+TLS 表单选择受管证书并填写其覆盖的 SNI，缺失或无效证书需先在“网站与证书”添加、导入或申请。VLESS REALITY 表单改为选择现有握手目标，SNI 跟随目标；引用的目标及本机站点、域名、证书依赖继续受到保护。节点停用不会解除依赖。证书替换或续期会更新使用它的节点，相关独立进程重启会中断其连接；未受影响节点与原 REALITY 入口保持运行，共用变化证书材料的 HY2 按相同依赖更新。
+
+创建自动生成独立凭据，名称、端口、传输选项更新和启停均保留凭据。普通资源和变更预览仅返回脱敏字段；“显示订阅 YAML”和客户端链接包含凭据，应按秘密材料保管。启用节点追加到原 REALITY、HY2 后方，已有默认选择与排序保留；停用节点从订阅移除。未加密的 VLESS/VMess 传输和 SOCKS5 会在页面及预览中明确提示，不能据服务运行状态推断公网连接已经验证。
+
+CLI 使用相同计划。`--options` 接收 JSON 对象，或以 `--options-file` 读取不超过 16 KiB 的本机 UTF-8 JSON 文件；只向操作层提交解析后的字段，不提交文件路径。未知、重复或协议冲突字段会拒绝。创建需要协议、名称、端口和选项，更新仅修改明确给出的名称、端口或完整 options 对象；协议不能修改。
+
+```sh
+proxyhub proxy node list
+proxyhub proxy node create --protocol vless --name "独立 VLESS WS" --port 5443 \
+  --options '{"transport":"ws","tls":true,"sni":"site.example.test","certificate_id":"<CERTIFICATE_ID>","host":"site.example.test","path":"/proxy"}'
+proxyhub apply <CREATE_PLAN_ID>
+
+proxyhub proxy node update --node-id <NODE_ID> --name "节点新名称"
+proxyhub apply <UPDATE_PLAN_ID>
+proxyhub proxy node disable --node-id <NODE_ID>
+proxyhub apply <DISABLE_PLAN_ID>
+proxyhub proxy node enable --node-id <NODE_ID>
+proxyhub apply <ENABLE_PLAN_ID>
+# 删除前先停用并应用，再单独准备删除计划。
+proxyhub proxy node delete --node-id <NODE_ID>
+proxyhub apply <DELETE_PLAN_ID>
+```
+
 ## 网站内容上传、预览与恢复
 
 在“网站与证书”先选择当前管理的网站，再选择 ZIP，点击“验证并预览上传”。变更抽屉显示文件数、体积与服务影响，点击“加载页面预览”读取隔离预览；确认应用后才切换该网站公网内容。取消预览保留当前部署。内容版本列表仅展示所选网站的当前版本、文件数、体积和创建时间，可选择已成功应用的上传版本或默认模板，再预览并确认恢复。未应用、失败或属于其他网站的候选不能恢复到当前网站；阶段 2a 的既有历史继续归属默认网站。
@@ -189,7 +228,7 @@ proxyhub site content restore --site-id <SITE_ID> --version <CONTENT_VERSION_ID>
 
 `preview --output` 写入权限为 `0600` 的本地 HTML 文件，不将 HTML 回显到终端。该文件属于临时预览产物，不应加入仓库；查看后按需删除。预览超限时不会自动放宽隔离规则。配置版本变化后应重新准备计划。
 
-阶段 2b 的多站点与证书依赖、阶段 2c 的 REALITY 目标切换与 SNI 迁移继续保留；当前阶段 2d 增加本机 HY2 并列明其余协议门槛。MRS 规则流水线和自动计量仍属后续范围。
+阶段 2b、2c、2d 与其余选定协议均已按明确支持范围验收。MRS 规则流水线、外部 URI 导入和自动计量仍属后续范围。
 
 ## 权限与排障
 

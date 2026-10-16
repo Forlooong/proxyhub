@@ -24,6 +24,7 @@ export function OverviewPage({data, navigate}: {data: Overview; navigate: (page:
       ['节点', data.hy2.node.name], ['状态', data.hy2.node.enabled ? '已启用，发布至当前订阅' : '已停用，保留配置与证书依赖'],
       ['独立监听', `UDP ${data.hy2.node.port}`], ['TLS 服务名', data.hy2.node.server_name], ['证书绑定', data.hy2.node.certificate_id],
     ]} /></Section>}
+    {data.nodes.nodes.length > 0 && <Section title="独立协议节点" description="启用的节点加入现有订阅，使用独立公网端口。" action={<button className="text-button" onClick={() => navigate('proxy')}>管理节点<Icon name="arrow" /></button>}><Details rows={data.nodes.nodes.map(node => [node.name, `${node.protocol.toUpperCase()} · ${node.port} · ${node.enabled ? '已发布' : '已停用'}`])} /></Section>}
     <div className="two-column overview-lower">
       <Section title="服务状态" description="来自当前系统服务状态"><div className="service-list">{data.services.map(service => <div key={service.name}><span><Icon name="server" /><code>{service.name}</code></span><Status value={service.status} /></div>)}</div></Section>
       <Section title="部署信息" action={<button className="text-button" onClick={() => navigate('server')}>服务器详情<Icon name="arrow" /></button>}><Details rows={[

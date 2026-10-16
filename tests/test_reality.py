@@ -99,6 +99,20 @@ def test_port_allocation_skips_managed_website_listener(configured):
     assert result['reality']['endpoints'][1]['listen_port'] == 2445
 
 
+@pytest.mark.parametrize(('protocol', 'enabled', 'expected'), [
+    ('socks5', True, 2445), ('socks5', False, 2445), ('tuic', True, 2444),
+])
+def test_port_allocation_reserves_protocol_tcp_ports_even_when_disabled(configured, protocol, enabled, expected):
+    from proxyhub import nodes
+    config = nodes.change(configured, 'nodes.create', {
+        'protocol': protocol, 'name': 'Retained protocol', 'port': 2444,
+        'options': {} if protocol == 'socks5' else {'sni': 'site.example.test', 'certificate_id': 'default'}})
+    config['nodes'][0]['enabled'] = enabled
+    result = migrated(config)
+    assert result['reality']['endpoints'][1]['listen_port'] == expected
+    assert nodes.normalize_nodes(result) == config['nodes']
+
+
 def test_retained_endpoint_limit(configured):
     result = deepcopy(configured)
     sites = result['web']['sites'][1]

@@ -236,6 +236,7 @@ def change(config: Mapping, kind: str, values: Mapping) -> dict:
             raise ValueError('Unsupported REALITY target type')
         reserved = _reserved_ports(validate_spec(config['server']), normalize_web(config))
         occupied = reserved | {endpoint['listen_port'] for endpoint in reality['endpoints']}
+        occupied |= {node['port'] for node in config.get('nodes', []) if node['protocol'] != 'tuic'}
         port = next((value for value in range(2444, 2544) if value not in occupied), None)
         if port is None:
             raise ManagementError('CONFLICT', '没有可分配的 REALITY 内部监听端口。')
