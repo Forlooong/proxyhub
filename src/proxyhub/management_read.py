@@ -88,7 +88,7 @@ def web_resources(config):
     return {'websites':sites,'certificates':certificates}
 
 
-def overview(config, revision, jobs, root):
+def overview(config, revision, jobs, root, directory=None):
     from .reality import public_resources
     from .hy2 import public_resources as hy2_resources
     from .nodes import public_resources as node_resources
@@ -104,15 +104,34 @@ def overview(config, revision, jobs, root):
     status = []
     units = [('proxyhub-proxy' if entry['id']=='default' else 'proxyhub-reality@'+entry['id'])
              for entry in reality['endpoints']]
-    if hy2['node'] is not None:
-        units.append('proxyhub-hy2')
-    units.extend('proxyhub-node@'+node['id'] for node in nodes['nodes'])
+    shared_path = (directory if directory is not None else root/'current')/'shared.json'
+    shared = shared_path.exists() or shared_path.is_symlink()
+    loaded = None
+    if shared:
+        try:
+            loaded = (set() if shared_path.is_symlink() else
+                      {entry['tag'] for entry in json.loads(shared_path.read_text(encoding='utf-8'))['inbounds']})
+        except (OSError, ValueError, KeyError, TypeError):
+            loaded = set()
+        units.append('proxyhub-shared')
+    else:
+        if hy2['node'] is not None:
+            units.append('proxyhub-hy2')
+        units.extend('proxyhub-node@'+node['id'] for node in nodes['nodes'])
     for unit in (*units,'proxyhub-nginx','proxyhub-publisher','proxyhub-manager','proxyhub-panel','proxyhub-renew.timer'):
         try:
             value = run(['systemctl','show',unit,'-p','ActiveState','--value'],timeout=5).strip()
         except Exception:
             value = 'unknown'
         status.append({'name':unit,'status':value})
+    states = {entry['name']:entry['status'] for entry in status}
+    for node in ([hy2['node']] if hy2['node'] is not None else []) + nodes['nodes']:
+        group = ('proxyhub-shared' if shared else 'proxyhub-hy2' if node is hy2['node']
+                 else 'proxyhub-node@'+node['id'])
+        node['runtime_group'] = group
+        node['runtime_status'] = ('inactive' if not node['enabled'] else
+                                  'not-loaded' if shared and node['listener_id'] not in loaded else
+                                  states.get(group,'unknown'))
     os_name = platform.system()
     try:
         values = dict(line.split('=',1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
@@ -158,7 +177,7 @@ def overview(config, revision, jobs, root):
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
                 {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
                 {'name':'REALITY 本机/外部目标与 SNI 迁移','available':True,'reason':'独立新旧入口、目标预检与显式退役'},
-                {'name':'独立 UDP HY2 节点','available':True,'reason':'显式启停，绑定受管证书并加入现有订阅'},
-                {'name':'独立多协议节点','available':True,'reason':'按能力矩阵管理 VLESS、Shadowsocks、Trojan、TUIC、AnyTLS、VMess 和认证 SOCKS5；不支持的传输明确拒绝'},
+                {'name':'UDP HY2 节点','available':True,'reason':'显式启停并加入现有订阅，与额外节点共用固定运行组；组重启时所有启用成员均需重连'},
+                {'name':'多协议节点','available':True,'reason':'独立身份与监听端口，共享运行组；按能力矩阵管理 VLESS、Shadowsocks、Trojan、TUIC、AnyTLS、VMess 和认证 SOCKS5'},
                 {'name':'规则管理','available':False,'reason':'按后续阶段实施，不影响现有节点'}],
             **resources,'recent_jobs':jobs.list()['jobs'][:5]}

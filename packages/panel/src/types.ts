@@ -27,11 +27,11 @@ export type RealityEndpoint = {
 };
 export type Hy2Node = {
   id: string; listener_id: string; enabled: boolean; name: string; port: number;
-  server_name: string; certificate_id: string;
+  server_name: string; certificate_id: string; runtime_group?: string; runtime_status?: string;
 };
 export type ProtocolNode = {
   id: string; listener_id: string; protocol: 'vless' | 'ss' | 'trojan' | 'tuic' | 'anytls' | 'vmess' | 'socks5';
-  enabled: boolean; name: string; port: number; options: JsonObject;
+  enabled: boolean; name: string; port: number; options: JsonObject; runtime_group?: string; runtime_status?: string;
 };
 export type Overview = {
   revision: number;

@@ -312,6 +312,7 @@ def test_reality_instance_template_is_isolated_from_legacy_activation():
 
 
 @pytest.mark.parametrize(('unit', 'config'), [
+    ('proxyhub-shared.service', 'shared.json'),
     ('proxyhub-hy2.service', 'hy2.json'),
     ('proxyhub-node@.service', 'nodes/%i.json'),
 ])

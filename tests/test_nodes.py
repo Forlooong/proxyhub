@@ -195,11 +195,73 @@ def test_auth_toggle_keeps_retained_credential_and_disabled_udp_is_enforced(conf
     node = config['nodes'][0]
     rendered = nodes.render_node(config, node)
     assert 'users' not in rendered['inbounds'][0]
-    assert rendered['route']['rules'] == [{'network': 'udp', 'action': 'reject'}]
+    assert rendered['route']['rules'] == [{'inbound': [node['listener_id']],
+                                           'network': 'udp', 'action': 'reject'}]
     assert nodes.client_node(config, node)['credentials'] == {}
     updated = nodes.change(config, 'nodes.update', {'node_id': node['id'], 'options': {'auth': True, 'udp': True}})
     assert updated['nodes'][0]['credentials'] == node['credentials']
     assert nodes.render_node(updated, updated['nodes'][0])['inbounds'][0]['users'] == [node['credentials']]
+
+
+def shared_config(config):
+    config = hy2.change(config, 'hy2.create', {
+        'server_name': 'site.example.test', 'certificate_id': 'default'})
+    for index, protocol in enumerate(nodes.PROTOCOLS):
+        options = ({'udp': False} if protocol == 'socks5' else {} if protocol == 'ss' else TLS)
+        config = create(config, protocol, options, 20001 + index)
+    return config
+
+
+def test_shared_group_reuses_all_enabled_resources_without_mutation(configured):
+    assert nodes.render_shared(configured) is None
+    config = shared_config(configured)
+    before = deepcopy(config)
+    rendered = nodes.render_shared(config)
+    expected = [hy2.render_hy2(config)['inbounds'][0]] + [
+        nodes.render_node(config, node)['inbounds'][0] for node in config['nodes']]
+    for inbound in expected:
+        for user in inbound.get('users', []):
+            if 'name' in user:
+                user['name'] = inbound['tag']
+    assert rendered['inbounds'] == expected
+    socks = next(node for node in config['nodes'] if node['protocol'] == 'socks5')
+    assert rendered['route']['rules'] == [{
+        'inbound': [socks['listener_id']], 'network': 'udp', 'action': 'reject'}]
+    assert rendered['outbounds'] == [{'type': 'direct', 'tag': 'direct'}]
+    assert config == before
+    renamed = hy2.change(config, 'hy2.update', {'name': 'Renamed HY2'})
+    for node in config['nodes']:
+        renamed = nodes.change(renamed, 'nodes.update', {
+            'node_id': node['id'], 'name': 'Renamed ' + node['protocol']})
+    assert nodes.render_shared(renamed) == rendered
+    config = hy2.change(config, 'hy2.disable', {})
+    config = nodes.change(config, 'nodes.disable', {'node_id': socks['id']})
+    rendered = nodes.render_shared(config)
+    assert 'route' not in rendered
+    assert {item['tag'] for item in rendered['inbounds']} == {
+        node['listener_id'] for node in config['nodes'] if node['enabled']}
+    for node in list(config['nodes']):
+        if node['enabled']:
+            config = nodes.change(config, 'nodes.disable', {'node_id': node['id']})
+    assert nodes.render_shared(config) is None
+
+
+def test_shared_group_passes_real_pinned_singbox_check(configured, pairs, tmp_path):
+    core = Path('.cache/runtime/windows-amd64/sing-box.exe') if os.name == 'nt' else Path('/opt/proxyhub/bin/sing-box')
+    if not core.is_file():
+        pytest.skip('Pinned sing-box binary is unavailable')
+    config = shared_config(configured)
+    rendered = nodes.render_shared(config)
+    for inbound in rendered['inbounds']:
+        tls = inbound.get('tls', {})
+        if 'certificate_path' in tls:
+            tls.pop('certificate_path')
+            tls.pop('key_path')
+            tls.update(certificate=pairs[0][0].decode().splitlines(), key=pairs[0][1].decode().splitlines())
+    path = tmp_path / 'shared.json'
+    path.write_text(json.dumps(rendered), encoding='utf-8')
+    checked = subprocess.run([str(core.resolve()), 'check', '-c', str(path)], capture_output=True, text=True, timeout=15)
+    assert checked.returncode == 0, checked.stderr
 
 
 def test_identity_bound_and_current_snapshot_validation(configured):

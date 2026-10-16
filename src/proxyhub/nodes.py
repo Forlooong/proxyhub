@@ -1,4 +1,4 @@
-"""Independent local protocol listeners for the pinned sing-box and Mihomo cores."""
+"""Local protocol resources and their fixed shared sing-box runtime."""
 from __future__ import annotations
 
 import base64
@@ -359,8 +359,32 @@ def render_node(config: Mapping, node: Mapping) -> dict:
     result = {'log': {'level': 'warn', 'timestamp': True}, 'inbounds': [inbound],
               'outbounds': [{'type': 'direct', 'tag': 'direct'}]}
     if protocol == 'socks5' and not options['udp']:
-        result['route'] = {'rules': [{'network': 'udp', 'action': 'reject'}]}
+        result['route'] = {'rules': [{'inbound': [node['listener_id']],
+                                      'network': 'udp', 'action': 'reject'}]}
     return result
+
+
+def render_shared(config: Mapping) -> dict | None:
+    """Reuse the individual renderers for one enabled HY2/additional-node group."""
+    from .hy2 import normalize_hy2, render_hy2
+    resources = []
+    hysteria = normalize_hy2(config)
+    if hysteria is not None and hysteria['enabled']:
+        resources.append(render_hy2(config))
+    resources.extend(render_node(config, node) for node in normalize_nodes(config) if node['enabled'])
+    if not resources:
+        return None
+    rendered = {'log': {'level': 'warn', 'timestamp': True},
+                'inbounds': [inbound for resource in resources for inbound in resource['inbounds']],
+                'outbounds': [{'type': 'direct', 'tag': 'direct'}]}
+    for inbound in rendered['inbounds']:
+        for user in inbound.get('users', []):
+            if 'name' in user:
+                user['name'] = inbound['tag']
+    rules = [rule for resource in resources for rule in resource.get('route', {}).get('rules', [])]
+    if rules:
+        rendered['route'] = {'rules': rules}
+    return rendered
 
 
 def client_node(config: Mapping, node: Mapping) -> dict | None:

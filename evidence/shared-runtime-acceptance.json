@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "version": "0.7.1a1",
+  "baseline_commit": "0b1d5b1378d30765fa52b564d4db39a9c3474739",
+  "execution_self_checks_completed": true,
+  "independent_audit": "pending",
+  "application_file_hash_matches": 284,
+  "active_services": 7,
+  "service_processes": 8,
+  "proxy_core_processes": 3,
+  "config_credentials_ports_certificates_unchanged": true,
+  "client_yaml_and_subscription_bundle_content_unchanged": true,
+  "original_reality_nginx_publisher_pids_unchanged": true,
+  "stages": [
+    {
+      "name": "migration authenticated failure rollback",
+      "passed": true
+    },
+    {
+      "name": "migration real process interruption recovery",
+      "passed": true
+    },
+    {
+      "name": "migration committed, all identities and original services retained",
+      "passed": true
+    },
+    {
+      "name": "metadata update preserves shared PID",
+      "passed": true
+    },
+    {
+      "name": "shared authenticated failure rollback",
+      "passed": true
+    },
+    {
+      "name": "shared real process interruption recovery",
+      "passed": true
+    },
+    {
+      "name": "shared eight protocols TCP UDP HTTPS",
+      "passed": true,
+      "members": 8
+    },
+    {
+      "name": "server SOCKS UDP rejects only its inbound; HY2 and SS UDP survive",
+      "passed": true
+    },
+    {
+      "name": "final config websites subscription and original REALITY processes preserved",
+      "passed": true
+    },
+    {
+      "name": "shared certificate switch and restore, all members PKI and selected leaf checked",
+      "passed": true
+    },
+    {
+      "name": "measured shared authenticated failure rollback",
+      "passed": true
+    },
+    {
+      "name": "measured shared process interruption recovery",
+      "passed": true
+    }
+  ],
+  "connection_impact": {
+    "existing_hy2_ss_streams_interrupted": 2,
+    "new_authenticated_sessions_passed": 2,
+    "shared_change_preview_members": 8
+  },
+  "reality_long_connections": {
+    "connections": 2,
+    "rounds": [
+      822,
+      822
+    ],
+    "errors": []
+  },
+  "baseline_rss_kib": 790792,
+  "preassessment_estimate_mib": 311.2,
+  "idle_samples": [
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    },
+    {
+      "rss_kib": 324048,
+      "pss_kib": 189483
+    }
+  ],
+  "idle_rss_max_kib": 324048,
+  "observed_post_migration_peak_kib": 593700,
+  "peak_sampling_interval_seconds": 0.2,
+  "post_migration_memory_windows": {
+    "shared-final": {
+      "samples": 312,
+      "service_rss_peak_kib": 324012,
+      "including_test_clients_peak_kib": 482212
+    },
+    "shared-certificate-switch": {
+      "samples": 58,
+      "service_rss_peak_kib": 324012,
+      "including_test_clients_peak_kib": 544744
+    },
+    "shared-measured-failure": {
+      "samples": 41,
+      "service_rss_peak_kib": 321096,
+      "including_test_clients_peak_kib": 541788
+    },
+    "shared-measured-crash": {
+      "samples": 40,
+      "service_rss_peak_kib": 322980,
+      "including_test_clients_peak_kib": 557516
+    },
+    "shared-measured-final": {
+      "samples": 538,
+      "service_rss_peak_kib": 322996,
+      "including_test_clients_peak_kib": 485288
+    },
+    "shared-live-connection-impact": {
+      "samples": 55,
+      "service_rss_peak_kib": 323008,
+      "including_test_clients_peak_kib": 593700
+    },
+    "shared-final-idle": {
+      "samples": 304,
+      "service_rss_peak_kib": 324048,
+      "including_test_clients_peak_kib": 458224
+    }
+  },
+  "oom_kill_delta": 0,
+  "working_budget_kib": 332800,
+  "idle_rss_threshold_kib": 358400,
+  "peak_rss_threshold_kib": 665600,
+  "working_budget_observed_passed": true,
+  "post_migration_observed_peak_passed": true,
+  "initial_migration_complete_peak": "未验证：旧拓扑基线已高于650 MiB；早期采样漏项不作完整峰值证据",
+  "first_attempt": {
+    "automatic_restore_left_pending": true,
+    "manual_recovery_passed": true,
+    "root_cause": "未验证：首轮未记录逐协议恢复错误，不能证明已修复",
+    "instrumented_followups_passed": true
+  },
+  "sampling_corrections": "初版漏嵌套cgroup及部分Python探针；最终指标仅取递归cgroup并按NUL拆分cmdline的完整采样，重测证书/失败/中断/长连接影响窗口",
+  "formal_PERF_1": "未验证：当前约4GB主机、现有单订阅/少量本机节点；未做1核1GB、5订阅/500节点及阶段3负载",
+  "external_personal_computer_and_gui": "本轮未验证",
+  "stale_frontend_assets_removed": 1,
+  "timestamp": 1792131708.976443,
+  "related_validation": {
+    "shared_transactions": {
+      "distinct_passed": 22,
+      "windows_passed": 21,
+      "linux_symbolic_link_passed": 1
+    },
+    "existing_hy2_node_activation": {
+      "windows_passed": 60,
+      "linux_tcp_time_wait_passed": 1
+    },
+    "management_related_passed": 24,
+    "renderer_related_passed": 3,
+    "new_cli_passed": 2,
+    "shared_unit_contract_passed": 1,
+    "linux_targeted_execution": {
+      "passed": 5,
+      "new_windows_skips_completed": 2,
+      "rechecked_after_recovery_set_validation": 3
+    },
+    "panel_typescript_vite_build": "passed",
+    "counting": "Distinct and rerun counts are separate; historical 589 tests and unchanged converter matrix were not rerun."
+  },
+  "validation_harness_corrections": [
+    "Read SNI from REALITY public projection instead of raw endpoint",
+    "Use validated regular tar members with Python 3.11-compatible extraction",
+    "Use ordinary OperationService job context for overview",
+    "Use recursive cgroups and NUL-delimited command arguments for final measured windows"
+  ]
+}

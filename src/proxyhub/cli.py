@@ -128,6 +128,7 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument('--output', required=True, type=Path)
     plan = deploy.add_parser('plan', help='Validate immutable candidate using pinned runtimes')
     plan.add_argument('--config', required=True, type=Path)
+    deploy.add_parser('migrate-runtime', help='Prepare HY2/additional-node shared-runtime migration; group connections reconnect')
     deploy.add_parser('recover', help='Recover an interrupted ProxyHub activation')
     renew = deploy.add_parser('renew', help='Renew managed HTTP-01 certificate and activate it if changed')
     apply = modules.add_parser('apply', help='Apply an explicitly prepared plan')
@@ -352,6 +353,12 @@ def execute(args) -> dict:
                 service.close()
         raise OperationError('Unsupported plan type')
     from .deployment import prepare, recover, apply
+    if args.operation == 'migrate-runtime':
+        from .deployment import _current_revision
+        previous = _current_revision()
+        if previous is None:
+            raise OperationError('Runtime migration requires an active deployment')
+        return prepare(store,json.loads((previous/'config.json').read_text()),runtime_only=True)
     if args.operation == 'plan':
         return prepare(store,json.loads(args.config.read_text()))
     if args.operation == 'recover':

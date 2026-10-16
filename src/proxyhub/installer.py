@@ -29,6 +29,10 @@ LockPersonality=yes
         'proxyhub-reality@.service': header + 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n'
             'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/reality/%i.json\n'
             + common.replace('AF_UNIX AF_INET AF_INET6', 'AF_UNIX AF_INET AF_INET6 AF_NETLINK') + '\n[Install]\nWantedBy=multi-user.target\n',
+        'proxyhub-shared.service': header + 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n'
+            'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/shared.json\n'
+            'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n'
+            + common.replace('AF_UNIX AF_INET AF_INET6', 'AF_UNIX AF_INET AF_INET6 AF_NETLINK') + '\n[Install]\nWantedBy=multi-user.target\n',
         'proxyhub-hy2.service': header + 'User=proxyhub-proxy\nGroup=proxyhub-proxy\n'
             'ExecStart=/opt/proxyhub/bin/sing-box run -c /var/lib/proxyhub/current/hy2.json\n'
             'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n'

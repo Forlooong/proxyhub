@@ -79,7 +79,8 @@ function Hy2Section({data, prepare, busy}: Pick<FormProps, 'data' | 'prepare' | 
     {node ? <>
       <Details rows={[
         ['节点编号', <code>{node.id}</code>], ['发布状态', node.enabled ? '已启用，加入订阅' : '已停用，不加入订阅'],
-        ['服务状态', <Status value={service?.status ?? 'unknown'} />],
+        ['服务状态', <Status value={node.runtime_status ?? service?.status ?? 'unknown'} />],
+        ['运行组', node.runtime_group ?? 'proxyhub-hy2'],
         ['连接地址', <code>{data.proxy.public_address}:{node.port} / UDP</code>],
         ['TLS 服务名', <code>{node.server_name}</code>], ['绑定证书', <code>{node.certificate_id}</code>],
         ['验证记录', '请使用客户端完成真实代理请求；服务运行不等于连接通过'],
@@ -96,7 +97,7 @@ function Hy2Section({data, prepare, busy}: Pick<FormProps, 'data' | 'prepare' | 
       <Field label="TLS 服务名" hint="填写绑定证书覆盖的域名。客户端连接地址沿用上方公网连接地址。"><input className="code-input" value={serverName} required maxLength={253} disabled={busy} onChange={event => setServerName(event.target.value)} /></Field>
       <Field label="HY2 绑定证书" hint="引用受管证书；证书替换和续期将同时更新引用它的服务。"><select required value={certificateId} disabled={busy} onChange={event => setCertificateId(event.target.value)}><option value="">选择证书</option>{data.certificates.map(item => <option key={item.id} value={item.id} disabled={item.status !== 'valid'}>{item.name} · {item.id}{item.status !== 'valid' ? ' · 校验失败' : ''}</option>)}</select></Field>
       {binding && <p className="muted">证书覆盖：{binding.domains.join('、')}。HY2 停用后仍保留证书绑定。</p>}
-      <Notice>应用只调整独立 HY2 服务和订阅，REALITY 核心不重启。UDP 端口需能从客户端访问；更新或停用会中断 HY2 连接。应用后刷新订阅并完成真实代理请求。</Notice>
+      <Notice>{node?.runtime_group === 'proxyhub-shared' ? '运行配置变化会重启共享组，HY2 与组内全部启用节点需要重连；REALITY 核心保持运行。名称等未改变运行配置的更新只发布订阅。' : '应用调整独立 HY2 服务和订阅，REALITY 核心不重启。更新或停用会中断 HY2 连接。'} UDP 端口需能从客户端访问；应用后刷新订阅并完成真实代理请求。</Notice>
       <div className="form-actions"><button className="button primary" disabled={busy || !changed || !certificateId}>{node ? '验证并预览 HY2 更新' : '验证并预览创建 HY2'}</button></div>
     </form>
   </Section>;
@@ -120,7 +121,8 @@ function NodesSection({data, prepare, busy}: Pick<FormProps, 'data' | 'prepare' 
         <Details rows={[
           ['节点编号', <code>{node.id}</code>], ['协议', protocols.find(item => item.id === node.protocol)?.label ?? node.protocol],
           ['公网监听', <code>{data.proxy.public_address}:{node.port}{node.protocol === 'tuic' ? ' / UDP' : node.protocol === 'ss' ? ' / TCP + UDP' : ' / TCP'}{node.protocol === 'socks5' && node.options.udp ? ' · UDP 转发已启用' : ''}</code>],
-          ['传输安全', encrypted ? node.protocol === 'vmess' && !node.options.tls ? 'VMess 协议加密，未启用 TLS' : '加密传输' : '未加密传输'], ['服务状态', <Status value={service?.status ?? 'unknown'} />],
+          ['传输安全', encrypted ? node.protocol === 'vmess' && !node.options.tls ? 'VMess 协议加密，未启用 TLS' : '加密传输' : '未加密传输'], ['服务状态', <Status value={node.runtime_status ?? service?.status ?? 'unknown'} />],
+          ['运行组', node.runtime_group ?? `proxyhub-node@${node.id}`],
           ['认证状态', node.protocol === 'socks5' && !node.options.auth ? '未启用认证，所有可达客户端均可使用' : '已配置独立认证凭据'],
           ['协议选项', <code>{JSON.stringify(node.options)}</code>],
         ]} />
@@ -223,7 +225,7 @@ function NodeForm({data, prepare, busy, node}: Pick<FormProps, 'data' | 'prepare
     {protocol === 'tuic' && <><Field label="TUIC 拥塞控制"><select value={congestion} disabled={busy} onChange={event => setCongestion(event.target.value)}>{['bbr', 'cubic', 'new_reno'].map(item => <option key={item} value={item}>{item}</option>)}</select></Field><Field label="TUIC UDP 转发"><select value={relay} disabled={busy} onChange={event => setRelay(event.target.value)}><option value="native">native</option><option value="quic">quic</option></select></Field></>}
     {!usesTls && (protocol === 'vless' || (protocol === 'vmess' && security === 'none')) && <Notice>此节点的传输未加密。请仅在可信网络中使用。</Notice>}
     {protocol === 'vmess' && !usesTls && security !== 'none' && <Notice>此节点使用 VMess 协议加密，未启用 TLS。</Notice>}
-    <Notice>创建时生成稳定认证凭据，更新保留凭据。启用节点加入现有订阅；更新、证书替换或停用会中断该独立节点的连接，已有 REALITY、HY2 和网站继续运行。</Notice>
+    <Notice>创建时生成稳定认证凭据，更新保留凭据。启用节点加入现有订阅。{data.services.some(item => item.name === 'proxyhub-shared') ? '运行配置变化会重启固定共享组，HY2 与组内全部启用节点需要重连；REALITY 与网站继续运行。名称等未改变运行配置的更新只发布订阅。' : '更新、证书替换或停用会中断该独立节点的连接，已有 REALITY、HY2 和网站继续运行。'}</Notice>
     <div className="form-actions"><button className="button primary" disabled={busy || (!node && data.nodes.nodes.length >= 32) || (usesTls && !['ss', 'socks5'].includes(protocol) && (!selectedSni || (realityMode ? !targetId : !certificateId)))}>{node ? '验证并预览节点更新' : '验证并预览创建节点'}</button></div>
   </form>;
 }

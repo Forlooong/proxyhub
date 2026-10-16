@@ -63,6 +63,36 @@ def test_renew_cannot_revert_configuration_changed_during_acme(tmp_path, monkeyp
     assert store.revision == 1
 
 
+def test_runtime_migration_prepares_current_config_without_applying(tmp_path, content_service, monkeypatch, capsys):
+    import json
+    from proxyhub import deployment
+    config = {'server': {'private_key': 'PRIVATE-CONFIG-CANARY'},
+              'hy2': {'id': 'local-hy2'}, 'nodes': [{'id': 'a' * 32}]}
+    (tmp_path/'config.json').write_text(json.dumps(config), encoding='utf-8')
+    monkeypatch.setattr('proxyhub.state.StateStore', lambda _: content_service)
+    monkeypatch.setattr(deployment, '_current_revision', lambda: tmp_path)
+    calls = []
+    def prepare(store, current, **options):
+        calls.append((store, current, options))
+        return {'plan_id': 'b' * 32, 'activation': 'runtime'}
+    monkeypatch.setattr(deployment, 'prepare', prepare)
+    monkeypatch.setattr(deployment, 'apply', lambda *args: pytest.fail('migration must prepare before applying'))
+    assert main(['deployment', 'migrate-runtime']) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {'plan_id': 'b' * 32, 'activation': 'runtime'}
+    assert 'PRIVATE-CONFIG-CANARY' not in captured.out + captured.err
+    assert calls == [(content_service, config, {'runtime_only': True})]
+
+
+def test_runtime_migration_rejects_missing_active_deployment(content_service, monkeypatch, capsys):
+    from proxyhub import deployment
+    monkeypatch.setattr('proxyhub.state.StateStore', lambda _: content_service)
+    monkeypatch.setattr(deployment, '_current_revision', lambda: None)
+    monkeypatch.setattr(deployment, 'prepare', lambda *args, **kwargs: pytest.fail('an active deployment is required'))
+    assert main(['deployment', 'migrate-runtime']) == 1
+    assert 'OperationError' in capsys.readouterr().err
+
+
 @pytest.fixture
 def content_service(monkeypatch):
     from contextlib import contextmanager

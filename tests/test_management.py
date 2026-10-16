@@ -222,6 +222,54 @@ def test_protocol_node_overview_reports_service_and_certificate_consumer(environ
         assert secret not in json.dumps(result)
 
 
+@pytest.mark.parametrize('missing_hy2', [False, True])
+def test_shared_overview_reports_one_actual_unit_and_separate_inbound_states(environment,missing_hy2):
+    from proxyhub import hy2, nodes
+    env = environment
+    config = hy2.change(env.config,'hy2.create',{'server_name':'site.example.test','certificate_id':'default'})
+    for port in (5443,5444):
+        config = nodes.change(config,'nodes.create',{'protocol':'ss','name':'SS '+str(port),'port':port,
+            'options':{'method':'aes-256-gcm'}})
+    config = nodes.change(config,'nodes.disable',{'node_id':config['nodes'][1]['id']})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    inbounds = [{'tag':config['nodes'][0]['listener_id']}]
+    if not missing_hy2:
+        inbounds.append({'tag':config['hy2']['listener_id']})
+    (env.directory/'shared.json').write_bytes(canonical({'inbounds':inbounds}))
+    result = env.service.handle('overview',{})
+    assert {'name':'proxyhub-shared','status':'active'} in result['services']
+    assert not any(item['name']=='proxyhub-hy2' or item['name'].startswith('proxyhub-node@')
+                   for item in result['services'])
+    assert result['hy2']['node']['runtime_status'] == ('not-loaded' if missing_hy2 else 'active')
+    assert [node['runtime_status'] for node in result['nodes']['nodes']] == ['active','inactive']
+    assert all(node['runtime_group']=='proxyhub-shared' for node in result['nodes']['nodes'])
+    assert 'credentials' not in json.dumps(result)
+    assert config['hy2']['password'] not in json.dumps(result)
+
+
+@pytest.mark.parametrize(('changed','reconnect'), [(False,False),(True,False),(True,True)])
+def test_node_plan_previews_exact_shared_group_impact(environment,monkeypatch,changed,reconnect):
+    env = environment
+    original = deployment.prepare
+    def prepare(*args,**options):
+        result = original(*args,**options)
+        result['shared_runtime'] = {'changed':changed,'reconnect_required':reconnect,
+            'members':[{'id':'local-hy2','name':'Existing HY2','protocol':'hy2'},
+                       {'id':'c'*32,'name':'Existing TUIC','protocol':'tuic'}]}
+        return result
+    monkeypatch.setattr(deployment,'prepare',prepare)
+    preview = env.service.create_plan('nodes.create',0,{'protocol':'ss','name':'New SS','port':5443,
+        'options':{'method':'aes-256-gcm'}})
+    impact = ' '.join(preview['impact'])
+    if changed:
+        assert 'Existing HY2 (HY2)' in impact and 'Existing TUIC (TUIC)' in impact
+        assert ('均需重连' in impact) is reconnect
+    else:
+        assert '运行配置未变化' in impact and '连接保持' in impact
+    assert 'REALITY 核心和网站进程保持运行' in impact
+    assert_private_fields_absent(preview,env.config)
+
+
 def test_website_upload_and_restore_share_existing_plan_contract(environment,monkeypatch):
     import base64
     import io
@@ -438,6 +486,34 @@ def test_pending_overview_shows_last_committed_config_and_reveal_is_blocked(envi
         with pytest.raises(ManagementError) as error:
             env.service.handle('subscription.reveal',{'format':format_name})
         assert error.value.code == 'BUSY'
+
+
+def test_pending_overview_reads_committed_runtime_layout(environment):
+    from proxyhub import hy2
+    env = environment
+    env.config = hy2.change(env.config,'hy2.create',{'server_name':'site.example.test','certificate_id':'default'})
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    (env.directory/'shared.json').write_bytes(canonical({'inbounds':[{'tag':env.config['hy2']['listener_id']}]}))
+    pending_activation(env)
+    (env.pointer['current']/'shared.json').write_bytes(canonical({'inbounds':[]}))
+    result = env.service.handle('overview',{})
+    assert result['operation_pending'] is True
+    assert result['hy2']['node']['runtime_group'] == 'proxyhub-shared'
+    assert result['hy2']['node']['runtime_status'] == 'active'
+
+
+def test_empty_or_invalid_shared_runtime_never_reports_retained_disabled_hy2_active(environment):
+    from proxyhub import hy2
+    env = environment
+    config = hy2.change(env.config,'hy2.create',{'server_name':'site.example.test','certificate_id':'default'})
+    config = hy2.change(config,'hy2.disable',{})
+    (env.directory/'config.json').write_bytes(canonical(config))
+    for body in (canonical({'inbounds':[]}),b'not valid JSON'):
+        (env.directory/'shared.json').write_bytes(body)
+        result = env.service.handle('overview',{})
+        assert result['hy2']['node']['runtime_status'] == 'inactive'
+        assert result['hy2']['node']['runtime_group'] == 'proxyhub-shared'
+        assert not any(item['name']=='proxyhub-hy2' for item in result['services'])
 
 
 def test_only_explicit_reveal_returns_link_or_node_credential(environment):

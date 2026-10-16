@@ -118,6 +118,13 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
     config = json.loads((directory/'config.json').read_text(encoding='utf-8'))
     sites = normalize_web(config)['sites'] if 'web' in config else [{'id':'default'}]
     allowed = set(CANDIDATE_FILES) - {'site/index.html'}
+    shared = directory/'shared.json'
+    if 'shared.json' in manifest:
+        if shared.is_symlink() or not shared.is_file() or digest(shared.read_bytes()) != manifest['shared.json']:
+            raise OperationError('Shared runtime changed after validation')
+        allowed.add('shared.json')
+    elif shared.exists() or shared.is_symlink():
+        raise OperationError('Candidate contains an unmanaged shared runtime')
     if hy2.normalize_hy2(config) is not None:
         file = directory/'hy2.json'
         if file.is_symlink() or not file.is_file() or digest(file.read_bytes()) != manifest.get('hy2.json'):
@@ -404,11 +411,29 @@ def _render_hy2(config: dict) -> dict:
     return rendered
 
 
+def _render_shared(config: dict) -> dict:
+    rendered = nodes.render_shared(config) or {'log':{'level':'warn','timestamp':True},
+        'inbounds':[], 'outbounds':[{'type':'direct','tag':'direct'}]}
+    for inbound in rendered['inbounds']:
+        tls = inbound.get('tls',{})
+        if 'certificate_path' in tls:
+            tls['certificate'] = _certificate_material(tls.pop('certificate_path'))
+            tls['key'] = _certificate_material(tls.pop('key_path'))
+    return rendered
+
+
+def _runtime_transition(config: dict, previous: Path | None) -> None:
+    if previous is None or config != json.loads((previous/'config.json').read_text(encoding='utf-8')):
+        raise OperationError('Runtime migration must preserve every resource and credential')
+    if (previous/'shared.json').exists():
+        raise OperationError('The fixed shared runtime is already in use')
+
+
 def prepare(store: StateStore, config: dict, *, expected_revision: int | None = None,
             publish_only: bool = False, site_files: dict[str, bytes] | None = None,
             website_change: bool = False, site_id: str = 'default', web_only: bool = False,
             reality_operation: dict | None = None, hy2_operation: dict | None = None,
-            node_operation: dict | None = None) -> dict:
+            node_operation: dict | None = None, runtime_only: bool = False) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
@@ -417,8 +442,8 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
     if (not {'server','subscription','overrides'} <= set(config)
             or set(config) - {'server','subscription','overrides','website_content','web','reality','hy2','nodes'}):
         raise OperationError('Deployment contains unknown or missing objects')
-    if (type(publish_only) is not bool or type(web_only) is not bool
-            or sum((publish_only,web_only,reality_operation is not None,hy2_operation is not None,node_operation is not None))>1):
+    if (type(publish_only) is not bool or type(web_only) is not bool or type(runtime_only) is not bool
+            or sum((publish_only,web_only,runtime_only,reality_operation is not None,hy2_operation is not None,node_operation is not None))>1):
         raise OperationError('Activation mode selection must be unambiguous')
     original = config
     config = sync_default(config)
@@ -435,7 +460,11 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
         _publication_server(server,previous,config)
         if site_files is not None:
             raise OperationError('Publication-only activation cannot change website content')
-    if reality_operation is not None:
+    if runtime_only:
+        _runtime_transition(config,previous)
+        if site_files is not None:
+            raise OperationError('Runtime migration cannot change website content')
+    elif reality_operation is not None:
         _reality_transition(config,previous,reality_operation)
     elif hy2_operation is not None:
         _hy2_transition(config,previous,hy2_operation)
@@ -479,6 +508,11 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             path = directory/'nodes'/(node['id']+'.json')
             atomic_write(path,canonical(_render_node(config,node)),0o640)
             path.parent.chmod(0o711)
+            os.chown(path,0,proxy_gid)
+            run([str(BIN/'sing-box'),'check','-c',str(path)])
+        if runtime_only or previous is None or (previous/'shared.json').is_file():
+            path = directory/'shared.json'
+            atomic_write(path,canonical(_render_shared(config)),0o640)
             os.chown(path,0,proxy_gid)
             run([str(BIN/'sing-box'),'check','-c',str(path)])
         if 'reality' in config:
@@ -533,7 +567,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
                    'content_versions':{site['id']:site['content_version'] for site in config['web']['sites']
                                        if site['content_version']},
                    'website_summaries':summaries,
-                   'activation':('node' if node_operation is not None else 'hy2' if hy2_operation is not None else 'reality' if reality_operation is not None else
+                   'activation':('runtime' if runtime_only else 'node' if node_operation is not None else 'hy2' if hy2_operation is not None else 'reality' if reality_operation is not None else
                                  'publication' if publish_only else 'web' if web_only else 'full')}
         if reality_operation is not None:
             payload['reality_operation'] = reality_operation
@@ -549,14 +583,21 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             payload.update(website_change=True,website_id=site_id)
         plan_id = store.plan('deployment',payload,expected_revision=base_revision)
         changes = (['subscription bundle','publisher reload'] if publish_only else
+                   ['fixed shared HY2/additional-node runtime','all enabled group members reconnect','REALITY and websites remain running'] if runtime_only else
                    ['selected protocol node and service','subscription publication'] if node_operation is not None else
                    ['HY2 resource and service','subscription publication'] if hy2_operation is not None else
                    ['new or retained REALITY entries','Nginx reload','subscription SNI publication'] if reality_operation is not None else
                    ['website resources','Nginx reload','publisher reload'] if web_only else
                    ['managed websites','REALITY listener','subscription bundle','ProxyHub service activation'])
+        shared_runtime = _runtime_impact(config,directory,previous)
+        if shared_runtime is not None and (node_operation is not None or hy2_operation is not None):
+            changes = ['selected protocol resource','subscription publication',
+                       'shared HY2/additional-node runtime restart; all enabled members reconnect'
+                       if shared_runtime['changed'] else 'shared runtime unchanged']
         return {'plan_id':plan_id,'revision':revision,'site_domain':server['site_domain'],
                 'subscription_domain':server['subscription_domain'],'checks':['certificates','sing-box','nginx','mihomo'],
-                'activation':payload['activation'],'changes':changes}
+                'activation':payload['activation'],'changes':changes,
+                'shared_runtime':shared_runtime}
     except Exception:
         shutil.rmtree(directory)
         raise
@@ -566,7 +607,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
 def _activation(payload: dict) -> str:
     """Missing mode identifies a phase-1 full-deployment record."""
     mode = payload.get('activation', 'full')
-    if mode not in ('full', 'publication', 'web', 'reality', 'hy2', 'node'):
+    if mode not in ('full', 'publication', 'web', 'reality', 'hy2', 'node', 'runtime'):
         raise OperationError('Unsupported activation mode')
     return mode
 
@@ -624,8 +665,14 @@ def _reality_units(config: dict) -> dict[str,str]:
             for entry in reality.normalize_reality(config)['endpoints']}
 
 
-def _core_units(config: dict) -> tuple[str,...]:
-    additional = (*_node_units(config).values(),*(('proxyhub-hy2.service',) if _hy2_enabled(config) else ()))
+def _runtime_units(config: dict, directory: Path | None) -> tuple[str,...]:
+    if directory is not None and (directory/'shared.json').is_file():
+        return ('proxyhub-shared.service',) if _runtime_members(config) else ()
+    return (*_node_units(config).values(),*(('proxyhub-hy2.service',) if _hy2_enabled(config) else ()))
+
+
+def _core_units(config: dict, directory: Path | None = None) -> tuple[str,...]:
+    additional = _runtime_units(config,directory)
     if 'reality' not in config:
         return (*_units(),*additional)
     entries = _reality_units(config)
@@ -697,6 +744,8 @@ def _check_runtime_permissions(directory: Path) -> None:
     extra = list((directory/'reality').glob('*.json')) if 'reality' in config else []
     if extra:
         parents.append(directory/'reality')
+    if (directory/'shared.json').exists():
+        extra.append(directory/'shared.json')
     if hy2.normalize_hy2(config) is not None:
         extra.append(directory/'hy2.json')
     node_files = [directory/'nodes'/(node['id']+'.json') for node in nodes.normalize_nodes(config)]
@@ -778,6 +827,105 @@ def _check_reality_ports(config: dict, previous: Path | None) -> None:
                     checked.bind((address,port))
             except OSError:
                 raise OperationError(f'New REALITY TCP port {port} is unavailable; no service was replaced') from None
+
+
+def _runtime_members(config: dict) -> list[dict]:
+    resource = hy2.normalize_hy2(config)
+    return ([{'id':resource['id'],'name':resource['name'],'protocol':'hy2'}]
+            if resource is not None and resource['enabled'] else []) + [
+        {key:node[key] for key in ('id','name','protocol')}
+        for node in nodes.normalize_nodes(config) if node['enabled']]
+
+
+def _runtime_impact(config: dict, directory: Path, previous: Path | None) -> dict | None:
+    if not (directory/'shared.json').is_file():
+        return None
+    old = json.loads((previous/'config.json').read_text(encoding='utf-8')) if previous else {}
+    changed = (previous is None or not (previous/'shared.json').is_file()
+               or (directory/'shared.json').read_bytes() != (previous/'shared.json').read_bytes())
+    members = {member['id']:member for member in [*_runtime_members(old),*_runtime_members(config)]}
+    return {'changed':changed,'members':list(members.values()),'reconnect_required':changed and bool(members)}
+
+
+def _sync_runtime(config: dict, old: dict, directory: Path, previous: Path | None) -> tuple[bool,set[str]]:
+    shared = (directory/'shared.json').is_file()
+    was_shared = previous is not None and (previous/'shared.json').is_file()
+    if not shared and not was_shared:
+        return (_sync_hy2(config,old,directory=directory,previous=previous),
+                _sync_nodes(config,old,directory,previous))
+    before, after = _runtime_units(old,previous), _runtime_units(config,directory)
+    changed = shared != was_shared or previous is None or (
+        shared and (directory/'shared.json').read_bytes() != (previous/'shared.json').read_bytes())
+    if not changed:
+        return False,set()
+    # Stop the old topology before binding any of its retained ports. The old
+    # units/configuration stay available until the journal commits, and on disk
+    # afterwards for recovery; no resource or credential is deleted.
+    for unit in before:
+        if not (shared and was_shared and unit in after):
+            run(['systemctl','stop',unit])
+            run(['systemctl','disable',unit])
+    for unit in after:
+        run(['systemctl','restart' if shared and was_shared and unit in before else 'start',unit])
+        run(['systemctl','enable',unit])
+    return _hy2_enabled(config),{node['id'] for node in nodes.normalize_nodes(config) if node['enabled']}
+
+
+def _runtime_health(config: dict, directory: Path, changed: tuple[bool,set[str]]) -> None:
+    changed_hy2, changed_nodes = changed
+    if changed_hy2:
+        _wait_hy2_health(config,directory)
+    _wait_nodes_health(config,directory,changed_nodes)
+
+
+def _isolated_runtime_health(config: dict, directory: Path) -> None:
+    """Authenticate the migration candidate before stopping the old listeners."""
+    if not _runtime_members(config):
+        return
+    import pwd
+    account = pwd.getpwnam('proxyhub-proxy')
+    probe = json.loads(json.dumps(config))
+    rendered = json.loads((directory/'shared.json').read_text(encoding='utf-8'))
+    ports = set()
+    for inbound in rendered['inbounds']:
+        while True:
+            with socket.socket() as tcp, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+                tcp.bind(('127.0.0.1',0))
+                port = tcp.getsockname()[1]
+                try:
+                    udp.bind(('127.0.0.1',port))
+                except OSError:
+                    continue
+            if port not in ports:
+                ports.add(port)
+                break
+        inbound.update(listen='127.0.0.1',listen_port=port)
+        if inbound['tag']=='hy2-default':
+            probe['hy2']['port'] = port
+        else:
+            next(node for node in probe['nodes'] if node['listener_id']==inbound['tag'])['port'] = port
+    with tempfile.TemporaryDirectory(prefix='.shared-health-',dir=ROOT) as temp:
+        parent = Path(temp)
+        os.chown(parent,0,account.pw_gid)
+        parent.chmod(0o710)
+        path = parent/'shared.json'
+        atomic_write(path,canonical(rendered),0o640)
+        os.chown(path,0,account.pw_gid)
+        process = subprocess.Popen([str(BIN/'sing-box'),'run','-c',str(path)],
+            user=account.pw_uid,group=account.pw_gid,extra_groups=[],
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            _wait_hy2_health(probe,directory)
+            _wait_nodes_health(probe,directory)
+            if process.poll() is not None:
+                raise OperationError('Isolated shared runtime exited before validation')
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def _hy2_enabled(config: dict) -> bool:
@@ -1004,25 +1152,21 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
     current = _current_revision()
     if current not in (None, previous, candidate):
         raise OperationError('Refusing to overwrite an unexpected current revision')
-    if activation == 'node':
+    if activation in ('node','hy2','runtime'):
         config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
-        _nodes_transition(config,previous,node_operation)
+        if activation=='node':
+            _nodes_transition(config,previous,node_operation)
+        elif activation=='hy2':
+            _hy2_transition(config,previous,hy2_operation)
+        else:
+            _runtime_transition(config,previous)
         restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+        if (candidate/'shared.json').is_file() and not (previous/'shared.json').is_file():
+            run(['systemctl','stop','proxyhub-shared.service'])
         _link(previous)
         _publish(previous)
-        changed = _sync_nodes(restored,config,previous,candidate)
-        _wait_nodes_health(restored,previous,changed)
-        run(['systemctl','reload','proxyhub-publisher.service'])
-        _wait_publication(previous)
-        return
-    if activation == 'hy2':
-        config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
-        _hy2_transition(config,previous,hy2_operation)
-        restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
-        _link(previous)
-        _publish(previous)
-        _sync_hy2(restored,config,restore=True)
-        _wait_hy2_health(restored,previous)
+        changed = _sync_runtime(restored,config,previous,candidate)
+        _runtime_health(restored,previous,changed)
         run(['systemctl','reload','proxyhub-publisher.service'])
         _wait_publication(previous)
         return
@@ -1042,16 +1186,13 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
         restored = json.loads((previous/'config.json').read_text(encoding='utf-8'))
         _link(previous)
         _publish(previous)
-        changed_hy2 = _sync_hy2(restored,config,directory=previous,previous=candidate)
-        changed_nodes = _sync_nodes(restored,config,previous,candidate)
+        changed = _sync_runtime(restored,config,previous,candidate)
         run(['systemctl','reload','proxyhub-nginx.service'])
         run(['systemctl','reload','proxyhub-publisher.service'])
         _wait_web_health(restored,previous)
         if 'reality' in restored:
             _wait_local_reality_health(restored,previous)
-        if changed_hy2:
-            _wait_hy2_health(restored,previous)
-        _wait_nodes_health(restored,previous,changed_nodes)
+        _runtime_health(restored,previous,changed)
         _wait_publication(previous)
         return
     if activation == 'reality':
@@ -1081,7 +1222,13 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
         config = json.loads((previous / 'config.json').read_text(encoding='utf-8'))
         _link(previous)
         _publish(previous)
-        for service in _core_units(config):
+        candidate_config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+        shared_topology = (candidate/'shared.json').is_file() or (previous/'shared.json').is_file()
+        if shared_topology:
+            _sync_runtime(config,candidate_config,previous,candidate)
+        for service in _core_units(config,previous):
+            if shared_topology and service in _runtime_units(config,previous):
+                continue
             run(['systemctl', 'restart', service])
         # systemctl restart acknowledges process startup, not HTTPS readiness.
         # Keep the activation pending until every restored consumer is healthy.
@@ -1097,13 +1244,15 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
         # Every service is attempted even if one stop fails. The journal is left
         # pending when any action fails, so a later recover can safely retry.
         errors = []
-        for service in reversed(_units()):
+        candidate_config = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+        candidate_units = _core_units(candidate_config,candidate)
+        for service in reversed(candidate_units):
             try:
                 run(['systemctl', 'stop', service])
             except Exception as exc:
                 errors.append(exc)
         try:
-            run(['systemctl', 'disable', *_units()])
+            run(['systemctl', 'disable', *candidate_units])
         except Exception as exc:
             errors.append(exc)
         if errors:
@@ -1141,7 +1290,16 @@ def recover(store: StateStore) -> dict:
         if candidate.name != record['payload']['revision']:
             raise OperationError('Recovery candidate differs from its plan')
         previous = _managed_revision(details['previous']) if details['previous'] else None
-        if activation in ('reality','hy2','node'):
+        if 'previous_files' in details:
+            if previous is None:
+                raise OperationError('Runtime recovery is missing its previous revision')
+            _verify_candidate(previous,{'files':details['previous_files']})
+            before = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+            after = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+            if (details.get('runtime_units_before') != list(_runtime_units(before,previous))
+                    or details.get('runtime_units_after') != list(_runtime_units(after,candidate))):
+                raise OperationError('Runtime recovery service set differs from its revisions')
+        if activation in ('reality','hy2','node','runtime') or (candidate/'shared.json').exists():
             _verify_candidate(candidate,record['payload'])
             _restore(previous,candidate,activation,record['payload'].get('reality_operation'),
                      record['payload'].get('hy2_operation'),record['payload'].get('node_operation'))
@@ -1353,6 +1511,8 @@ def apply(store: StateStore, identity: str) -> dict:
             _reality_transition(config,previous,payload.get('reality_operation'))
         elif activation == 'hy2':
             _hy2_transition(config,previous,payload.get('hy2_operation'))
+        elif activation == 'runtime':
+            _runtime_transition(config,previous)
         elif activation == 'node':
             _nodes_transition(config,previous,payload.get('node_operation'))
         elif activation == 'web':
@@ -1374,38 +1534,39 @@ def apply(store: StateStore, identity: str) -> dict:
             _probe_node_targets(config,{payload['node_operation']['node_id']})
         if previous is None:
             _check_ports(server)
-        store.record(identity,'activating',{'previous':str(previous) if previous else None,
-                     'candidate':str(directory),'activation':activation})
+        if activation=='runtime':
+            _isolated_runtime_health(config,directory)
+        details = {'previous':str(previous) if previous else None,
+                   'candidate':str(directory),'activation':activation}
+        if (directory/'shared.json').is_file() or (previous is not None and (previous/'shared.json').is_file()):
+            old = json.loads((previous/'config.json').read_text(encoding='utf-8')) if previous else {}
+            details.update(runtime_units_before=list(_runtime_units(old,previous)),
+                           runtime_units_after=list(_runtime_units(config,directory)))
+            if previous is not None:
+                details['previous_files'] = {path.relative_to(previous).as_posix():digest(path.read_bytes())
+                    for path in previous.rglob('*') if path.is_file()}
+        store.record(identity,'activating',details)
         try:
             _link(directory)
             _publish(directory)
             if activation == 'publication':
                 run(['systemctl', 'reload', 'proxyhub-publisher.service'])
                 _wait_publication(directory)
-            elif activation == 'hy2':
+            elif activation in ('hy2','node','runtime'):
                 old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
-                _sync_hy2(config,old)
-                _wait_hy2_health(config,directory)
-                run(['systemctl','reload','proxyhub-publisher.service'])
-                _wait_publication(directory)
-            elif activation == 'node':
-                old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
-                changed_nodes = _sync_nodes(config,old,directory,previous)
-                _wait_nodes_health(config,directory,changed_nodes)
+                changed = _sync_runtime(config,old,directory,previous)
+                _runtime_health(config,directory,changed)
                 run(['systemctl','reload','proxyhub-publisher.service'])
                 _wait_publication(directory)
             elif activation == 'web':
                 old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
-                changed_hy2 = _sync_hy2(config,old,directory=directory,previous=previous)
-                changed_nodes = _sync_nodes(config,old,directory,previous)
+                changed = _sync_runtime(config,old,directory,previous)
                 run(['systemctl','reload','proxyhub-nginx.service'])
                 run(['systemctl','reload','proxyhub-publisher.service'])
                 _wait_web_health(config,directory)
                 if 'reality' in config:
                     _wait_local_reality_health(config,directory)
-                if changed_hy2:
-                    _wait_hy2_health(config,directory)
-                _wait_nodes_health(config,directory,changed_nodes)
+                _runtime_health(config,directory,changed)
                 _wait_publication(directory)
             elif activation == 'reality':
                 old = json.loads((previous/'config.json').read_text(encoding='utf-8'))
@@ -1426,7 +1587,13 @@ def apply(store: StateStore, identity: str) -> dict:
                     if entry_id not in before:
                         run(['systemctl','enable',unit])
             else:
-                for service in _core_units(config):
+                shared_topology = (directory/'shared.json').is_file() or (previous is not None and (previous/'shared.json').is_file())
+                if shared_topology:
+                    old = json.loads((previous/'config.json').read_text(encoding='utf-8')) if previous else {}
+                    _sync_runtime(config,old,directory,previous)
+                for service in _core_units(config,directory):
+                    if shared_topology and service in _runtime_units(config,directory):
+                        continue
                     run(['systemctl','restart',service])
                 if 'reality' not in config:
                     _wait_health(server)
@@ -1438,13 +1605,15 @@ def apply(store: StateStore, identity: str) -> dict:
                     _wait_local_reality_health(config,directory)
                 _wait_hy2_health(config,directory)
                 _wait_nodes_health(config,directory)
-                run(['systemctl','enable',*_core_units(config)])
+                run(['systemctl','enable',*_core_units(config,directory)])
             store.commit(identity)
         except Exception:
             # A successful database COMMIT is the boundary. Never undo it if a
             # later Python exception occurs; recovery sees no pending activation.
             if store.inspect(identity)['status'] != 'applied':
-                if activation in ('reality','hy2','node'):
+                if 'previous_files' in details:
+                    _verify_candidate(previous,{'files':details['previous_files']})
+                if activation in ('reality','hy2','node','runtime'):
                     _restore(previous,directory,activation,payload.get('reality_operation'),payload.get('hy2_operation'),payload.get('node_operation'))
                 else:
                     _restore(previous, directory, activation)

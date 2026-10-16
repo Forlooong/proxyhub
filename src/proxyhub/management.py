@@ -32,6 +32,18 @@ def identifier(value):
     return value
 
 
+def runtime_impact(prepared, legacy):
+    group = prepared.get('shared_runtime')
+    if group is None:
+        return [legacy]
+    if not group['changed']:
+        return ['共享组运行配置未变化，HY2 与额外节点进程及现有连接保持。']
+    members = '、'.join(item['name']+' ('+item['protocol'].upper()+')' for item in group['members'])
+    return ['固定共享组影响成员：'+members+'。',
+            ('切换共享组运行配置，HY2 与全部已启用额外节点的现有连接均需重连。'
+             if group['reconnect_required'] else '启动固定共享组；此前没有需要重连的共享组连接。')]
+
+
 class OperationService:
     def __init__(self, root=ROOT, *, jobs=None, synchronous=False):
         self.root = Path(root)
@@ -77,8 +89,8 @@ class OperationService:
         if operation == 'overview':
             shape(payload,())
             with self.state() as store:
-                _, config, revision, pending = self.snapshot(store)
-                result = overview(config,revision,self.jobs,self.root)
+                directory, config, revision, pending = self.snapshot(store)
+                result = overview(config,revision,self.jobs,self.root,directory)
                 result['operation_pending'] = pending
                 return result
         if operation == 'jobs.list':
@@ -181,7 +193,7 @@ class OperationService:
                            for key,label in (('name','节点名称'),('protocol','协议'),('port','独立监听端口'),
                                              ('options','协议与传输选项'),('enabled','启用状态'))
                            if old is None or new is None or old.get(key) != new.get(key)]
-                warnings = ['更新或停用会中断所选独立节点的连接；删除前必须先停用。应用后刷新订阅并验证真实客户端请求。',
+                warnings = ['删除前必须先停用。应用后刷新订阅并验证真实客户端请求。',
                             '公网端口需能从客户端访问；服务运行和配置校验不代表真实连接已通过。']
                 selected = new or old
                 if selected and selected['options'].get('transport') == 'h2':
@@ -192,7 +204,8 @@ class OperationService:
                 if selected and selected['protocol'] == 'socks5' and not selected['options'].get('auth'):
                     warnings.insert(0,'此 SOCKS5 节点未启用认证，所有能够访问该端口的客户端均可使用。')
                 return self.preview(prepared['plan_id'],kind,base_revision,changes,
-                    ['仅调整所选独立节点和关联订阅；现有 REALITY、HY2、网站服务保持运行。'],warnings)
+                    runtime_impact(prepared,'调整所选独立节点和关联订阅，更新或停用会中断该节点连接；现有 HY2 服务保持运行。')+
+                    ['REALITY 核心和网站进程保持运行；节点凭据保持原值。'],warnings)
             if kind in hy2.KINDS:
                 before = hy2.public_resources(config)['node']
                 candidate = hy2.change(config,kind,values)
@@ -204,9 +217,10 @@ class OperationService:
                                              ('server_name','TLS 服务名'),('certificate_id','绑定证书'),('enabled','启用状态'))
                            if before is None or before[key] != after[key]]
                 return self.preview(prepared['plan_id'],kind,base_revision,changes,
-                    ['仅调整独立 HY2 服务和关联订阅；REALITY 核心不重启，原 TCP 入口保留。'],
+                    runtime_impact(prepared,'调整独立 HY2 服务和关联订阅，更新或停用会中断其连接。')+
+                    ['REALITY 核心和网站进程保持运行，原 TCP 入口保留。'],
                     ['HY2 需要 UDP 端口可达；TCP 网站和 REALITY 入口不受 UDP 监听影响。',
-                     '更新或停用 HY2 会中断该节点的连接；应用后刷新订阅并验证真实客户端请求。'])
+                     '应用后刷新订阅并验证真实客户端请求。'])
             if kind in reality.KINDS:
                 before = reality.public_resources(config)
                 candidate = reality.change(config,kind,values)
@@ -237,7 +251,8 @@ class OperationService:
                 result = management_web.change(config,kind,values,self.root)
                 prepared = deployment.prepare(store,result['config'],expected_revision=base_revision,web_only=True)
                 return self.preview(prepared['plan_id'],kind,base_revision,result['changes'],
-                                    ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。'],result['warnings'])
+                    ['重新加载网站和订阅发布器，保留 REALITY 进程。']+
+                    runtime_impact(prepared,'启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。'),result['warnings'])
             if kind == 'certificate.issue' or (kind == 'certificate.renew' and ('web' in config or values)):
                 return self._acme_plan(store,directory,config,kind,base_revision,values)
             before = deepcopy(config)
@@ -306,10 +321,14 @@ class OperationService:
             options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
             if kind.startswith('website.'):
                 options.update(site_id=site_id,web_only=True)
-                impact = ['重新加载网站和订阅发布器，保留 REALITY 进程；启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。']
+                impact = ['重新加载网站和订阅发布器，保留 REALITY 进程。']
             if kind.startswith('website.content.'):
                 options.update(site_files=site_files,website_change=True)
             result = deployment.prepare(store,config,**options)
+            if kind.startswith('website.'):
+                impact += runtime_impact(result,'启用 HY2 或独立节点所用证书材料变化时重启相应节点，相关连接会中断。')
+            elif kind == 'proxy.update':
+                impact += runtime_impact(result,'代理服务重新加载时相关连接需要重连。')
             return self.preview(result['plan_id'],kind,base_revision,changes,impact,warnings)
 
     def _acme_plan(self, store, directory, config, kind, base_revision, values):
@@ -345,7 +364,7 @@ class OperationService:
         return self.preview(plan,kind,base_revision,
                             [{'label':'证书绑定','before':None if action=='issue' else identity,'after':identity},
                              {'label':'域名','before':None,'after':domains}],
-                            ['申请成功后才保存绑定；证书变化时更新消费者并核对实际指纹。保留 REALITY 进程，启用 HY2 或独立节点所用材料变化时重启相应节点并中断其连接。'],
+                            ['申请成功后才保存绑定；证书变化时更新消费者并核对实际指纹。保留 REALITY 进程；若启用 HY2 或额外节点使用的证书材料变化，将切换固定共享组，HY2 与全部启用额外节点的连接均需重连。旧布局仍只重启对应独立节点。'],
                             ['HTTP-01 要求所有 A/AAAA 正确指向本机且公网 TCP 80 可达。','签发失败不会替换当前有效配置；手工证书不会自动接管续期。'])
 
     def _ssh_plan(self, store, base_revision, values):
