@@ -13,6 +13,9 @@ from test_multisite_activation import multisite, two_sites, activate, CERTIFICAT
 from test_subscription_activation import environment, read_config
 
 
+REAL_WAIT_HY2_HEALTH = deployment._wait_hy2_health
+
+
 @pytest.fixture
 def hy2_environment(multisite, monkeypatch):
     env = multisite
@@ -310,6 +313,40 @@ def test_hy2_health_requires_both_pki_name_and_selected_leaf(hy2_environment, mo
     assert probes == ([None] if failure == 'trust' else [None, fingerprint])
 
 
+@pytest.mark.parametrize('failure_stage', ['pki', 'pin'])
+@pytest.mark.parametrize('recovers', [False, True])
+def test_hy2_wait_bounds_failures_and_rechecks_trust_before_pin(hy2_environment, monkeypatch,
+                                                              failure_stage, recovers):
+    env = hy2_environment
+    config = create(env)
+    fingerprint = 'c' * 64
+    probes, sleeps = [], []
+    attempt = 0
+    monkeypatch.setattr(deployment, '_runtime_fingerprint', lambda path: fingerprint)
+    monkeypatch.setattr(deployment.time, 'sleep', sleeps.append)
+    def probe(snapshot, fingerprint=None):
+        nonlocal attempt
+        assert snapshot == config
+        stage = 'pki' if fingerprint is None else 'pin'
+        if stage == 'pki':
+            attempt += 1
+        probes.append((attempt, stage))
+        if stage == failure_stage and (not recovers or attempt < 3):
+            raise OperationError('HY2 bounded fixture failure at ' + stage)
+    monkeypatch.setattr(deployment, '_hy2_probe', probe)
+    if recovers:
+        REAL_WAIT_HY2_HEALTH(config, env.pointer['current'])
+    else:
+        with pytest.raises(OperationError, match='bounded fixture failure'):
+            REAL_WAIT_HY2_HEALTH(config, env.pointer['current'])
+    expected = [(number, 'pki') for number in range(1, 4)] if failure_stage == 'pki' else [
+        (number, stage) for number in range(1, 4) for stage in ('pki', 'pin')]
+    if failure_stage == 'pki' and recovers:
+        expected.append((3, 'pin'))
+    assert probes == expected
+    assert sleeps == [.2, .2]
+
+
 def test_runtime_fingerprint_uses_first_immutable_leaf(tmp_path):
     leaf = b'\x30\x03\x02\x01\x01'
     chain = b'\x30\x03\x02\x01\x02'
@@ -411,3 +448,97 @@ def test_hy2_probe_reaches_configured_publisher_when_proxy_uses_host_authority(h
         worker.join(timeout=3)
     assert not worker.is_alive()
     assert observed == [(('127.0.0.1', 19991), ('127.0.0.1', 19991))]
+
+
+@pytest.fixture
+def verification_http_client(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from types import SimpleNamespace
+    clients = []
+    def start(command, **kwargs):
+        client = json.loads(deployment.Path(command[command.index('-f') + 1]).read_text())
+        state = SimpleNamespace(requests=[], statuses=[502, 404], terminated=0, waited=0)
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                state.requests.append((self.path, self.headers['Host']))
+                status = state.statuses[min(len(state.requests) - 1, len(state.statuses) - 1)]
+                self.send_response(status)
+                self.send_header('Content-Length', '0')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = HTTPServer(('127.0.0.1', client['mixed-port']), Handler)
+        worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True)
+        state.poll = lambda: 0 if state.terminated else None
+        def terminate():
+            state.terminated += 1
+            server.shutdown()
+            server.server_close()
+        def wait(timeout):
+            state.waited += 1
+            worker.join(timeout)
+            assert not worker.is_alive()
+            return 0
+        state.terminate, state.wait, state.kill = terminate, wait, terminate
+        state.worker = worker
+        clients.append(state)
+        worker.start()
+        return state
+    monkeypatch.setattr(deployment.subprocess, 'Popen', start)
+    yield clients
+    for state in clients:
+        if not state.terminated:
+            state.terminate()
+            state.wait(timeout=3)
+
+
+def test_probe_waits_for_authenticated_response_from_same_started_client(hy2_environment, verification_http_client):
+    env = hy2_environment
+    config = create(env)
+    deployment._hy2_probe(config)
+    assert len(verification_http_client) == 1
+    client = verification_http_client[0]
+    target = config['server']['publisher_port']
+    assert client.requests == [(f'http://127.0.0.1:{target}/__hy2_health__', f'127.0.0.1:{target}')] * 2
+    assert client.terminated == client.waited == 1 and not client.worker.is_alive()
+
+
+def test_probe_persistent_502_expires_startup_budget_and_reaps_client(hy2_environment, verification_http_client,
+                                                                   monkeypatch):
+    env = hy2_environment
+    config = create(env)
+    elapsed = [0.]
+    original_start = deployment.subprocess.Popen
+    def start(*args, **kwargs):
+        state = original_start(*args, **kwargs)
+        state.statuses = [502]
+        return state
+    monkeypatch.setattr(deployment.subprocess, 'Popen', start)
+    monkeypatch.setattr(deployment.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(deployment.time, 'sleep', lambda delay: elapsed.__setitem__(0, elapsed[0] + delay))
+    with pytest.raises(OperationError):
+        deployment._hy2_probe(config)
+    assert 3. <= elapsed[0] <= 3.1
+    assert len(verification_http_client) == 1
+    client = verification_http_client[0]
+    assert len(client.requests) > 1
+    assert client.terminated == client.waited == 1 and not client.worker.is_alive()
+
+
+def test_probe_rejection_fails_immediately_and_reaps_client(hy2_environment, verification_http_client, monkeypatch):
+    env = hy2_environment
+    config = create(env)
+    original_start = deployment.subprocess.Popen
+    def start(*args, **kwargs):
+        state = original_start(*args, **kwargs)
+        state.statuses = [403]
+        return state
+    monkeypatch.setattr(deployment.subprocess, 'Popen', start)
+    with pytest.raises(OperationError):
+        deployment._hy2_probe(config)
+    assert len(verification_http_client) == 1
+    client = verification_http_client[0]
+    assert len(client.requests) == 1
+    assert client.terminated == client.waited == 1 and not client.worker.is_alive()

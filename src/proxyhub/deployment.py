@@ -991,29 +991,37 @@ def _proxy_probe(config: dict, outbound: dict, fingerprint: str | None = None) -
         process = subprocess.Popen([str(BIN/'mihomo'),'-d',temp,'-f',str(path)],
                                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
-            for attempt in range(30):
+            deadline = time.monotonic()+3
+            connected = False
+            while time.monotonic()<deadline:
                 if process.poll() is not None:
                     raise OperationError('HY2 verification client could not start')
                 try:
-                    stream = socket.create_connection(('127.0.0.1',port),timeout=.2)
-                    break
-                except OSError:
-                    if attempt==29:
-                        raise OperationError('HY2 verification client is unavailable') from None
-                    time.sleep(.1)
-            with stream:
-                stream.settimeout(5)
-                target = config['server']['publisher_port']
-                stream.sendall(f'GET http://127.0.0.1:{target}/__hy2_health__ HTTP/1.1\r\nHost: 127.0.0.1:{target}\r\nConnection: close\r\n\r\n'.encode())
-                response = http.client.HTTPResponse(stream)
-                try:
-                    response.begin()
-                    if response.status!=404:
-                        raise OperationError('HY2 authenticated QUIC or selected certificate check failed')
-                finally:
-                    response.close()
-        except (OSError,http.client.HTTPException):
-            raise OperationError('HY2 authenticated QUIC or selected certificate check failed') from None
+                    stream = socket.create_connection(('127.0.0.1',port),timeout=min(.2,max(.001,deadline-time.monotonic())))
+                    connected = True
+                    with stream:
+                        stream.settimeout(max(.001,deadline-time.monotonic()))
+                        target = config['server']['publisher_port']
+                        stream.sendall(f'GET http://127.0.0.1:{target}/__hy2_health__ HTTP/1.1\r\nHost: 127.0.0.1:{target}\r\nConnection: close\r\n\r\n'.encode())
+                        response = http.client.HTTPResponse(stream)
+                        try:
+                            response.begin()
+                            if response.status==404:
+                                return
+                            if response.status!=502:
+                                raise OperationError('HY2 authenticated QUIC or selected certificate check failed')
+                        finally:
+                            response.close()
+                except (OSError,http.client.HTTPException):
+                    pass
+                # Mihomo listens before its tunnel enters Running. A listening
+                # port (and its temporary 502) is not authenticated readiness.
+                remaining = deadline-time.monotonic()
+                if remaining>0:
+                    time.sleep(min(.1,remaining))
+            if not connected:
+                raise OperationError('HY2 verification client is unavailable')
+            raise OperationError('HY2 authenticated QUIC or selected certificate check failed')
         finally:
             process.terminate()
             try:

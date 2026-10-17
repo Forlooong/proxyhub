@@ -8,11 +8,13 @@ from proxyhub import deployment, hy2, nodes
 from proxyhub.core import OperationError
 from test_node_activation import add as add_node, node_environment
 from test_hy2_activation import hy2_environment
-from test_multisite_activation import multisite
+from test_multisite_activation import multisite, CERTIFICATE
 from test_subscription_activation import environment, read_config
 
 
 SHARED = 'proxyhub-shared.service'
+REAL_WAIT_HY2_HEALTH = deployment._wait_hy2_health
+REAL_WAIT_NODES_HEALTH = deployment._wait_nodes_health
 
 
 class Interrupted(BaseException):
@@ -207,6 +209,129 @@ def test_restore_failure_keeps_journal_for_retry(node_environment, monkeypatch):
     monkeypatch.setattr(deployment, '_wait_nodes_health', original)
     assert deployment.recover(env.store)['status'] == 'recovered'
     assert env.pointer['current'] == previous and env.store.pending() == []
+    assert_original_services_untouched(env)
+
+
+@pytest.mark.parametrize('layout', ['legacy', 'shared'])
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_recovery_keeps_pending_until_real_bounded_wait_checks_every_member(node_environment, monkeypatch,
+                                                                         layout, interrupted):
+    env = node_environment
+    _, certificate_id = add_node(env, protocol='anytls', name='Certificate member', port=5445,
+                                 options={'sni': 'second.example.test', 'certificate_id': CERTIFICATE})
+    previous = migrate(env) if layout == 'shared' else env.pointer['current']
+    before = read_config(previous)
+    if layout == 'legacy':
+        prepared, candidate = prepare_runtime(env)
+    else:
+        changed = nodes.change(before, 'nodes.update', {'node_id': env.retained_id, 'port': 5543})
+        prepared = deployment.prepare(env.store, changed,
+                                      node_operation={'kind': 'update', 'node_id': env.retained_id})
+        candidate = env.root / 'revisions' / prepared['revision']
+    events, sleeps = [], []
+    unavailable = True
+    fingerprints = {previous / 'hy2.json': 'a' * 64, candidate / 'hy2.json': 'a' * 64,
+                    previous / 'nodes' / (certificate_id + '.json'): 'b' * 64,
+                    candidate / 'nodes' / (certificate_id + '.json'): 'b' * 64}
+    def observe(member, fingerprint):
+        assert env.store.pending(), 'No member check may acknowledge an unjournalled transition'
+        events.append((env.pointer['current'], member, 'pki' if fingerprint is None else 'pin'))
+    def hy2_probe(config, fingerprint=None):
+        observe('HY2', fingerprint)
+    def node_probe(config, outbound, fingerprint=None):
+        observe(outbound['name'], fingerprint)
+        if unavailable and outbound['name'] == 'Certificate member' and fingerprint is not None:
+            raise OperationError('Certificate member remains unavailable')
+    monkeypatch.setattr(deployment, '_wait_hy2_health', REAL_WAIT_HY2_HEALTH)
+    monkeypatch.setattr(deployment, '_wait_nodes_health', REAL_WAIT_NODES_HEALTH)
+    monkeypatch.setattr(deployment, '_hy2_probe', hy2_probe)
+    monkeypatch.setattr(deployment, '_proxy_probe', node_probe)
+    monkeypatch.setattr(deployment, '_runtime_fingerprint', fingerprints.__getitem__)
+    monkeypatch.setattr(deployment, '_generated_client', lambda config: {'proxies': [
+        {'name': node['name']} for node in config['nodes'] if node['enabled']]})
+    monkeypatch.setattr(deployment.time, 'sleep', sleeps.append)
+    revision = env.store.revision
+    original_run = deployment.run
+    if interrupted:
+        def stopped(command, **kwargs):
+            result = original_run(command, **kwargs)
+            if tuple(command[:2]) in {('systemctl', 'start'), ('systemctl', 'restart')} and SHARED in command:
+                raise Interrupted()
+            return result
+        monkeypatch.setattr(deployment, 'run', stopped)
+        with pytest.raises(Interrupted):
+            deployment.apply(env.store, prepared['plan_id'])
+        monkeypatch.setattr(deployment, 'run', original_run)
+    else:
+        with pytest.raises(OperationError, match='Protocol node authentication'):
+            deployment.apply(env.store, prepared['plan_id'])
+    assert env.store.pending() and env.store.revision == revision
+    events.clear()
+    sleeps.clear()
+    with pytest.raises(OperationError, match='Protocol node authentication'):
+        deployment.recover(env.store)
+    expected = [('HY2', 'pki'), ('HY2', 'pin'), ('Retained SS', 'pki')] + [
+        ('Certificate member', stage) for _ in range(3) for stage in ('pki', 'pin')]
+    assert events == [(previous, member, stage) for member, stage in expected]
+    assert sleeps == [.2, .2]
+    assert env.store.pending() and env.store.revision == revision
+    unavailable = False
+    events.clear()
+    sleeps.clear()
+    assert deployment.recover(env.store)['status'] == 'recovered'
+    assert events == [(previous, member, stage) for member, stage in expected[:5]]
+    assert sleeps == [] and env.pointer['current'] == previous
+    assert read_config(previous) == before and env.store.revision == revision
+    assert env.store.pending() == [] and env.store.inspect(prepared['plan_id'])['status'] == 'failed'
+    assert_original_services_untouched(env)
+    env.calls.clear()
+    events.clear()
+    assert deployment.recover(env.store)['status'] == 'nothing_to_recover'
+    assert env.calls == [] and events == []
+
+
+@pytest.mark.parametrize('layout', ['legacy', 'shared'])
+def test_transient_member_failure_completes_only_after_all_members_authenticate(node_environment, monkeypatch, layout):
+    env = node_environment
+    _, certificate_id = add_node(env, protocol='anytls', name='Certificate member', port=5445,
+                                 options={'sni': 'second.example.test', 'certificate_id': CERTIFICATE})
+    previous = migrate(env) if layout == 'shared' else env.pointer['current']
+    before = read_config(previous)
+    if layout == 'legacy':
+        prepared, candidate = prepare_runtime(env)
+    else:
+        changed = nodes.change(before, 'nodes.update', {'node_id': env.retained_id, 'port': 5543})
+        prepared = deployment.prepare(env.store, changed,
+                                      node_operation={'kind': 'update', 'node_id': env.retained_id})
+        candidate = env.root / 'revisions' / prepared['revision']
+    events, sleeps = [], []
+    attempt = 0
+    def observe(member, fingerprint):
+        assert env.store.pending()
+        events.append((member, 'pki' if fingerprint is None else 'pin'))
+    def hy2_probe(config, fingerprint=None):
+        observe('HY2', fingerprint)
+    def node_probe(config, outbound, fingerprint=None):
+        nonlocal attempt
+        observe(outbound['name'], fingerprint)
+        if outbound['name'] == 'Certificate member':
+            if fingerprint is None:
+                attempt += 1
+            elif attempt < 3:
+                raise OperationError('Certificate member transient fixture failure')
+    monkeypatch.setattr(deployment, '_wait_hy2_health', REAL_WAIT_HY2_HEALTH)
+    monkeypatch.setattr(deployment, '_wait_nodes_health', REAL_WAIT_NODES_HEALTH)
+    monkeypatch.setattr(deployment, '_hy2_probe', hy2_probe)
+    monkeypatch.setattr(deployment, '_proxy_probe', node_probe)
+    monkeypatch.setattr(deployment, '_runtime_fingerprint', lambda path: 'c' * 64)
+    monkeypatch.setattr(deployment, '_generated_client', lambda config: {'proxies': [
+        {'name': node['name']} for node in config['nodes'] if node['enabled']]})
+    monkeypatch.setattr(deployment.time, 'sleep', sleeps.append)
+    assert deployment.apply(env.store, prepared['plan_id'])['status'] == 'applied'
+    assert events == [('HY2', 'pki'), ('HY2', 'pin'), ('Retained SS', 'pki')] + [
+        ('Certificate member', stage) for _ in range(3) for stage in ('pki', 'pin')]
+    assert sleeps == [.2, .2] and env.pointer['current'] == candidate
+    assert env.store.pending() == [] and env.store.inspect(prepared['plan_id'])['status'] == 'applied'
     assert_original_services_untouched(env)
 
 
