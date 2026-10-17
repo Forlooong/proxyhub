@@ -156,7 +156,9 @@ class DeploymentRenderingTests(unittest.TestCase):
 
     def test_publisher_and_http_boundary(self):
         nginx = render_nginx(deployment_spec(public_port=10443), REVISION)
-        self.assertIn("proxy_set_header Host sub.example.test;", nginx)
+        self.assertIn("proxy_set_header Host $host;", nginx)
+        self.assertIn('location ~ "^/(?:[A-Za-z0-9_-]+/)+[A-Za-z0-9_-]{32,128}/"', nginx)
+        self.assertEqual(nginx.count('location = /__proxyhub_publication__ { return 404; }'), 2)
         self.assertIn("proxy_pass http://127.0.0.1:18890;", nginx)
         self.assertIn("limit_req zone=proxyhub_subscription", nginx)
         self.assertIn("client_max_body_size 1k;", nginx)

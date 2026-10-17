@@ -33,6 +33,13 @@ export type ProtocolNode = {
   id: string; listener_id: string; protocol: 'vless' | 'ss' | 'trojan' | 'tuic' | 'anytls' | 'vmess' | 'socks5';
   enabled: boolean; name: string; port: number; options: JsonObject; runtime_group?: string; runtime_status?: string;
 };
+export type SubscriptionProfile = {
+  id: string; name: string; host: string; path_prefix: string; enabled: boolean;
+  node_ids: string[] | null; formats: ('yaml' | 'raw')[]; overrides: JsonObject;
+  userinfo: Record<string, number>; update_interval_hours: number; reset_day: number | null; reset_at: number | null;
+  aliases: {id: string; host: string; path_prefix: string; access_status: 'active' | 'blocked' | 'unknown'}[];
+  access_status: 'active' | 'blocked' | 'unknown';
+};
 export type Overview = {
   revision: number;
   server: {hostname: string; os: string; architecture: string; memory_total_bytes: number | null; accounts: string[]; ssh_context: SSHContext};
@@ -45,6 +52,7 @@ export type Overview = {
   hy2: {node: Hy2Node | null};
   nodes: {nodes: ProtocolNode[]};
   subscription: {id: string; name: string; domain: string; update_interval_hours: number; userinfo: Record<string, number>; reset_day: number | null; reset_at: number | null; overrides: JsonObject; traffic_source: string};
+  subscriptions: {profiles: SubscriptionProfile[]; nodes: {id: string; name: string; protocol: string; enabled: boolean}[]};
   services: {name: string; status: string}[];
   capabilities: {name: string; available: boolean; reason: string}[];
   recent_jobs: Job[];

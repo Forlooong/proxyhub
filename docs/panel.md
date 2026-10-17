@@ -1,6 +1,6 @@
 # 管理面板
 
-`0.7.1a1` 增加固定共享运行组：两个 REALITY 进程继续独立，HY2 与七类额外节点共享一个进程，资源身份、监听端口、凭据及依赖不变。`0.7.0a1` 的阶段 2 功能验收继续作为历史记录；本轮已部署至专用 VPS 并完成执行自测，等待独立审计，不能表述为审计已放行。实测、失败记录与剩余边界见[共享组执行交付](phase2-protocols-acceptance.md#2026-10-16-固定共享运行组执行交付)。界面保留浅/深色、自托管字体、资源关系图、变更抽屉和移动布局；设计取舍见[面板设计记录](../packages/panel/DESIGN.md)。
+本页补充阶段 3a 的多订阅与链接生命周期。沿用 `0.7.1a1` 引入的固定共享运行组：两个 REALITY 进程继续独立，HY2 与七类额外节点共享一个进程，资源身份、监听端口、凭据及依赖不变。`0.7.0a1` 的阶段 2 功能验收继续作为历史记录；各轮实测、失败、独立审计与剩余边界见[验收记录](phase2-protocols-acceptance.md)，本手册不代表本轮已获独立审计放行。界面保留浅/深色、自托管字体、资源关系图、变更抽屉和移动布局；设计取舍见[面板设计记录](../packages/panel/DESIGN.md)。
 
 ## 安装与访问
 
@@ -68,7 +68,7 @@ proxyhub deployment recover
 
 共享组内一个启用入站的端口、传输或证书材料变化，以及启停导致组配置变化，都会切换共享组；HY2 与全部已启用额外节点的现有连接均需重连，即使其中某个成员本身未修改。组级预览列出影响成员。名称、订阅元数据及停用资源的操作若未改变共享运行配置，则不重启该组；最后一个启用成员停用后停止组，资源身份、凭据与依赖仍保留。总览列出真实运行单元，资源停用状态独立于共享服务状态。SOCKS5 关闭 UDP 的服务端拒绝规则带对应 `inbound` 条件，不扩散到共享组其他入站；客户端默认 `MATCH,REJECT` 边界仍按下文执行。
 
-本次资源调整已部署并完成执行自测，停在交付点等待独立审计，不自行进入阶段 3a。当前负载工作预算为 RSS ≤325 MiB，原 RSS <350 MiB、峰值 <650 MiB、无 OOM 指标不变；迁移后实测与采样口径见[执行记录及 JSON 证据](phase2-protocols-acceptance.md#2026-10-16-固定共享运行组执行交付)。约 311.2 MiB 的前置评估仍属于隔离估算，首次迁移全过程峰值、首轮故障恢复未完成的根因、本轮个人电脑外网复验、真实浏览器/指定 GUI 及正式 1 核 1GB、5 订阅/500 节点 PERF-1 均未验证。
+`0.7.1a1` 资源调整交付时的执行自测、隔离估算和当时未验证项保留在[执行记录及 JSON 证据](phase2-protocols-acceptance.md#2026-10-16-固定共享运行组执行交付)，不以阶段 3a 追认历史失败或未知原因。后续补验、审计和目标机器限制以该验收记录及[总方案 10.2](superpowers/specs/2026-10-14-proxyhub-design.md#102-阶段-2-结果与阶段-3-执行顺序)为准；正式 1 核 1GB、5 订阅/500 节点 PERF-1 与指定 GUI 不能由历史 CLI 结果替代。
 
 ## 本阶段操作
 
@@ -78,12 +78,47 @@ proxyhub deployment recover
 | 服务器 | 选择账号和连接上下文、读取生效授权路径、预览并追加公钥 | 不关闭密码登录；第二个 SSH 会话需独立验证；sshd 转发策略不代表每把公钥都允许隧道 |
 | 网站与证书 | 创建、选择、启用、停用和删除网站，绑定/解绑域名，更换证书绑定；逐站上传 ZIP、隔离预览和恢复内容；申请、导入、替换、续期和删除证书，查看消费者 | 所有存续 REALITY 入口、HY2 与独立节点（包括停用资源）的直接或间接证书依赖均参与保护；默认网站按旧配置兼容保留；已有内部监听不变；上传内容时禁用模板标题编辑；证书异常仍可进入修复流程 |
 | 代理服务 | 修改 REALITY 名称与连接地址，迁移 SNI、切回或退役保留入口；创建、更新、启用或停用 HY2；创建、更新、启停和删除七种协议的独立节点，选择证书或 REALITY 目标 | 独立节点最多 32 个，须先停用再删除；协议与凭据不可修改；[传输与 H2 UDP 边界](phase2-protocols-acceptance.md)以验收记录为准；外部 REALITY 目标仅 HTTPS 443，主入口或最后一个入口不能退役；HY2 仅一个独立 IPv4 UDP 资源，不支持删除或高级参数 |
-| 订阅 | 修改名称、刷新间隔、手工额度、到期、重置记录和 JSON 配置覆盖；显式查看/复制链接及最终 YAML | 覆盖层经过唯一生成器校验；重置记录不会自动计量或触发归零；没有多订阅归属计费 |
+| 订阅 | 创建、选择、更新、复制和启停订阅；选择已有节点、域名、路径和格式；独立管理元数据与覆盖；保留/退役别名、轮换下载令牌；显式查看/复制链接、二维码及最终 YAML | 共用唯一生成器与发布链；订阅令牌不等于节点凭据；退役路径不可由旧配置复活；手工记录不自动计量或重置；Clash Verge Rev 2.5.8 导入入口仍待 GUI 验收 |
 | 任务 | 查看排队、执行、成功、失败、中断记录；恢复未完成部署 | 中断任务不会自动重放输入；只保留最近 200 条完成记录，列表展示最近 30 条 |
 
-订阅元数据与正文共同发布，发布器确认加载新版本后才提交状态。只改订阅时不重启网站和代理，也不依赖外部握手目标当前可达；网站、节点和证书变更会在预览中说明服务重载影响。配置版本变化后旧预览不可应用，需要刷新并重新生成。
+订阅元数据与正文共同发布，发布器确认全部有效 profile 的新版本后才提交状态。正常订阅操作只 reload 发布器，不重启网站和代理，也不依赖外部握手目标当前可达；网站、节点和证书变更会在预览中说明服务重载影响。配置版本变化后旧预览不可应用，需要刷新并重新生成。
 
 覆盖层使用受控 JSON 对象编辑，最终 YAML 由生成器产生。`Subscription-Userinfo` 中的到期时间、`Profile-Update-Interval` 和独立 `reset_day/reset_at` 不混用；`reset_at` 持久化为 Unix 秒，表单按浏览器本地时区输入。不同 Clash GUI 的显示兼容性需分别验收。
+
+## 多订阅与链接生命周期
+
+“当前订阅”选择本次操作对象。每份订阅有稳定 ID，独立保存名称、已有受管 HTTPS 域名、固定路径前缀、下载令牌、启停、YAML/raw 格式、节点引用、配置覆盖及手工元数据。原订阅编号为 `default`，原链接、令牌、配置位置和默认包含全部启用节点的行为继续保留；只有显式对应操作才改变它们。新订阅选择已有节点；同一节点被多份订阅引用不会复制节点身份、核心、监听或凭据。停用订阅保留其设置，停止新下载，不停用节点。复制生成新订阅 ID 与令牌，沿用选定节点及设置，不复制旧别名。
+
+名称、刷新建议、流量、到期、重置记录和覆盖均按所选订阅编辑。域名只可选择已有受管 HTTPS 域名；路径前缀使用 `/sub`、`/family` 这类固定路径，不包含令牌。修改域名或路径时自动保留旧主路径为别名；旧、新路径返回同一份订阅内容，直至显式退役旧别名。一次发布仍使用现有不可变 bundle、唯一生成器、事务与恢复链路，各 profile 的正文和元数据共同确认，不另建发布服务。管理器或网关停止时，独立发布器继续提供最后有效快照。
+
+**别名退役是域名与路径前缀范围内的永久撤销。** 撤销记录独立于普通配置和 revision，影响该精确 `host/path_prefix` 下的所有令牌；恢复旧配置、复制订阅或生成新令牌均不能复活该路径。需要重新提供下载时使用有效的新路径。令牌轮换则跨该令牌的全部主路径和别名拒绝旧令牌的新请求；恢复旧配置也不会复活它。令牌只控制订阅下载，已下载配置中的节点凭据仍可连接，节点凭据轮换需另行实施，不能把订阅令牌轮换写成节点身份撤销。
+
+发布器读取独立安全记录；状态缺失或无效时界面显示“未确认”，不显示链接、二维码或 YAML。撤销策略无法持久化或运行时未确认时，事务保持 pending；为确保旧凭据不会继续下载，可能短暂停止整个订阅发布器，此时其他订阅下载也暂不可用，代理与网站保持运行。先排查失败，再执行 `proxyhub deployment recover`；恢复补齐撤销策略，并取得全部有效 profile 的健康确认后才恢复发布与结束事务。重复恢复无额外动作，不用一次下载成功代替全 profile 确认。
+
+“客户端访问”只在显式显示后返回含凭据链接或 YAML；可复制主路径及仍有效别名的链接，并展开本地生成的二维码，二维码不调用外部服务。离开所选订阅或隐藏凭据会清除页面敏感内容。Clash Verge Rev 2.5.8 的导入 URI 已按[固定版本官方解析器](https://github.com/clash-verge-rev/clash-verge-rev/blob/4337bd85758d54d7b9044b2da3c9ac1176eae1f3/src-tauri/src/utils/resolve/scheme.rs#L42-L80)构造，`name` 在前、`url` 最后；按钮明确标记“待 GUI 验收”。源码核对、二维码和 CLI 成功均不能替代指定 GUI 的实际导入、名称、流量、到期、受支持刷新显示及实际核心版本检查。未完成时 SUB-1 保持未验证，3a 不能据此自称完整通过。
+
+CLI 与面板共用类型化计划，需 Linux root。`list` 不返回凭据；原 `proxyhub sub urls` 继续操作 `default`，原 `--output` 写入私有文件方式保持。其余生命周期命令只返回计划，检查后分别执行 `proxyhub apply <PLAN_ID>`，不要把示例连续执行当作一笔事务：
+
+```sh
+proxyhub sub list
+proxyhub sub urls
+proxyhub sub urls --subscription-id <SUBSCRIPTION_ID> --output /root/sub-links.json
+proxyhub sub yaml --subscription-id <SUBSCRIPTION_ID> --output /root/sub.yaml
+
+proxyhub sub create --name "家用订阅" --node-id local-reality --node-id local-hy2 --format yaml --format raw
+proxyhub sub update --subscription-id <SUBSCRIPTION_ID> --name "新名称" --host sub.example.test --path-prefix /family
+proxyhub sub update --subscription-id <SUBSCRIPTION_ID> --values-file /root/sub-settings.json
+proxyhub sub copy --subscription-id <SUBSCRIPTION_ID> --name "独立副本"
+proxyhub sub disable --subscription-id <SUBSCRIPTION_ID>
+proxyhub sub enable --subscription-id <SUBSCRIPTION_ID>
+proxyhub sub alias add --subscription-id <SUBSCRIPTION_ID> --host sub.example.test --path-prefix /retained
+proxyhub sub alias retire --subscription-id <SUBSCRIPTION_ID> --alias-id <ALIAS_ID>
+proxyhub sub token rotate --subscription-id <SUBSCRIPTION_ID>
+# 每条变更分别检查返回的计划，再显式应用。
+proxyhub apply <PLAN_ID>
+```
+
+节点和订阅/别名编号从列表读取，示例域名须替换为已有受管 HTTPS 域名。`--node-id` 和 `--format` 可重复；更新时仅修改明确给出的字段。`--values-file` 接收不超过 32 KiB 的 UTF-8 JSON 对象，可提供 `userinfo`、`update_interval_hours`、`reset_day`、`reset_at`、`overrides` 等可编辑设置；同条命令的具名选项优先，未知或重复字段拒绝。文件路径不传给管理操作。流量为手工字节数，到期仅用于客户端显示，重置字段只是记录；本阶段没有外部订阅源、规则流水线、自动计量、重置或计费模块。原始 URI 的传输兼容边界与 H2 UDP 限制继续按下文及验收记录执行。
 
 ## 多站点与证书依赖
 

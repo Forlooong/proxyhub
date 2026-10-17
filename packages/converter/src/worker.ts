@@ -237,7 +237,7 @@ function extraNode(value: unknown): { id: string; proxy: RecordValue; uri: strin
 
 function compose(input: unknown): { yaml: string; raw: string; uri: string; uris: string[]; proxies: RecordValue[] } {
   const source = record(input);
-  keys(source, ["node", "hy2", "nodes", "overrides"], ["node"]);
+  keys(source, ["node", "hy2", "nodes", "overrides", "node_ids"], ["node"]);
   const node = record(source.node);
   keys(node, ["id", "name", "server", "port", "uuid", "server_name", "public_key", "short_id"]);
   const id = string(node.id, 64);
@@ -295,6 +295,15 @@ function compose(input: unknown): { yaml: string; raw: string; uri: string; uris
     ids.add(extra.id);
     names.add(extra.proxy.name as string);
   }
+  let selected: Set<string> | undefined;
+  if (Object.hasOwn(source, "node_ids")) {
+    if (!Array.isArray(source.node_ids) || source.node_ids.length === 0 || source.node_ids.length > ids.size ||
+        source.node_ids.some((value: unknown) => typeof value !== "string" || !ids.has(value))) {
+      throw new InputError("Invalid selected node references");
+    }
+    selected = new Set(source.node_ids as string[]);
+    if (selected.size !== source.node_ids.length) throw new InputError("Duplicate selected node");
+  }
   const overrides = source.overrides === undefined ? {} : record(source.overrides);
   keys(overrides, ["mixed-port", "log-level", "mode", "ipv6", "allow-lan"], []);
   const mixedPort = overrides["mixed-port"] === undefined ? 17890 : integer(overrides["mixed-port"], 1, 65535);
@@ -350,6 +359,15 @@ function compose(input: unknown): { yaml: string; raw: string; uri: string; uris
     uris.push(`hysteria2://${encodeURIComponent(hy2.password as string)}@${hy2Authority}:${hy2.port}/?sni=${encodeURIComponent(hy2.sni as string)}#${encodeURIComponent(hy2.name as string)}`);
   }
   uris.push(...extras.map((extra) => extra.uri));
+  if (selected !== undefined) {
+    const orderedIds = [id, ...(hy2 === undefined ? [] : ["local-hy2"]), ...extras.map((extra) => extra.id)];
+    config.proxies = config.proxies.filter((_, index) => selected.has(orderedIds[index] as string));
+    config["proxy-groups"][0]!.proxies = config.proxies.map((proxy) => proxy.name as string);
+    config.rules = ["MATCH,PROXY", ...(config.proxies.some((proxy) => proxy.udp === false) ? ["MATCH,REJECT"] : [])];
+    const selectedUris = uris.filter((_, index) => selected.has(orderedIds[index] as string));
+    return { yaml: stringify(config), raw: Buffer.from(`${selectedUris.join("\n")}\n`, "utf8").toString("base64"),
+      uri: selectedUris[0] as string, uris: selectedUris, proxies: config.proxies };
+  }
   return { yaml: stringify(config), raw: Buffer.from(`${uris.join("\n")}\n`, "utf8").toString("base64"), uri, uris, proxies: config.proxies };
 }
 

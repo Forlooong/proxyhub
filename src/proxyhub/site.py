@@ -123,6 +123,33 @@ def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = 
         *(domain for certificate in resources['certificates'] for domain in certificate['domains']),
     ]))
     https_suffix = "" if value["public_port"] == 443 else f":{value['public_port']}"
+    def publication_location(selector):
+        return f"""        {selector} {{
+            access_log off;
+            error_log /dev/null crit;
+            limit_except GET {{ deny all; }}
+            limit_req zone=proxyhub_subscription burst=20 nodelay;
+            limit_req_status 429;
+            proxy_pass http://127.0.0.1:{value['publisher_port']};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For "";
+            proxy_set_header X-Real-IP "";
+            proxy_set_header Connection "";
+            proxy_set_header Content-Length "";
+            proxy_pass_request_body off;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_max_temp_file_size 0;
+            proxy_connect_timeout 3s;
+            proxy_read_timeout 10s;
+            proxy_send_timeout 10s;
+        }}"""
+    # Route only credential-shaped paths on existing managed website TLS
+    # listeners. No additional listener, certificate or proxy process is made.
+    website_publication = publication_location(
+        'location ~ "^/(?:[A-Za-z0-9_-]+/)+[A-Za-z0-9_-]{32,128}/"')
     redirects = []
     for domain in challenge_domains:
         response = (f'return 308 https://{domain}{https_suffix}$request_uri;'
@@ -164,6 +191,8 @@ def render_nginx(spec: Mapping[str, Any], revision_dir: str, web: dict | None = 
         add_header X-Content-Type-Options nosniff always;
         add_header Referrer-Policy no-referrer always;
         add_header Content-Security-Policy "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" always;
+        location = /__proxyhub_publication__ {{ return 404; }}
+{website_publication}
         location / {{
             limit_except GET {{ deny all; }}
             try_files $uri $uri/ =404;
@@ -247,26 +276,8 @@ http {{
         ssl_certificate_key {subscription_certificate['key_path']};
         access_log off;
         error_log /dev/null crit;
-        location / {{
-            limit_except GET {{ deny all; }}
-            limit_req zone=proxyhub_subscription burst=20 nodelay;
-            limit_req_status 429;
-            proxy_pass http://127.0.0.1:{value['publisher_port']};
-            proxy_http_version 1.1;
-            proxy_set_header Host {subscription};
-            proxy_set_header X-Forwarded-Proto https;
-            proxy_set_header X-Forwarded-For "";
-            proxy_set_header X-Real-IP "";
-            proxy_set_header Connection "";
-            proxy_set_header Content-Length "";
-            proxy_pass_request_body off;
-            proxy_request_buffering off;
-            proxy_buffering off;
-            proxy_max_temp_file_size 0;
-            proxy_connect_timeout 3s;
-            proxy_read_timeout 10s;
-            proxy_send_timeout 10s;
-        }}
+        location = /__proxyhub_publication__ {{ return 404; }}
+{publication_location('location /')}
     }}
 }}
 """

@@ -88,7 +88,27 @@ def web_resources(config):
     return {'websites':sites,'certificates':certificates}
 
 
+def subscription_resources(config, root):
+    from . import subscriptions
+    from .publication import load_security, route_allowed
+    result = subscriptions.public_resources(config)
+    try:
+        security = load_security(Path(root)/'publish/security.json')
+    except (OSError, ValueError):
+        security = None
+    private = {profile['id']:profile for profile in subscriptions.normalize(config)}
+    for profile in result['profiles']:
+        token = private[profile['id']]['token']
+        profile['access_status'] = ('unknown' if security is None else 'active'
+            if route_allowed(security,profile['host'],profile['path_prefix'],token) else 'blocked')
+        for alias in profile['aliases']:
+            alias['access_status'] = ('unknown' if security is None else 'active'
+                if route_allowed(security,alias['host'],alias['path_prefix'],token) else 'blocked')
+    return result
+
+
 def overview(config, revision, jobs, root, directory=None):
+    from . import subscriptions
     from .reality import public_resources
     from .hy2 import public_resources as hy2_resources
     from .nodes import public_resources as node_resources
@@ -96,7 +116,7 @@ def overview(config, revision, jobs, root, directory=None):
     hy2 = hy2_resources(config)
     nodes = node_resources(config)
     endpoint = next(entry for entry in reality['endpoints'] if entry['primary'])
-    server, sub = config['server'], config['subscription']
+    server, sub = config['server'], subscriptions.get_profile(config)
     resources = web_resources(config)
     primary = get_site(normalize_web(config),'default')
     binding = next(item for item in resources['certificates'] if item['id']==primary['certificate_id'])
@@ -168,12 +188,13 @@ def overview(config, revision, jobs, root, directory=None):
             'reality':reality,
             'hy2':hy2,
             'nodes':nodes,
-            'subscription':{'id':sub['id'],'name':sub['name'],'domain':server['subscription_domain'],
+            'subscription':{'id':sub['id'],'name':sub['name'],'domain':sub['host'],
                             'update_interval_hours':sub['update_interval_hours'],'userinfo':sub['userinfo'],
                             'reset_day':sub.get('reset_day'),'reset_at':sub.get('reset_at'),
                             'overrides':config['overrides'],'traffic_source':'manual'},
+            'subscriptions':subscription_resources(config,root),
             'services':status,'capabilities':[
-                {'name':'多网站 / 证书依赖 / REALITY / 单订阅','available':True,'reason':'网站与证书绑定独立管理，现有 REALITY 目标保留'},
+                {'name':'多网站 / 证书依赖 / REALITY / 多订阅','available':True,'reason':'订阅独立引用已有节点，网站与证书绑定独立管理，现有 REALITY 目标保留'},
                 {'name':'自动流量计量与重置','available':False,'reason':'当前仅手工元数据，重置字段只作记录'},
                 {'name':'网站 ZIP 上传、隔离预览、内容恢复','available':True,'reason':'按所选网站复用部署计划与回滚'},
                 {'name':'REALITY 本机/外部目标与 SNI 迁移','available':True,'reason':'独立新旧入口、目标预检与显式退役'},

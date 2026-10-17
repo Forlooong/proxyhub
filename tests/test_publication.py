@@ -10,6 +10,8 @@ import pytest
 
 from proxyhub import publication
 from proxyhub.publication import PublicationError, build_bundle, save_bundle, validate_bundle
+from proxyhub.publication import (advance_security, alias_digest, iter_routes,
+                                  load_security, route_allowed, save_security, token_digest)
 from proxyhub.publisher import PublisherHandler, PublisherServer, load_snapshot
 
 
@@ -266,3 +268,176 @@ def test_duplicate_json_fields_rejected(profile, tmp_path):
     path.write_text(text.replace('"version": 1', '"version": 1, "version": 1'), encoding="utf-8")
     with pytest.raises(PublicationError):
         load_snapshot(path)
+
+
+def test_profiles_aliases_formats_and_disabled_routes_have_exact_get_head(profile, live_server):
+    server, path = live_server
+    profile.update(path_prefix="/team/first", formats=["yaml"], aliases=[{
+        "id": "alternate", "host": "alias.example.test", "path_prefix": "/other"}])
+    other = {**profile, "id": "second", "token": "b" * 43, "name": "Second",
+             "path_prefix": "/different", "formats": ["raw"], "aliases": [],
+             "userinfo": {"expire": 2100000000}, "update_interval_hours": 7}
+    disabled = {**other, "id": "disabled", "token": "c" * 43, "enabled": False}
+    bundle = build_bundle([profile, other, disabled], "multiple")
+    assert validate_bundle(bundle) == bundle
+    assert [item["id"] for item in bundle["profiles"]] == ["primary", "second"]
+    save_bundle(path, bundle)
+    assert server.reload_bundle()
+    for item in bundle["profiles"]:
+        for route in iter_routes(item):
+            status, headers, body = request(server, route["path"], host=route["host"])
+            head_status, head_headers, head_body = request(server, route["path"], "HEAD", route["host"])
+            assert status == head_status == 200 and head_headers == headers
+            assert body == route["body"].encode() and head_body == b""
+            assert all(headers[key] == value for key, value in route["headers"].items())
+    assert request(server, f"/team/first/{profile['token']}/raw")[0] == 404
+    assert request(server, f"/different/{disabled['token']}/raw")[0] == 404
+
+
+@pytest.mark.parametrize("change", [
+    {"path_prefix": "/sub/../other"}, {"path_prefix": "/sub%2Fother"},
+    {"formats": []}, {"formats": ["yaml", "yaml"]}, {"formats": ["unknown"]},
+    {"formats": ["yaml"], "yaml": None}, {"enabled": 1},
+    {"aliases": [{"host": "sub.example.test", "path_prefix": "/sub"}]},
+])
+def test_new_profile_route_contract_rejects_ambiguous_input(profile, change):
+    with pytest.raises(PublicationError):
+        build_bundle([{**profile, **change}], "invalid")
+
+
+def test_tampered_alias_response_is_rejected(profile):
+    profile["aliases"] = [{"host": "alias.example.test", "path_prefix": "/alias"}]
+    bundle = build_bundle([profile], "aliases")
+    bundle["profiles"][0]["responses"]["alias-0-yaml"]["host"] = "different.example.test"
+    with pytest.raises(PublicationError):
+        validate_bundle(bundle)
+
+
+def security_file(server, path):
+    security_path = path.with_name("security.json")
+    initial = {"schema_version": 1, "generation": 0, "revoked_tokens": [], "retired_aliases": []}
+    save_security(security_path, initial)
+    server.security_path = security_path
+    return security_path, initial
+
+
+def test_revoke_all_aliases_survives_failed_reload_old_bundle_and_restart(profile, live_server):
+    server, path = live_server
+    profile["aliases"] = [{"host": "alias.example.test", "path_prefix": "/alias"}]
+    old_bundle = build_bundle([profile], "old-config")
+    save_bundle(path, old_bundle)
+    assert server.reload_bundle()
+    security_path, _ = security_file(server, path)
+    routes = list(iter_routes(old_bundle["profiles"][0]))
+    assert all(request(server, route["path"], host=route["host"])[0] == 200 for route in routes)
+    updated = advance_security(security_path, tokens=[profile["token"]])
+    assert updated["generation"] == 1 and updated["revoked_tokens"] == [token_digest(profile["token"])]
+    assert advance_security(security_path, tokens=[profile["token"]]) == updated
+    path.write_text("invalid bundle", encoding="utf-8")
+    assert not server.reload_bundle()
+    for route in routes:
+        for method in ("GET", "HEAD"):
+            status, headers, body = request(server, route["path"], method, route["host"])
+            assert status == 404 and body == b"" and headers["X-ProxyHub-Security-Generation"] == "1"
+    save_bundle(path, old_bundle)
+    assert server.reload_bundle()
+    restarted = PublisherServer(("127.0.0.1", 0), path, security_path)
+    thread = threading.Thread(target=restarted.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    thread.start()
+    try:
+        assert all(request(restarted, route["path"], host=route["host"])[0] == 404 for route in routes)
+    finally:
+        restarted.shutdown()
+        restarted.server_close()
+        thread.join(timeout=5)
+
+
+def test_retired_alias_only_closes_its_route_even_after_old_bundle_restore(profile, live_server):
+    server, path = live_server
+    alias = {"id": "alternate", "host": "alias.example.test", "path_prefix": "/alias"}
+    profile["aliases"] = [alias]
+    old = build_bundle([profile], "old")
+    save_bundle(path, old)
+    assert server.reload_bundle()
+    security_path, _ = security_file(server, path)
+    updated = advance_security(security_path, aliases=[alias])
+    assert updated["retired_aliases"] == [alias_digest(alias["host"], alias["path_prefix"])]
+    assert route_allowed(updated, profile["host"], "/sub", profile["token"])
+    assert not route_allowed(updated, alias["host"], alias["path_prefix"], profile["token"])
+    for route in iter_routes(old["profiles"][0]):
+        expected = 200 if route["host"] == profile["host"] else 404
+        assert request(server, route["path"], host=route["host"])[0] == expected
+    save_bundle(path, old)
+    assert server.reload_bundle()
+    assert request(server, f"/alias/{profile['token']}/raw", host=alias["host"])[0] == 404
+
+
+@pytest.mark.parametrize("failure", ["missing", "invalid", "generation", "removed-token", "same-generation"])
+def test_security_failures_close_routes_without_using_last_in_memory_policy(profile, live_server, failure):
+    server, path = live_server
+    security_path, initial = security_file(server, path)
+    advance_security(security_path, tokens=["b" * 43])
+    route = f"/sub/{profile['token']}/raw"
+    assert request(server, route)[0] == 200
+    if failure == "missing":
+        security_path.unlink()
+    elif failure == "invalid":
+        security_path.write_text("{invalid secret}", encoding="utf-8")
+    else:
+        invalid = load_security(security_path)
+        if failure == "generation":
+            invalid["generation"] = 0
+        elif failure == "removed-token":
+            invalid.update(generation=2, revoked_tokens=[])
+        else:
+            invalid["revoked_tokens"].append(token_digest("c" * 43))
+        security_path.write_text(json.dumps(invalid), encoding="utf-8")
+    assert request(server, route)[0] == 503
+    assert request(server, "/__proxyhub_publication__", "HEAD", "proxyhub.internal")[0] == 503
+
+
+def test_status_ack_works_with_empty_bundle_and_missing_security_starts_closed(live_server):
+    server, path = live_server
+    server.security_path = path.with_name("missing-security.json")
+    assert request(server, "/__proxyhub_publication__", "HEAD", "proxyhub.internal")[0] == 503
+    security_path, _ = security_file(server, path)
+    save_bundle(path, build_bundle([], "empty"))
+    assert server.reload_bundle()
+    for method in ("GET", "HEAD"):
+        status, headers, body = request(server, "/__proxyhub_publication__", method, "proxyhub.internal")
+        assert status == 200 and body == b""
+        assert headers["X-ProxyHub-Generation"] == "empty"
+        assert headers["X-ProxyHub-Security-Generation"] == "0"
+    assert request(server, "/__proxyhub_publication__")[0] == 404
+
+
+def test_security_ledger_rejects_backward_save_and_preserves_old_file_on_failure(live_server, monkeypatch):
+    server, path = live_server
+    security_path, initial = security_file(server, path)
+    current = advance_security(security_path, tokens=["b" * 43])
+    previous_bytes = security_path.read_bytes()
+    with pytest.raises(PublicationError):
+        save_security(security_path, initial)
+    def fail_replace(*args):
+        raise OSError("test replacement failure")
+    monkeypatch.setattr(publication.os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        advance_security(security_path, aliases=[{"host": "other.example.test", "path_prefix": "/alias"}])
+    assert load_security(security_path) == current and security_path.read_bytes() == previous_bytes
+    assert not list(path.parent.glob(".proxyhub-security-*"))
+
+
+def test_security_replacement_sets_existing_owner_before_atomic_publish(live_server, monkeypatch):
+    server, path = live_server
+    security_path, _ = security_file(server, path)
+    owner = security_path.stat()
+    ownership = []
+    replacement = publication.os.replace
+    def fchown(fd, uid, gid):
+        ownership.append((uid, gid))
+    def replace(source, destination):
+        assert ownership == [(owner.st_uid, owner.st_gid)]
+        return replacement(source, destination)
+    monkeypatch.setattr(publication.os, "fchown", fchown, raising=False)
+    monkeypatch.setattr(publication.os, "replace", replace)
+    assert advance_security(security_path, tokens=["b" * 43])["generation"] == 1

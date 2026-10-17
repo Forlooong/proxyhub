@@ -1,6 +1,6 @@
 """Read-only loopback HTTP runtime serving immutable publication snapshots.
 
-The only persistent input is the bounded JSON bundle. There is no outbound
+The persistent inputs are the bounded JSON bundle and independent deny ledger. There is no outbound
 fetch, write endpoint, access log, manager socket or database dependency.
 """
 
@@ -21,18 +21,23 @@ import threading
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .publication import MAX_BUNDLE_BYTES, PublicationError, validate_bundle
+from .publication import (MAX_BUNDLE_BYTES, PublicationError, validate_bundle,
+                          iter_routes, load_security, token_digest, alias_digest)
 
 MAX_HEADER_BYTES = 8192
 REQUEST_TIMEOUT = 5
 MAX_CONNECTIONS = 32
-_PATH = re.compile(r"/sub/[A-Za-z0-9_-]{32,128}/(?:mihomo\.yaml|raw)\Z")
+_PATH = re.compile(r"/(?:[A-Za-z0-9_-]{1,64}/)+[A-Za-z0-9_-]{32,128}/(?:mihomo\.yaml|raw)\Z")
+STATUS_PATH = "/__proxyhub_publication__"
+STATUS_HOST = "proxyhub.internal"
 
 
 @dataclass(frozen=True)
 class Response:
     headers: tuple[tuple[str, str], ...]
     body: bytes
+    token_hash: str
+    alias_hash: str
 
 
 @dataclass(frozen=True)
@@ -61,9 +66,11 @@ def load_snapshot(path: str | Path) -> Snapshot:
         raise PublicationError("Invalid publication bundle") from exc
     routes = {}
     for profile in bundle["profiles"]:
-        for response in profile["responses"].values():
+        for response in iter_routes(profile):
             headers = tuple(response["headers"].items()) + (("X-ProxyHub-Generation", bundle["generation"]),)
-            routes[(profile["host"], response["path"])] = Response(headers, response["body"].encode("utf-8"))
+            routes[(response["host"], response["path"])] = Response(
+                headers, response["body"].encode("utf-8"), token_digest(profile["token"]),
+                alias_digest(response["host"], response["path_prefix"]))
     return Snapshot(bundle["generation"], MappingProxyType(routes))
 
 
@@ -96,12 +103,17 @@ class PublisherHandler(BaseHTTPRequestHandler):
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
         self._empty(code)
 
-    def _empty(self, code: int) -> None:
+    def _empty(self, code: int, security_generation: int | None = None,
+               generation: str | None = None) -> None:
         self.close_connection = True
         self.send_response_only(code)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
+        if security_generation is not None:
+            self.send_header("X-ProxyHub-Security-Generation", str(security_generation))
+        if generation is not None:
+            self.send_header("X-ProxyHub-Generation", generation)
         if code == 405:
             self.send_header("Allow", "GET, HEAD")
         self.end_headers()
@@ -138,17 +150,27 @@ class PublisherHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         hosts = self.headers.get_all("Host", [])
-        if len(hosts) != 1 or not _PATH.fullmatch(self.path):
-            self._empty(404)
+        security = self.server.security()
+        if security is None:
+            self._empty(503)
             return
         snapshot = self.server.snapshot
+        security_generation = security["generation"]
+        if self.path == STATUS_PATH and hosts == [STATUS_HOST]:
+            self._empty(200, security_generation, snapshot.generation)
+            return
+        if len(hosts) != 1 or not _PATH.fullmatch(self.path):
+            self._empty(404, security_generation)
+            return
         response = snapshot.routes.get((hosts[0], self.path))
-        if response is None:
-            self._empty(404)
+        if (response is None or response.token_hash in security["revoked_tokens"]
+                or response.alias_hash in security["retired_aliases"]):
+            self._empty(404, security_generation)
             return
         self.send_response_only(200)
         for name, value in response.headers:
             self.send_header(name, value)
+        self.send_header("X-ProxyHub-Security-Generation", str(security_generation))
         self.send_header("Content-Length", str(len(response.body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -163,7 +185,8 @@ class PublisherServer(ThreadingHTTPServer):
     block_on_close = False
     request_queue_size = MAX_CONNECTIONS
 
-    def __init__(self, address: tuple[str, int], bundle_path: str | Path):
+    def __init__(self, address: tuple[str, int], bundle_path: str | Path,
+                 security_path: str | Path | None = None):
         try:
             if not ipaddress.ip_address(address[0]).is_loopback:
                 raise ValueError
@@ -172,6 +195,10 @@ class PublisherServer(ThreadingHTTPServer):
         self.bundle_path = Path(bundle_path)
         self._snapshot = load_snapshot(self.bundle_path)
         self._snapshot_lock = threading.Lock()
+        self.security_path = Path(security_path) if security_path is not None else None
+        self._security_lock = threading.Lock()
+        self._security = {"schema_version": 1, "generation": 0,
+                          "revoked_tokens": [], "retired_aliases": []}
         self._connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.reload_requested = threading.Event()
         if ":" in address[0]:
@@ -191,6 +218,24 @@ class PublisherServer(ThreadingHTTPServer):
         with self._snapshot_lock:
             self._snapshot = candidate
         return True
+
+    def security(self) -> dict | None:
+        # A reload signal cannot close the crash window after a durable revoke.
+        # Read the independent atomic ledger before every new request instead.
+        if self.security_path is None:
+            return self._security
+        with self._security_lock:
+            try:
+                candidate = load_security(self.security_path)
+                if (candidate["generation"] < self._security["generation"]
+                        or candidate != self._security and candidate["generation"] == self._security["generation"]
+                        or any(not set(self._security[name]) <= set(candidate[name])
+                               for name in ("revoked_tokens", "retired_aliases"))):
+                    return None
+            except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                return None
+            self._security = candidate
+            return candidate
 
     def service_actions(self) -> None:
         if self.reload_requested.is_set():
@@ -222,13 +267,15 @@ class PublisherServer(ThreadingHTTPServer):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Serve an immutable ProxyHub subscription bundle on loopback")
     parser.add_argument("--bundle", required=True, type=Path)
+    parser.add_argument("--security", type=Path)
     parser.add_argument("--listen", default="127.0.0.1")
     parser.add_argument("--port", default=18890, type=int)
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     try:
-        server = PublisherServer((args.listen, args.port), args.bundle)
+        server = PublisherServer((args.listen, args.port), args.bundle,
+                                 args.security or args.bundle.with_name("security.json"))
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         print("publisher: startup failed", file=sys.stderr)
         return 2

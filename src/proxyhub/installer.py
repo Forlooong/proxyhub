@@ -95,6 +95,13 @@ def install() -> dict:
     pub = pwd.getpwnam('proxyhub-pub')
     os.chown(DATA/'publish', 0, pub.pw_gid)
     (DATA/'publish').chmod(0o750)
+    from .deployment import _ensure_publication_security
+    from .state import StateStore
+    store = StateStore(DATA/'plans')
+    try:
+        _ensure_publication_security(store,DATA)
+    finally:
+        store.db.close()
     for name in ('client_temp', 'proxy_temp', 'fastcgi_temp', 'uwsgi_temp', 'scgi_temp'):
         if (DATA/'nginx'/name).is_symlink():
             raise OperationError('Managed temporary directories must not be symlinks')

@@ -75,6 +75,49 @@ def test_config_and_uri_share_node_snapshot(input_document):
     assert base64.b64decode(output["raw"]).decode() == output["uri"] + "\n"
 
 
+@pytest.mark.parametrize('selection', ['hy2', 'extra'])
+def test_subscription_selection_uses_existing_snapshots_without_implicit_reality(input_document, selection):
+    add_hy2(input_document)
+    extra = managed_node('ss')
+    input_document['nodes'] = [extra]
+    selected = 'local-hy2' if selection == 'hy2' else extra['id']
+    input_document['node_ids'] = [selected]
+    output = json.loads(run_worker(input_document).stdout)
+    config = parse_yaml(output['yaml'])
+    expected_name = input_document['hy2']['name'] if selection == 'hy2' else extra['name']
+    assert [proxy['name'] for proxy in config['proxies']] == [expected_name]
+    assert config['proxy-groups'][0]['proxies'] == [expected_name]
+    assert output['proxies'] == config['proxies'] and output['uris'] == [output['uri']]
+    assert base64.b64decode(output['raw']).decode().splitlines() == output['uris']
+
+
+def test_multi_subscription_selection_preserves_shared_snapshot_and_legacy_result(input_document):
+    add_hy2(input_document)
+    extra = managed_node('ss')
+    input_document['nodes'] = [extra]
+    original = json.loads(run_worker(input_document).stdout)
+    all_ids = [input_document['node']['id'], 'local-hy2', extra['id']]
+    input_document['node_ids'] = all_ids
+    assert json.loads(run_worker(input_document).stdout) == original
+    input_document['node_ids'] = all_ids[:2]
+    first = json.loads(run_worker(input_document).stdout)
+    input_document['node_ids'] = [all_ids[0], all_ids[2]]
+    input_document['overrides'] = {'mixed-port': 18999}
+    second = json.loads(run_worker(input_document).stdout)
+    assert first['proxies'][0] == second['proxies'][0] == original['proxies'][0]
+    assert first['proxies'][1]['type'] == 'hysteria2' and second['proxies'][1]['type'] == 'ss'
+    assert parse_yaml(first['yaml'])['mixed-port'] == 17890
+    assert parse_yaml(second['yaml'])['mixed-port'] == 18999
+
+
+@pytest.mark.parametrize('selection', [[], ['unknown'], ['node_1', 'node_1'], None])
+def test_invalid_subscription_selection_is_rejected(input_document, selection):
+    input_document['node_ids'] = selection
+    process = run_worker(input_document)
+    assert process.returncode == 2 and process.stdout == ''
+    assert process.stderr == 'converter: invalid or unsupported input\n'
+
+
 def test_allowed_overrides_are_preserved(input_document):
     input_document["overrides"] = {"mixed-port": 18080, "mode": "global", "log-level": "info", "ipv6": True, "allow-lan": False}
     output = json.loads(run_worker(input_document).stdout)

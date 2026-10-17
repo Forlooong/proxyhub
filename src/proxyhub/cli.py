@@ -135,7 +135,38 @@ def parser() -> argparse.ArgumentParser:
     apply.add_argument('plan_id')
     sub = modules.add_parser('sub', help='Subscription access').add_subparsers(dest='operation')
     urls = sub.add_parser('urls', help='Show SECRET client links from active config (root only)')
+    urls.add_argument('--subscription-id', default='default')
     urls.add_argument('--output', type=Path, help='Write links to a private file instead of stdout')
+    sub.add_parser('list', help='List subscriptions and available node IDs without credentials')
+    yaml = sub.add_parser('yaml', help='Show SECRET published YAML for one subscription')
+    yaml.add_argument('--subscription-id', default='default')
+    yaml.add_argument('--output', type=Path)
+    for action in ('create','update'):
+        command = sub.add_parser(action, help='Prepare subscription '+action+'; apply its plan explicitly')
+        if action == 'update':
+            command.add_argument('--subscription-id', default='default')
+        command.add_argument('--name', required=action == 'create')
+        command.add_argument('--node-id', action='append', dest='node_ids', required=action == 'create')
+        command.add_argument('--host', help='Existing enabled managed HTTPS domain')
+        command.add_argument('--path-prefix', help='Literal path prefix, for example /sub or /family')
+        command.add_argument('--format', action='append', dest='formats', choices=('yaml','raw'))
+        command.add_argument('--values-file', type=Path, help='Bounded JSON object of metadata and overrides; named options take precedence')
+    for action in ('copy','enable','disable'):
+        command = sub.add_parser(action, help='Prepare subscription '+action)
+        command.add_argument('--subscription-id', default='default')
+        if action == 'copy':
+            command.add_argument('--name')
+    alias = sub.add_parser('alias', help='Manage retained subscription paths').add_subparsers(dest='action')
+    added = alias.add_parser('add', help='Prepare an additional download alias')
+    added.add_argument('--subscription-id', default='default')
+    added.add_argument('--host', required=True)
+    added.add_argument('--path-prefix', required=True)
+    retired = alias.add_parser('retire', help='Prepare permanent retirement of an alias')
+    retired.add_argument('--subscription-id', default='default')
+    retired.add_argument('--alias-id', required=True)
+    token = sub.add_parser('token', help='Manage download credentials, preserving node credentials').add_subparsers(dest='action')
+    rotated = token.add_parser('rotate', help='Prepare revocation of the old token across every alias')
+    rotated.add_argument('--subscription-id', default='default')
     panel = modules.add_parser('panel', help='Private management panel over an SSH tunnel').add_subparsers(dest='operation')
     panel.add_parser('install', help='Install and start the loopback gateway and privileged manager')
     access = panel.add_parser('access', help='Show SECRET panel credential and tunnel instructions (root only)')
@@ -310,15 +341,36 @@ def execute(args) -> dict:
     if args.module == 'deployment' and args.operation == 'init':
         return _initial_config(args)
     if args.module == 'sub':
-        config = json.loads(Path('/var/lib/proxyhub/current/config.json').read_text())
-        port = config['server']['public_port']
-        authority = config['server']['subscription_domain'] + ((':'+str(port)) if port != 443 else '')
-        base = 'https://' + authority + '/sub/' + config['subscription']['token']
-        result = {'mihomo': base+'/mihomo.yaml', 'raw': base+'/raw'}
-        if args.output:
-            atomic_write(args.output, canonical(result))
-            return {'status': 'written', 'private_links': str(args.output)}
-        return result
+        from .management import OperationService
+        service = OperationService(synchronous=True)
+        try:
+            if args.operation == 'list':
+                return service.handle('subscription.resources',{})
+            if args.operation in {'urls','yaml'}:
+                result = service.handle('subscription.reveal',{'format':'links' if args.operation=='urls' else 'yaml',
+                                                               'subscription_id':args.subscription_id})
+                output = result['links'] if args.operation == 'urls' else result['yaml']
+                if args.output:
+                    atomic_write(args.output,canonical(output) if isinstance(output,dict) else output.encode('utf-8'))
+                    return {'status':'written','private_links' if args.operation=='urls' else 'private_yaml':str(args.output)}
+                return output if isinstance(output,dict) else {'yaml':output}
+            values = {}
+            if getattr(args,'values_file',None):
+                with args.values_file.open('rb') as source:
+                    content = source.read(32*1024+1)
+                from .rpc import decode_json
+                values = decode_json(content,32*1024)
+                if not isinstance(values,dict):
+                    raise OperationError('Subscription values must be a JSON object')
+            for field in ('subscription_id','name','node_ids','host','path_prefix','formats','alias_id'):
+                if getattr(args,field,None) is not None:
+                    values[field] = getattr(args,field)
+            kind = 'subscription.'+args.operation
+            if args.operation in {'alias','token'}:
+                kind += '.'+args.action
+            return _site_plan(service,kind,values)
+        finally:
+            service.close()
     from .state import StateStore
     store = StateStore(Path('/var/lib/proxyhub/plans'))
     if args.module == 'host':
@@ -434,6 +486,9 @@ def main(argv=None) -> int:
         return 0
     if args.module == 'proxy' and args.action is None:
         _help(root,['proxy',args.operation])
+        return 0
+    if args.module == 'sub' and args.operation in {'alias','token'} and args.action is None:
+        _help(root,['sub',args.operation])
         return 0
     if args.module == 'site' and args.operation == 'website' and args.action in {'domain', 'certificate'} and args.resource_action is None:
         _help(root, ['site', 'website', args.action])

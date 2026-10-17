@@ -18,10 +18,12 @@ import time
 from .core import OperationError, atomic_write, canonical, digest, run
 from .proxy import validate_spec, render_sing_box
 from .site import render_nginx, render_site, validate_certificate
-from .publication import build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES
+from .publication import (build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES,
+                          iter_routes, load_security, save_security, advance_security, route_allowed)
+from .publication import token_digest
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, consumers, site_directory, sync_default
-from . import reality, hy2, nodes
+from . import reality, hy2, nodes, subscriptions
 
 ROOT = Path('/var/lib/proxyhub')
 BIN = Path('/opt/proxyhub/bin')
@@ -169,7 +171,7 @@ def _verify_candidate(directory: Path, payload: dict) -> None:
 
 
 def client_config(server: dict, overrides: dict, sni: str | None = None, hy2_node: dict | None = None,
-                  extra_nodes: list | None = None) -> dict:
+                  extra_nodes: list | None = None, node_ids: list[str] | None = None) -> dict:
     node = {key: server[key] for key in ('uuid', 'public_key', 'short_id')}
     node.update(id='local-reality', name=server['node_name'], server=server['public_address'],
                 port=server['public_port'], server_name=sni or server['site_domain'])
@@ -178,17 +180,21 @@ def client_config(server: dict, overrides: dict, sni: str | None = None, hy2_nod
         source['hy2'] = hy2_node
     if extra_nodes:
         source['nodes'] = extra_nodes
+    if node_ids is not None:
+        source['node_ids'] = node_ids
     text = run([str(BIN/'node'), str(APP/'packages/converter/dist/worker.js')], input=json.dumps(source), timeout=20)
     return json.loads(text)
 
 
-def _generated_client(config: dict) -> dict:
+def _generated_client(config: dict, node_ids: list[str] | None = None) -> dict:
     sni = None
     if 'reality' in config:
         sni = next(entry['sni'] for entry in reality.public_resources(config)['endpoints'] if entry['primary'])
     extra = [snapshot for node in nodes.normalize_nodes(config)
              if (snapshot := nodes.client_node(config,node)) is not None]
     resource = hy2.client_node(config) if _hy2_enabled(config) else None
+    if node_ids is not None:
+        return client_config(config['server'],config['overrides'],sni,resource,extra,node_ids)
     if extra:
         return client_config(config['server'],config['overrides'],sni,resource,extra)
     if resource is not None:
@@ -196,6 +202,84 @@ def _generated_client(config: dict) -> dict:
     if sni is not None:
         return client_config(config['server'],config['overrides'],sni)
     return client_config(config['server'],config['overrides'])
+
+
+def _generated_profiles(config: dict, default: dict) -> list[dict]:
+    profiles = []
+    for profile in subscriptions.normalize(config):
+        if not profile['enabled']:
+            continue
+        if profile['id']=='default' and profile['node_ids'] is None:
+            generated = default
+        else:
+            selected = subscriptions.selected_node_ids(config,profile)
+            generated = _generated_client({**config,'overrides':profile['overrides']},selected)
+        entry = {key:profile[key] for key in ('id','host','token','name','userinfo','update_interval_hours',
+                                             'reset_day','reset_at','path_prefix','aliases','formats')}
+        entry.update(yaml=generated['yaml'],raw=generated['raw'])
+        profiles.append(entry)
+    return profiles
+
+
+def _subscription_transition(config: dict, previous: Path | None, operation: dict | None) -> None:
+    if operation is not None and (not isinstance(operation,dict)
+            or set(operation)!={'kind','subscription_id'} or operation['kind'] not in subscriptions.KINDS
+            or not isinstance(operation['subscription_id'],str)):
+        raise OperationError('Invalid subscription lifecycle operation')
+    if previous is None:
+        return
+    before = {item['id']:item for item in subscriptions.normalize(
+        json.loads((previous/'config.json').read_text(encoding='utf-8')))}
+    after = {item['id']:item for item in subscriptions.normalize(config)}
+    if operation is not None:
+        try:
+            security = load_security(ROOT/'publish/security.json')
+        except (OSError,ValueError):
+            raise OperationError('Publication safety state is unavailable') from None
+        for identity,last in after.items():
+            first = before.get(identity)
+            old_routes = {(entry['host'],entry['path_prefix']) for entry in
+                          ([first,*first['aliases']] if first else [])}
+            if ((first is None or first['token']!=last['token'])
+                    and token_digest(last['token']) in security['revoked_tokens']):
+                raise OperationError('A subscription cannot introduce a revoked token')
+            for entry in [last,*last['aliases']]:
+                if ((entry['host'],entry['path_prefix']) not in old_routes
+                        and not route_allowed(security,entry['host'],entry['path_prefix'],last['token'])):
+                    raise OperationError('A subscription cannot introduce a retired route')
+    for identity in before.keys() & after.keys():
+        first, last = before[identity], after[identity]
+        if first['token']==last['token']:
+            continue
+        if operation=={'kind':'subscription.token.rotate','subscription_id':identity}:
+            if {k:v for k,v in first.items() if k!='token'} != {k:v for k,v in last.items() if k!='token'}:
+                raise OperationError('Token rotation cannot change subscription settings')
+            continue
+        # Restoring a revoked historical token is safe only as a closed route;
+        # restoration itself must not revoke the newer valid token.
+        try:
+            revoked = load_security(ROOT/'publish/security.json')['revoked_tokens']
+        except (OSError,ValueError):
+            revoked = []
+        if operation is not None or token_digest(last['token']) not in revoked:
+            raise OperationError('Subscription token changes require an explicit token rotation')
+    if operation and operation['kind'] in ('subscription.token.rotate','subscription.alias.retire'):
+        identity = operation['subscription_id']
+        if identity not in before or identity not in after:
+            raise OperationError('Subscription safety operation requires an existing identity')
+        first, last = before[identity], after[identity]
+        if operation['kind']=='subscription.token.rotate' and first['token']==last['token']:
+            raise OperationError('Token rotation must replace the selected subscription token')
+        if operation['kind']=='subscription.alias.retire':
+            if ({k:v for k,v in first.items() if k!='aliases'} != {k:v for k,v in last.items() if k!='aliases'}
+                    or len(first['aliases'])!=len(last['aliases'])+1
+                    or any(alias not in first['aliases'] for alias in last['aliases'])):
+                raise OperationError('Alias retirement must remove exactly one existing alias')
+            retired = next(alias for alias in first['aliases'] if alias not in last['aliases'])
+            if any((entry['host'],entry['path_prefix'])==(retired['host'],retired['path_prefix'])
+                   for other in before.values() if other['id']!=identity
+                   for entry in [other,*other['aliases']]):
+                raise OperationError('Alias route is still referenced by another subscription')
 
 
 def _certificate_bindings(config: dict) -> dict:
@@ -433,14 +517,15 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             publish_only: bool = False, site_files: dict[str, bytes] | None = None,
             website_change: bool = False, site_id: str = 'default', web_only: bool = False,
             reality_operation: dict | None = None, hy2_operation: dict | None = None,
-            node_operation: dict | None = None, runtime_only: bool = False) -> dict:
+            node_operation: dict | None = None, runtime_only: bool = False,
+            subscription_operation: dict | None = None) -> dict:
     base_revision = store.revision if expected_revision is None else expected_revision
     if store.revision != base_revision:
         raise OperationError('Configuration changed before preparation')
     if store.pending():
         raise OperationError('Recover the interrupted activation before preparing a deployment')
     if (not {'server','subscription','overrides'} <= set(config)
-            or set(config) - {'server','subscription','overrides','website_content','web','reality','hy2','nodes'}):
+            or set(config) - {'server','subscription','subscriptions','overrides','website_content','web','reality','hy2','nodes'}):
         raise OperationError('Deployment contains unknown or missing objects')
     if (type(publish_only) is not bool or type(web_only) is not bool or type(runtime_only) is not bool
             or sum((publish_only,web_only,runtime_only,reality_operation is not None,hy2_operation is not None,node_operation is not None))>1):
@@ -456,6 +541,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
     if server['publisher_port'] != 18890:
         raise OperationError('The publisher unit reserves loopback port 18890')
     previous = _current_revision()
+    _subscription_transition(config,previous,subscription_operation)
     if publish_only:
         _publication_server(server,previous,config)
         if site_files is not None:
@@ -483,6 +569,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
     bindings = _certificate_bindings(config)
     resource = hy2.normalize_hy2(config)
     generated = _generated_client(config)
+    profiles = _generated_profiles(config,generated)
     revision = secrets.token_hex(16)
     selected = get_site(config['web'],site_id)
     from .site_content import validate_files
@@ -544,9 +631,7 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
                 while parent != directory:
                     parent.chmod(0o755)
                     parent = parent.parent
-        subscription = dict(config['subscription'])
-        subscription.update(host=server['subscription_domain'],yaml=generated['yaml'],raw=generated['raw'])
-        save_bundle(directory/'bundle.json',build_bundle([subscription],revision))
+        save_bundle(directory/'bundle.json',build_bundle(profiles,revision))
         atomic_write(directory/'config.json',canonical(config))
         atomic_write(directory/'client.yaml',generated['yaml'].encode())
         run([str(BIN/'sing-box'),'check','-c',str(singbox)])
@@ -575,6 +660,8 @@ def prepare(store: StateStore, config: dict, *, expected_revision: int | None = 
             payload['hy2_operation'] = hy2_operation
         if node_operation is not None:
             payload['node_operation'] = node_operation
+        if subscription_operation is not None:
+            payload['subscription_operation'] = subscription_operation
         if config.get('website_content'):
             payload['content_version'] = config['website_content']
         if 'default' in summaries:
@@ -652,6 +739,63 @@ def _publish(directory: Path) -> None:
     save_bundle(target, json.loads((directory/'bundle.json').read_text(encoding='utf-8')))
     os.chown(target, 0, pwd.getpwnam('proxyhub-pub').pw_gid)
     target.chmod(0o640)
+
+
+def _ensure_publication_security(store: StateStore, data_root: Path | None = None) -> dict:
+    """Initialize once; a missing ledger after initialization must never reset it."""
+    import pwd
+    root = ROOT if data_root is None else data_root
+    path = root/'publish/security.json'
+    if path.parent.is_symlink():
+        raise OperationError('Unsafe publication security directory')
+    row = store.db.execute("SELECT value FROM metadata WHERE key='publication_security_generation'").fetchone()
+    if not path.exists() and not path.is_symlink() and row is None:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        save_security(path,{'schema_version':1,'generation':0,'revoked_tokens':[],'retired_aliases':[]})
+    try:
+        security = load_security(path)
+    except (OSError,ValueError):
+        raise OperationError('Publication security state is unavailable; publishing must remain closed') from None
+    if row is not None and security['generation']<int(row[0]):
+        raise OperationError('Publication security generation cannot go backwards')
+    os.chown(path,0,pwd.getpwnam('proxyhub-pub').pw_gid)
+    path.chmod(0o640)
+    with store.db:
+        store.db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES ('publication_security_generation',?)",
+                         (str(security['generation']),))
+    return security
+
+
+def _revoke_publication_changes(store: StateStore, previous: Path | None, directory: Path,
+                                operation: dict | None = None) -> None:
+    """Safety changes survive candidate failure and ordinary configuration recovery."""
+    _ensure_publication_security(store)
+    if previous is None or operation is None or operation['kind'] not in (
+            'subscription.token.rotate','subscription.alias.retire'):
+        return
+    before = subscriptions.get_profile(json.loads((previous/'config.json').read_text(encoding='utf-8')),
+                                       operation['subscription_id'])
+    after = subscriptions.get_profile(json.loads((directory/'config.json').read_text(encoding='utf-8')),
+                                      operation['subscription_id'])
+    revoked, retired = [], []
+    if operation['kind']=='subscription.token.rotate':
+        revoked.append(before['token'])
+    else:
+        routes = {(entry['host'],entry['path_prefix']) for entry in after['aliases']}
+        retired.extend({'host':entry['host'],'path_prefix':entry['path_prefix']}
+                       for entry in before['aliases']
+                       if (entry['host'],entry['path_prefix']) not in routes)
+    if revoked or retired:
+        advance_security(ROOT/'publish/security.json',revoked,retired)
+        _ensure_publication_security(store)
+
+
+def _publication_nginx_changed(directory: Path, previous: Path | None) -> bool:
+    if previous is None:
+        return True
+    def normalized(path):
+        return (path/'nginx.conf').read_text(encoding='utf-8').replace(str(path),'<revision>')
+    return normalized(directory)!=normalized(previous)
 
 
 def _units() -> tuple[str, ...]:
@@ -1185,6 +1329,8 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
         _publication_server(config['server'], previous, config)
         _link(previous)
         _publish(previous)
+        if _publication_nginx_changed(previous,candidate):
+            run(['systemctl','reload','proxyhub-nginx.service'])
         run(['systemctl', 'reload', 'proxyhub-publisher.service'])
         _wait_publication(previous)
         return
@@ -1248,6 +1394,7 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
             _wait_local_reality_health(config,previous)
         _wait_hy2_health(config,previous)
         _wait_nodes_health(config,previous)
+        _wait_publication(previous)
     else:
         # Every service is attempted even if one stop fails. The journal is left
         # pending when any action fails, so a later recover can safely retry.
@@ -1307,11 +1454,19 @@ def recover(store: StateStore) -> dict:
             if (details.get('runtime_units_before') != list(_runtime_units(before,previous))
                     or details.get('runtime_units_after') != list(_runtime_units(after,candidate))):
                 raise OperationError('Runtime recovery service set differs from its revisions')
+        if details.get('publication_safety_failed'):
+            _verify_candidate(candidate,record['payload'])
+            _revoke_publication_changes(store,previous,candidate,record['payload'].get('subscription_operation'))
+            run(['systemctl','start','proxyhub-publisher.service'])
+            if previous is not None:
+                _wait_publication(previous)
         if activation in ('reality','hy2','node','runtime') or (candidate/'shared.json').exists():
             _verify_candidate(candidate,record['payload'])
+            _ensure_publication_security(store)
             _restore(previous,candidate,activation,record['payload'].get('reality_operation'),
                      record['payload'].get('hy2_operation'),record['payload'].get('node_operation'))
         else:
+            _ensure_publication_security(store)
             _restore(previous, candidate, activation)
         store.abort(item['plan_id'], {'recovered': True, 'previous_available': previous is not None})
         return {'status': 'recovered', 'previous_available': previous is not None}
@@ -1453,36 +1608,51 @@ def _publication_health(directory: Path) -> None:
     no URL from a browser or subscription configuration is fetched here.
     """
     bundle = validate_bundle(json.loads((directory / 'bundle.json').read_text(encoding='utf-8')))
-    if bundle['generation'] != directory.name or len(bundle['profiles']) != 1:
-        raise OperationError('Publication acknowledgement requires the managed single subscription')
-    profile = bundle['profiles'][0]
-    for expected in profile['responses'].values():
+    if bundle['generation'] != directory.name:
+        raise OperationError('Publication generation differs from its immutable revision')
+    try:
+        security = load_security(ROOT/'publish/security.json')
+    except (OSError,ValueError):
+        raise OperationError('Publication security state is unavailable') from None
+    def request(host, path, method, expected=None, allowed=True):
         connection = http.client.HTTPConnection('127.0.0.1', 18890, timeout=1)
         try:
-            connection.request('GET', expected['path'], headers={
-                'Host': profile['host'], 'Connection': 'close',
-            })
+            connection.request(method,path,headers={'Host':host,'Connection':'close'})
             response = connection.getresponse()
-            generation = response.headers.get_all('X-ProxyHub-Generation', [])
-            if response.status != 200 or generation != [bundle['generation']]:
+            if response.headers.get_all('X-ProxyHub-Security-Generation',[]) != [str(security['generation'])]:
+                raise OperationError('Publisher has not acknowledged the safety generation')
+            if response.status != (200 if allowed else 404):
+                raise OperationError('Publisher route or revocation has not been acknowledged')
+            if allowed and response.headers.get_all('X-ProxyHub-Generation',[]) != [bundle['generation']]:
                 raise OperationError('Publisher has not acknowledged the expected generation')
+            if expected is None or not allowed:
+                if response.headers.get_all('Content-Length',[]) != ['0'] or response.read(1):
+                    raise OperationError('Publisher status or rejected route returned unexpected content')
+                return
             body = expected['body'].encode('utf-8')
             if response.headers.get_all('Content-Length', []) != [str(len(body))]:
                 raise OperationError('Publisher response length differs from the candidate')
             if any(response.headers.get_all(name, []) != [value]
                    for name, value in expected['headers'].items()):
                 raise OperationError('Publisher response metadata differs from the candidate')
-            if response.read(MAX_BODY_BYTES + 1) != body:
+            if response.read(MAX_BODY_BYTES + 1) != (body if method=='GET' else b''):
                 raise OperationError('Publisher response body differs from the candidate')
         except (OSError, http.client.HTTPException):
             # HTTP exception details may contain a credential-bearing route.
             raise OperationError('Publisher acknowledgement is unavailable') from None
         finally:
             connection.close()
+    # This also confirms empty/all-revoked bundles; an empty route loop is not ACK.
+    request('proxyhub.internal','/__proxyhub_publication__','HEAD')
+    for profile in bundle['profiles']:
+        for expected in iter_routes(profile):
+            allowed = route_allowed(security,expected['host'],expected['path_prefix'],profile['token'])
+            for method in ('GET','HEAD'):
+                request(expected['host'],expected['path'],method,expected,allowed)
 
 
 def _wait_publication(directory: Path) -> None:
-    """Bound retries: at most 15 two-route probes with one-second I/O waits."""
+    """Bound retries: at most 15 complete profile/alias sweeps with one-second I/O waits."""
     for attempt in range(15):
         try:
             _publication_health(directory)
@@ -1513,6 +1683,7 @@ def apply(store: StateStore, identity: str) -> dict:
                     or _certificate_files(server) != payload['certificate_files']):
                 raise OperationError('Deployment certificate changed after validation')
         previous = _current_revision()
+        _subscription_transition(config,previous,payload.get('subscription_operation'))
         if activation == 'publication':
             _publication_server(server, previous, config)
         elif activation == 'reality':
@@ -1553,11 +1724,30 @@ def apply(store: StateStore, identity: str) -> dict:
             if previous is not None:
                 details['previous_files'] = {path.relative_to(previous).as_posix():digest(path.read_bytes())
                     for path in previous.rglob('*') if path.is_file()}
+        operation = payload.get('subscription_operation')
+        safety_change = operation is not None and operation['kind'] in (
+            'subscription.token.rotate','subscription.alias.retire')
+        if safety_change:
+            try:
+                # Revocation is irreversible and precedes the activation journal:
+                # an interrupted journal must never leave the old token live.
+                _revoke_publication_changes(store,previous,directory,operation)
+            except Exception:
+                # A failed policy write cannot safely restore the old route.
+                # Stop publication until recover has durably completed denial.
+                run(['systemctl','stop','proxyhub-publisher.service'])
+                details['publication_safety_failed'] = True
+                store.record(identity,'activating',details)
+                raise OperationError('Publication safety persistence failed; publisher is closed until recovery') from None
         store.record(identity,'activating',details)
         try:
+            if not safety_change:
+                _revoke_publication_changes(store,previous,directory)
             _link(directory)
             _publish(directory)
             if activation == 'publication':
+                if _publication_nginx_changed(directory,previous):
+                    run(['systemctl','reload','proxyhub-nginx.service'])
                 run(['systemctl', 'reload', 'proxyhub-publisher.service'])
                 _wait_publication(directory)
             elif activation in ('hy2','node','runtime'):
@@ -1613,6 +1803,7 @@ def apply(store: StateStore, identity: str) -> dict:
                     _wait_local_reality_health(config,directory)
                 _wait_hy2_health(config,directory)
                 _wait_nodes_health(config,directory)
+                _wait_publication(directory)
                 run(['systemctl','enable',*_core_units(config,directory)])
             store.commit(identity)
         except Exception:

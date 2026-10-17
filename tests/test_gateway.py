@@ -64,6 +64,13 @@ def test_complete_session_operation_logout_flow(client):
     assert client.get("/api/session").json() == {"authenticated": False}
 
 
+def test_subscription_resources_dispatches_through_authenticated_typed_operation(client):
+    csrf = login(client)
+    result = operation(client,csrf,{"operation":"subscription.resources","payload":{}})
+    assert result.status_code == 200
+    assert client.calls == [("subscription.resources",{})]
+
+
 def test_cookie_is_not_readable_to_javascript_or_cross_site(client):
     response = client.post("/api/login", json={"credential": CREDENTIAL}, headers={"Origin": ORIGIN})
     cookie = response.headers["set-cookie"].lower()

@@ -395,6 +395,72 @@ def test_resource_lists_use_read_operation(resource, content_service, capsys):
     assert content_service.closed
 
 
+@pytest.mark.parametrize(('arguments','kind','values'),[
+    (['create','--name','Family','--node-id','local-reality','--node-id','local-hy2','--format','yaml'],
+     'subscription.create',{'name':'Family','node_ids':['local-reality','local-hy2'],'formats':['yaml']}),
+    (['update','--name','Renamed','--path-prefix','/family'], 'subscription.update',
+     {'subscription_id':'default','name':'Renamed','path_prefix':'/family'}),
+    (['copy','--subscription-id','family','--name','Copy'], 'subscription.copy',{'subscription_id':'family','name':'Copy'}),
+    (['enable','--subscription-id','family'],'subscription.enable',{'subscription_id':'family'}),
+    (['disable'],'subscription.disable',{'subscription_id':'default'}),
+    (['alias','add','--host','sub.example.test','--path-prefix','/retained'],'subscription.alias.add',
+     {'subscription_id':'default','host':'sub.example.test','path_prefix':'/retained'}),
+    (['alias','retire','--alias-id','old'],'subscription.alias.retire',{'subscription_id':'default','alias_id':'old'}),
+    (['token','rotate'],'subscription.token.rotate',{'subscription_id':'default'}),
+])
+def test_subscription_commands_prepare_typed_plans(arguments,kind,values,content_service,capsys):
+    assert main(['sub',*arguments]) == 0
+    assert content_service.calls == [(kind,7,values)] and content_service.closed
+
+
+def test_subscription_list_is_public_read_operation(content_service,capsys):
+    content_service.result = {'revision':7,'profiles':[],'nodes':[]}
+    assert main(['sub','list']) == 0
+    assert content_service.calls == [('subscription.resources',{})] and content_service.closed
+
+
+def test_subscription_values_file_is_bounded_and_named_options_take_precedence(tmp_path,content_service,capsys):
+    import json
+    path = tmp_path/'values.json'
+    path.write_text(json.dumps({'name':'file name','userinfo':{'expire':2000000000},'overrides':{'mixed-port':17892}}))
+    assert main(['sub','update','--values-file',str(path),'--name','named option']) == 0
+    assert content_service.calls == [('subscription.update',7,{
+        'subscription_id':'default','name':'named option','userinfo':{'expire':2000000000},'overrides':{'mixed-port':17892},
+    })]
+    assert content_service.closed
+
+
+@pytest.mark.parametrize('body',[b'[]',b'{"name":"a","name":"b"}',b'x'*(32*1024+1)],ids=['array','duplicate','oversized'])
+def test_subscription_values_file_rejects_invalid_input_before_plan(tmp_path,content_service,capsys,body):
+    path = tmp_path/'values.json'
+    path.write_bytes(body)
+    assert main(['sub','update','--values-file',str(path)]) == 1
+    assert content_service.calls == [] and content_service.closed
+
+
+@pytest.mark.parametrize('arguments',[['sub'],['help','sub','create'],['help','sub','urls'],['sub','alias'],['sub','token']])
+def test_subscription_help_never_opens_root_state(arguments,capsys,monkeypatch):
+    monkeypatch.setattr('proxyhub.cli.require_root',lambda:pytest.fail('help must not require root'))
+    assert main(arguments) == 0
+    assert 'usage:' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('subscription_id',['default','family'])
+def test_subscription_urls_preserve_original_shape_and_private_output(tmp_path,content_service,capsys,subscription_id):
+    import json
+    content_service.result = {'links':{'mihomo':'SECRET-YAML-URL','raw':'SECRET-RAW-URL'}}
+    output = tmp_path/'links.json'
+    arguments = ['sub','urls','--output',str(output)]
+    if subscription_id != 'default':
+        arguments += ['--subscription-id',subscription_id]
+    assert main(arguments) == 0
+    captured = capsys.readouterr()
+    assert 'SECRET-' not in captured.out+captured.err
+    assert json.loads(output.read_text()) == content_service.result['links']
+    assert content_service.calls == [('subscription.reveal',{'format':'links','subscription_id':subscription_id})]
+    assert content_service.closed
+
+
 def test_content_versions_can_select_site(content_service, capsys):
     assert main(['site','content','versions','--site-id','site-2']) == 0
     assert content_service.calls == [('website.content.versions', {'site_id':'site-2'})]

@@ -271,6 +271,8 @@ def test_nginx_keeps_original_reality_path_and_renders_independent_sites(configu
     assert 'server_name second.example.test alias.example.test;' in output
     assert 'root ' + REVISION + '/sites/' + SITE + ';' in output
     assert 'root ' + REVISION + '/site;' in output
+    assert output.count('location ~ "^/(?:[A-Za-z0-9_-]+/)+[A-Za-z0-9_-]{32,128}/"') == 2
+    assert output.count('location = /__proxyhub_publication__ { return 404; }') == 3
     second_tls = output[output.index('listen 127.0.0.1:9443 ssl;'):]
     assert 'ssl_certificate ' + get_certificate(web, CERTIFICATE)['certificate_path'] + ';' in second_tls
     subscription_tls = output[output.index('listen 127.0.0.1:8444 ssl;'):]

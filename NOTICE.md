@@ -42,6 +42,7 @@ Clash Verge Rev 2.5.8 为计划验收的外部 GUI 客户端，按其 [GPLv3 许
 - `yaml` 2.9.1，ISC，Copyright Eemeli Aro。应用归档包含此依赖时保留其 `LICENSE`。
 - TypeScript 5.9.3，Apache-2.0；`@types/node` 24.10.0 和 `undici-types` 7.16.0，MIT。它们是开发依赖，当前应用归档不携带这些构建工具。
 - 管理面板使用 React / ReactDOM 19.3.0（MIT）与 IBM Plex Sans / Mono（SIL OFL 1.1，`@fontsource` 5.3.0）；对应许可证随 `packages/panel/public` 和构建产物提供。Vite 8.3.4、React Vite 插件与类型包仅用于本地构建。
+- 面板本地二维码使用 `qrcode.react` 4.2.0（ISC，Paul O’Shannessy）及其内含的 QR Code Generator（MIT，Project Nayuki）；依据上游提交 `f91d2bdcc39def6c5c77178743a44f935a740992`，完整许可随 `packages/panel/public/licenses/qrcode-react.txt` 和构建产物提供。
 - 网关 Python 依赖由 `requirements-panel.lock` 全量固定，包括 FastAPI 0.143.0（MIT）、Uvicorn 0.54.0（BSD-3-Clause）。安装使用原始 wheel 并保留各包的 `.dist-info/licenses` 等声明。测试专用 httpx 不进入生产依赖清单。
 
 面板从 [developer-portfolios](https://github.com/emmabostian/developer-portfolios) 收集的作品中参考导航与信息层级，未复制其作品代码、素材或品牌；具体取舍记录在 `packages/panel/DESIGN.md`。

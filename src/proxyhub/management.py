@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+from urllib.parse import quote
 
 from . import deployment
 from . import management_web
@@ -12,10 +13,10 @@ from .core import OperationError
 from .jobs import Jobs
 from .management_errors import ManagementError, public_error
 from .management_read import overview, ssh_details
-from .management_read import web_resources
+from .management_read import web_resources, subscription_resources
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, sync_default
-from . import reality, hy2, nodes
+from . import reality, hy2, nodes, subscriptions
 
 ROOT = Path('/var/lib/proxyhub')
 
@@ -127,6 +128,11 @@ class OperationService:
             with self.state() as store:
                 _, config, revision, _ = self.snapshot(store,reject_pending=True)
                 return {'revision':revision,**nodes.public_resources(config)}
+        if operation == 'subscription.resources':
+            shape(payload,())
+            with self.state() as store:
+                _, config, revision, _ = self.snapshot(store,reject_pending=True)
+                return {'revision':revision,**subscription_resources(config,self.root)}
         if operation == 'website.content.preview':
             shape(payload,('plan_id',))
             with self.state() as store:
@@ -144,22 +150,42 @@ class OperationService:
                 raise ManagementError('PREVIEW_UNAVAILABLE','静态预览超过大小或结构限制，无法显示；候选未改变，仍可确认应用后通过公网网站检查。') from None
             return {'html':html,'file_count':len(files),'total_bytes':sum(map(len,files.values()))}
         if operation == 'subscription.reveal':
-            shape(payload,('format',))
+            shape(payload,('format','subscription_id'),('format',))
             with self.state() as store:
                 directory, config, _, _ = self.snapshot(store,reject_pending=True)
+            profile = subscriptions.get_profile(config,payload.get('subscription_id','default'))
+            public = next(item for item in subscription_resources(config,self.root)['profiles'] if item['id']==profile['id'])
+            if not profile['enabled'] or public['access_status'] != 'active':
+                raise ManagementError('SUBSCRIPTION_BLOCKED','订阅已停用、已撤销或安全状态未确认；请检查状态，已撤销的订阅需轮换令牌。')
             if payload['format'] == 'yaml':
-                return {'yaml':(directory/'client.yaml').read_text(encoding='utf-8')}
+                if 'yaml' not in profile['formats']:
+                    raise ManagementError('VALIDATION','此订阅未启用 YAML 格式。')
+                from .publication import validate_bundle
+                bundle = validate_bundle(json.loads((directory/'bundle.json').read_text(encoding='utf-8')))
+                published = next(item for item in bundle['profiles'] if item['id']==profile['id'])
+                return {'yaml':published['responses']['yaml']['body']}
             if payload['format'] != 'links':
                 raise ManagementError('VALIDATION','仅支持链接或 YAML 的显式查看。')
-            s, sub = config['server'], config['subscription']
-            suffix = '' if s['public_port'] == 443 else ':'+str(s['public_port'])
-            base = 'https://'+s['subscription_domain']+suffix+'/sub/'+sub['token']
-            return {'links':{'mihomo':base+'/mihomo.yaml','raw':base+'/raw'}}
+            suffix = '' if config['server']['public_port'] == 443 else ':'+str(config['server']['public_port'])
+            def links(host,prefix):
+                base = 'https://'+host+suffix+prefix+'/'+profile['token']
+                return {key:base+'/'+name for key,name in (('mihomo','mihomo.yaml'),('raw','raw'))
+                        if ('yaml' if key=='mihomo' else key) in profile['formats']}
+            result = {'links':links(profile['host'],profile['path_prefix']),
+                      'aliases':[{'id':alias['id'],'links':links(alias['host'],alias['path_prefix'])}
+                                 for alias in public['aliases'] if alias['access_status']=='active']}
+            if 'mihomo' in result['links']:
+                # The pinned GUI parser takes everything after url= as the URL.
+                # Keep name first and the percent-encoded subscription URL last.
+                result['imports'] = {'Clash Verge Rev 2.5.8（待 GUI 验收）':
+                    'clash-verge://install-config?name='+quote(profile['name'],safe='')+
+                    '&url='+quote(result['links']['mihomo'],safe='')}
+            return result
         if operation == 'plan.create':
             shape(payload,('kind','base_revision','values'))
             if type(payload['base_revision']) is not int or payload['base_revision'] < 0:
                 raise ManagementError('VALIDATION','配置版本必须是非负整数。')
-            if payload['kind'] not in management_web.KINDS | reality.KINDS | hy2.KINDS | nodes.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','subscription.update','certificate.issue','certificate.renew'}:
+            if payload['kind'] not in management_web.KINDS | reality.KINDS | hy2.KINDS | nodes.KINDS | subscriptions.KINDS | {'ssh.append','website.update','website.content.upload','website.content.restore','proxy.update','certificate.issue','certificate.renew'}:
                 raise ManagementError('UNSUPPORTED','当前不支持此变更。')
             return self.jobs.submit('plan.create:'+payload['kind'],lambda:self.create_plan(**payload))
         if operation == 'plan.apply':
@@ -180,6 +206,32 @@ class OperationService:
                     directory, config = self.active()
             if kind == 'ssh.append':
                 return self._ssh_plan(store,base_revision,values)
+            if kind in subscriptions.KINDS:
+                before = subscriptions.public_resources(config)['profiles']
+                candidate = subscriptions.change(config,kind,values)
+                after = subscriptions.public_resources(candidate)['profiles']
+                identity = (next(item['id'] for item in after if item['id'] not in {entry['id'] for entry in before})
+                            if kind in {'subscription.create','subscription.copy'} else values.get('subscription_id','default'))
+                old = next((item for item in before if item['id']==identity),None)
+                new = next(item for item in after if item['id']==identity)
+                changes = [{'label':label,'before':old.get(key) if old else None,'after':new.get(key)}
+                           for key,label in (('name','订阅名称'),('host','发布域名'),('path_prefix','发布路径'),
+                                             ('enabled','启用状态'),('node_ids','引用节点'),('formats','输出格式'),
+                                             ('overrides','客户端覆盖'),('userinfo','手工流量 / 到期信息'),
+                                             ('update_interval_hours','刷新间隔（小时）'),('reset_day','重置日记录'),
+                                             ('reset_at','重置时间记录'),('aliases','保留别名'))
+                           if old is None or old.get(key)!=new.get(key)]
+                if kind == 'subscription.token.rotate':
+                    changes.append({'label':'订阅令牌','before':'原令牌','after':'新随机令牌；跨全部别名撤销旧令牌'})
+                prepared = deployment.prepare(store,candidate,expected_revision=base_revision,publish_only=True,
+                    subscription_operation={'kind':kind,'subscription_id':identity})
+                return self.preview(prepared['plan_id'],kind,base_revision,changes,
+                    ['原子发布订阅；保留两个 REALITY、HY2/额外节点共享组和网站进程，现有代理连接保持。'],
+                    ['订阅令牌只控制新下载，不轮换节点凭据；已下载的节点连接身份仍然有效。',
+                     '域名或路径更新会保留旧别名；显式退役才关闭该路径。',
+                     *(['撤销与退役不会随配置回滚撤销。安全记录无法持久化时暂停全部订阅下载，恢复完成后开放；代理连接保持。']
+                       if kind in {'subscription.token.rotate','subscription.alias.retire'} else []),
+                     '流量为手工元数据；到期与重置记录不执行自动计量、重置或节点撤销。'])
             if kind in nodes.KINDS:
                 before = nodes.public_resources(config)['nodes']
                 candidate = nodes.change(config,kind,values)
@@ -299,18 +351,6 @@ class OperationService:
                     config['server'][key] = values[key]
                     changes.append({'label':label,'before':before['server'][key],'after':values[key]})
                 warnings = ['节点凭据、监听端口、SNI 与握手目标保持原值；客户端需要刷新订阅。']
-            elif kind == 'subscription.update':
-                shape(values,('name','update_interval_hours','userinfo','reset_day','reset_at','overrides'))
-                if not isinstance(values['overrides'],dict):
-                    raise ManagementError('VALIDATION','客户端覆盖必须是 JSON 对象。')
-                for key in ('name','update_interval_hours','userinfo','reset_day','reset_at'):
-                    config['subscription'][key] = values[key]
-                    changes.append({'label':{'name':'订阅名称','update_interval_hours':'刷新间隔（小时）','userinfo':'手工流量 / 到期信息','reset_day':'重置日记录','reset_at':'重置时间记录'}[key],
-                                    'before':before['subscription'].get(key),'after':values[key]})
-                config['overrides'] = values['overrides']
-                changes.append({'label':'客户端配置覆盖','before':before['overrides'],'after':values['overrides']})
-                impact = ['仅重新加载订阅发布内容，保持网站和代理进程运行。']
-                warnings = ['流量为手工填写；重置字段仅作记录，不会执行计量归零。','空流量对象表示未知；刷新间隔、到期和重置时间分别保存。']
             elif kind == 'certificate.renew':
                 shape(values,())
                 from .certificates import managed_acme
@@ -318,7 +358,7 @@ class OperationService:
                     raise ManagementError('UNSUPPORTED','此证书由外部签发流程维护，请导入更新后的证书。')
                 identity = store.plan('panel-renew',{'current':directory.name},expected_revision=base_revision)
                 return self.preview(identity,kind,base_revision,[],['检查 HTTP-01 续期；仅证书变化时加载新证书。'],['必须保持公网 TCP 80 可达；失败保留有效旧配置。'])
-            options = {'expected_revision':base_revision,'publish_only':kind=='subscription.update'}
+            options = {'expected_revision':base_revision,'publish_only':False}
             if kind.startswith('website.'):
                 options.update(site_id=site_id,web_only=True)
                 impact = ['重新加载网站和订阅发布器，保留 REALITY 进程。']
@@ -400,7 +440,10 @@ class OperationService:
                            'website.domain.bind':'绑定网站域名','website.domain.unbind':'解绑网站域名','website.certificate.bind':'更换网站证书绑定',
                            'certificate.add':'新增证书绑定','certificate.issue':'申请新证书绑定','certificate.delete':'删除证书绑定',
                            'website.content.upload':'发布网站内容','website.content.restore':'恢复网站内容',
-                           'subscription.update':'发布订阅变更','certificate.import':'替换绑定证书','certificate.renew':'检查并更新证书'}[kind],
+                           'subscription.create':'创建订阅','subscription.update':'发布订阅变更','subscription.copy':'复制订阅',
+                           'subscription.enable':'启用订阅','subscription.disable':'停用订阅','subscription.alias.add':'保留订阅别名',
+                           'subscription.alias.retire':'退役订阅别名','subscription.token.rotate':'轮换订阅下载令牌',
+                           'certificate.import':'替换绑定证书','certificate.renew':'检查并更新证书'}[kind],
                 'changes':changes,'impact':impact,'warnings':warnings}
 
     def apply_plan(self, identity):

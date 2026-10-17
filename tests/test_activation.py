@@ -1,13 +1,31 @@
 """Transaction boundaries and recovery; no privileged services are touched."""
 from contextlib import nullcontext
+import base64
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from proxyhub.core import OperationError, canonical, digest
 from proxyhub.state import StateStore
 from proxyhub import deployment
+from proxyhub.proxy import validate_spec
+from proxyhub.publication import save_security
+
+
+def configuration(node_name='Test node'):
+    return {'server':validate_spec({
+        'certificate_path':'/var/lib/proxyhub/certificates/0123456789abcdef/fullchain.pem',
+        'key_path':'/var/lib/proxyhub/certificates/0123456789abcdef/privkey.pem',
+        'site_domain':'site.example.test','subscription_domain':'sub.example.test',
+        'public_address':'203.0.113.10','uuid':'a875d3ac-980f-4a0c-929e-78cc678429f1',
+        'private_key':base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip('='),
+        'public_key':base64.urlsafe_b64encode(bytes(reversed(range(32)))).decode().rstrip('='),
+        'short_id':'0123456789abcdef','node_name':node_name}),
+        'subscription':{'id':'default','token':'T'*43,'name':'Test subscription',
+                        'userinfo':{},'update_interval_hours':6},'overrides':{}}
 
 
 @pytest.fixture
@@ -98,6 +116,10 @@ def activation(tmp_path, monkeypatch, store):
     (root / 'revisions').mkdir(parents=True)
     (root / 'publish').mkdir()
     monkeypatch.setattr(deployment, 'ROOT', root)
+    monkeypatch.setitem(sys.modules,'pwd',SimpleNamespace(getpwnam=lambda name:SimpleNamespace(pw_gid=123)))
+    monkeypatch.setattr(deployment.os,'chown',lambda *args:None,raising=False)
+    save_security(root/'publish/security.json',{'schema_version':1,'generation':0,
+                                              'revoked_tokens':[],'retired_aliases':[]})
     monkeypatch.setattr(store, 'exclusive', nullcontext)
     pointer = {'current': None}
     calls = []
@@ -107,6 +129,7 @@ def activation(tmp_path, monkeypatch, store):
     monkeypatch.setattr(deployment, '_publish', lambda value: calls.append(('publish', value)))
     monkeypatch.setattr(deployment, '_check_ports', lambda server: None)
     monkeypatch.setattr(deployment, '_health', lambda server: None)
+    monkeypatch.setattr(deployment, '_wait_publication',lambda directory:None)
     monkeypatch.setattr(deployment, 'run', lambda command: calls.append(tuple(command)))
     monkeypatch.setattr(deployment.time, 'sleep', lambda value: None)
     monkeypatch.setattr(deployment, 'validate_certificate', lambda *a: {'sha256': 'c' * 64})
@@ -114,15 +137,15 @@ def activation(tmp_path, monkeypatch, store):
     key = root / 'key.pem'
     certificate.write_bytes(b'certificate test fixture')
     key.write_bytes(b'key test fixture')
+    monkeypatch.setattr(deployment,'_certificate_files',lambda server:{
+        'certificate_path':digest(certificate.read_bytes()),'key_path':digest(key.read_bytes())})
 
     def candidate(char='b'):
         directory = root / 'revisions' / (char * 32)
         directory.mkdir()
         (directory / 'site').mkdir()
-        server = {'certificate_path': str(certificate), 'key_path': str(key),
-                  'site_domain': 'site.example.test', 'subscription_domain': 'sub.example.test'}
         for name in deployment.CANDIDATE_FILES:
-            (directory / name).write_bytes(canonical({'server': server}) if name == 'config.json' else b'fixture')
+            (directory / name).write_bytes(canonical(configuration()) if name == 'config.json' else b'fixture')
         payload = {'revision': directory.name,
                    'files': {name: digest((directory / name).read_bytes()) for name in deployment.CANDIDATE_FILES},
                    'certificate_sha256': 'c' * 64,
@@ -165,7 +188,7 @@ def test_runtime_failure_restores_previous_bundle_and_services(store, activation
     root, pointer, calls, candidate, _ = activation
     old = root / 'revisions' / ('a' * 32)
     old.mkdir()
-    (old / 'config.json').write_bytes(canonical({'server': {'fixture': 'previous'}}))
+    (old / 'config.json').write_bytes(canonical(configuration('Previous node')))
     pointer['current'] = old
     directory, identity = candidate()
     health_calls = []
@@ -181,7 +204,7 @@ def test_runtime_failure_restores_previous_bundle_and_services(store, activation
     assert store.inspect(identity)['status'] == 'failed'
     assert store.revision == 0 and store.pending() == []
     assert len(health_calls) == 18
-    assert health_calls[-3:] == [{'fixture': 'previous'}] * 3
+    assert health_calls[-3:] == [configuration('Previous node')['server']] * 3
 
 
 def test_first_activation_failure_removes_publication(store, activation, monkeypatch):
@@ -200,7 +223,7 @@ def test_interrupted_activation_is_rolled_back_idempotently(store, activation):
     root, pointer, calls, candidate, _ = activation
     old = root / 'revisions' / ('a' * 32)
     old.mkdir()
-    (old / 'config.json').write_bytes(canonical({'server': {'fixture': 'previous'}}))
+    (old / 'config.json').write_bytes(canonical(configuration('Previous node')))
     directory, identity = candidate()
     pointer['current'] = directory
     store.record(identity, 'activating', {'previous': str(old), 'candidate': str(directory)})
@@ -214,7 +237,7 @@ def test_rollback_health_failure_keeps_activation_pending(store, activation, mon
     root, pointer, calls, candidate, _ = activation
     old = root / 'revisions' / ('a' * 32)
     old.mkdir()
-    (old / 'config.json').write_bytes(canonical({'server': {'fixture': 'previous'}}))
+    (old / 'config.json').write_bytes(canonical(configuration('Previous node')))
     pointer['current'] = old
     directory, identity = candidate()
     probes = []

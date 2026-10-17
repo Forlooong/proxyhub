@@ -41,6 +41,14 @@ def environment(tmp_path, monkeypatch):
               'overrides': {'mixed-port': 17890}}
     (directory / 'config.json').write_bytes(canonical(config))
     (directory / 'client.yaml').write_text('uuid: '+server['uuid'],encoding='utf-8')
+    from proxyhub.publication import build_bundle, save_bundle, save_security
+    import base64
+    (root/'publish').mkdir()
+    save_security(root/'publish/security.json',{'schema_version':1,'generation':0,'revoked_tokens':[],'retired_aliases':[]})
+    save_bundle(directory/'bundle.json',build_bundle([{
+        **config['subscription'],'host':server['subscription_domain'],
+        'yaml':'uuid: '+server['uuid'], 'raw':base64.b64encode(b'vless://fixture').decode('ascii'),
+    }],directory.name))
     pointer = {'current': directory}
     locking = {'active': False}
     @contextmanager
@@ -550,11 +558,136 @@ def test_subscription_update_uses_publication_mode_and_no_secret_preview(environ
     job = finish_job(env.service,'plan.create',{'kind':'subscription.update','base_revision':0,'values':values})
     assert job['status'] == 'succeeded'
     candidate, arguments = env.prepared[0]
-    assert arguments == {'expected_revision':0,'publish_only':True}
+    assert arguments == {'expected_revision':0,'publish_only':True,
+                         'subscription_operation':{'kind':'subscription.update','subscription_id':'default'}}
     assert candidate['server'] == env.config['server']
     assert candidate['subscription']['token'] == env.config['subscription']['token']
     assert candidate['overrides'] == values['overrides']
     assert_private_fields_absent(job,env.config)
+
+
+@pytest.mark.parametrize(('kind','values'),[
+    ('subscription.create',{'name':'Family','node_ids':['local-reality']}),
+    ('subscription.copy',{'subscription_id':'default','name':'Copy'}),
+    ('subscription.update',{'subscription_id':'default','path_prefix':'/family','formats':['yaml']}),
+    ('subscription.enable',{'subscription_id':'default'}),
+    ('subscription.disable',{'subscription_id':'default'}),
+    ('subscription.alias.add',{'subscription_id':'default','host':'sub.example.test','path_prefix':'/alias'}),
+    ('subscription.alias.retire',{'subscription_id':'default','alias_id':'alias-1'}),
+    ('subscription.token.rotate',{'subscription_id':'default'}),
+])
+def test_subscription_lifecycle_uses_one_publication_plan_and_secret_free_preview(environment,kind,values):
+    from proxyhub import subscriptions
+    env = environment
+    if kind == 'subscription.enable':
+        env.config['subscription']['enabled'] = False
+    if kind == 'subscription.alias.retire':
+        env.config['subscription']['aliases'] = [{'id':'alias-1','host':'sub.example.test','path_prefix':'/alias'}]
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    job = finish_job(env.service,'plan.create',{'kind':kind,'base_revision':0,'values':values})
+    assert job['status'] == 'succeeded', job
+    candidate, arguments = env.prepared[0]
+    assert arguments == {'expected_revision':0,'publish_only':True,
+                         'subscription_operation':{'kind':kind,'subscription_id':next(
+                             profile['id'] for profile in subscriptions.normalize(candidate)
+                             if profile['id'] not in {item['id'] for item in subscriptions.normalize(env.config)})
+                             if kind in {'subscription.create','subscription.copy'} else values.get('subscription_id','default')}}
+    assert candidate['server'] == env.config['server']
+    for profile in subscriptions.normalize(candidate):
+        assert profile['token'] not in json.dumps(job)
+    assert_private_fields_absent(job,env.config)
+    assert '节点凭据' in ''.join(job['result']['warnings'])
+
+
+@pytest.mark.parametrize('security_state',['missing','invalid'])
+def test_subscription_unknown_security_is_visible_and_reveal_fails_closed(environment,security_state):
+    env = environment
+    path = env.root/'publish/security.json'
+    if security_state == 'missing':
+        path.unlink()
+    else:
+        path.write_text('not valid security',encoding='utf-8')
+    resources = env.service.handle('subscription.resources',{})
+    assert resources['profiles'][0]['access_status'] == 'unknown'
+    assert_private_fields_absent(resources,env.config)
+    for format_name in ('links','yaml'):
+        with pytest.raises(ManagementError) as error:
+            env.service.handle('subscription.reveal',{'format':format_name})
+        assert error.value.code == 'SUBSCRIPTION_BLOCKED'
+
+
+def test_subscription_revoked_token_remains_blocked_for_primary_and_all_aliases(environment):
+    from proxyhub.publication import advance_security
+    env = environment
+    env.config['subscription']['aliases'] = [{'id':'alias-1','host':'sub.example.test','path_prefix':'/alias'}]
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    advance_security(env.root/'publish/security.json',tokens=[env.config['subscription']['token']])
+    resources = env.service.handle('subscription.resources',{})
+    assert resources['profiles'][0]['access_status'] == 'blocked'
+    assert resources['profiles'][0]['aliases'][0]['access_status'] == 'blocked'
+    with pytest.raises(ManagementError,match='节点|令牌|安全'):
+        env.service.handle('subscription.reveal',{'format':'links'})
+
+
+def test_subscription_reveal_selects_one_published_profile_and_enabled_formats(environment):
+    import base64
+    from proxyhub import subscriptions
+    from proxyhub.publication import build_bundle, save_bundle
+    env = environment
+    config = subscriptions.change(env.config,'subscription.create',{
+        'name':'YAML only','node_ids':['local-reality'],'path_prefix':'/family','formats':['yaml'],
+    })
+    extra = config['subscriptions'][0]
+    (env.directory/'config.json').write_bytes(canonical(config))
+    save_bundle(env.directory/'bundle.json',build_bundle([
+        {**{key:value for key,value in profile.items() if key not in {'node_ids','overrides'}},
+         'yaml':'profile: '+profile['id'],'raw':base64.b64encode(b'vless://fixture').decode('ascii')}
+        for profile in subscriptions.normalize(config)
+    ],env.directory.name))
+    old_links = env.service.handle('subscription.reveal',{'format':'links'})['links']
+    assert old_links == {'mihomo':'https://sub.example.test/sub/'+env.config['subscription']['token']+'/mihomo.yaml',
+                         'raw':'https://sub.example.test/sub/'+env.config['subscription']['token']+'/raw'}
+    result = env.service.handle('subscription.reveal',{'format':'links','subscription_id':extra['id']})
+    assert set(result['links']) == {'mihomo'}
+    assert '/family/'+extra['token']+'/' in result['links']['mihomo']
+    assert env.service.handle('subscription.reveal',{'format':'yaml','subscription_id':extra['id']}) == {'yaml':'profile: '+extra['id']}
+    projected = env.service.handle('overview',{})['subscriptions']
+    assert len(projected['profiles']) == 2
+    assert extra['token'] not in json.dumps(projected)
+
+
+def test_subscription_links_exclude_retired_alias_and_gui_uri_keeps_url_last(environment):
+    from urllib.parse import parse_qs, urlsplit
+    from proxyhub.publication import advance_security
+    env = environment
+    env.config['subscription']['name'] = 'Family & devices'
+    env.config['subscription']['aliases'] = [
+        {'id':'retired','host':'sub.example.test','path_prefix':'/old'},
+        {'id':'retained','host':'sub.example.test','path_prefix':'/kept'},
+    ]
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    advance_security(env.root/'publish/security.json',aliases=[env.config['subscription']['aliases'][0]])
+    result = env.service.handle('subscription.reveal',{'format':'links'})
+    assert [alias['id'] for alias in result['aliases']] == ['retained']
+    assert result['aliases'][0]['links']['mihomo'].endswith('/kept/'+env.config['subscription']['token']+'/mihomo.yaml')
+    uri = next(iter(result['imports'].values()))
+    assert uri.startswith('clash-verge://install-config?name=')
+    assert uri.count('&') == 1 and '&url=' in uri
+    assert parse_qs(urlsplit(uri).query) == {'name':['Family & devices'],'url':[result['links']['mihomo']]}
+    resources = env.service.handle('subscription.resources',{})
+    assert resources['profiles'][0]['access_status'] == 'active'
+    assert [alias['access_status'] for alias in resources['profiles'][0]['aliases']] == ['blocked','active']
+
+
+def test_subscription_raw_only_cannot_reveal_yaml_or_gui_import(environment):
+    env = environment
+    env.config['subscription']['formats'] = ['raw']
+    (env.directory/'config.json').write_bytes(canonical(env.config))
+    result = env.service.handle('subscription.reveal',{'format':'links'})
+    assert set(result['links']) == {'raw'} and 'imports' not in result
+    with pytest.raises(ManagementError) as error:
+        env.service.handle('subscription.reveal',{'format':'yaml'})
+    assert error.value.code == 'VALIDATION'
 
 
 def test_operation_exception_cannot_enter_jobs_or_overview(environment,monkeypatch):

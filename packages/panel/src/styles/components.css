@@ -132,6 +132,9 @@
 .help-grid {display: grid; grid-template-columns: 1fr 1fr; gap: 26px 35px;}
 .help-grid h3 {font-size: 14px; margin-bottom: 8px;}
 .help-grid p {font-size: 12px; color: var(--slate); line-height: 1.9;}
+.subscription-nodes {display: grid; gap: 10px; margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px;}
+.subscription-nodes legend {padding: 0 6px; font-size: 13px;}
+.subscription-qr {display: block; max-width: 100%; height: auto; margin-top: 12px;}
 @media (max-width: 900px) {.three-fields {grid-template-columns: 1fr;} .detail-row {grid-template-columns: 110px minmax(0, 1fr);}}
 @media (max-width: 699px) {
   .form-grid, .theme-choices, .help-grid {grid-template-columns: 1fr;} .form-stack {gap: 20px;}
