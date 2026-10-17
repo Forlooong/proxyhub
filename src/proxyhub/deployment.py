@@ -20,7 +20,7 @@ from .proxy import validate_spec, render_sing_box
 from .site import render_nginx, render_site, validate_certificate
 from .publication import (build_bundle, save_bundle, validate_bundle, MAX_BODY_BYTES,
                           iter_routes, load_security, save_security, advance_security, route_allowed)
-from .publication import token_digest
+from .publication import token_digest, alias_digest
 from .state import StateStore
 from .websites import normalize_web, get_site, get_certificate, consumers, site_directory, sync_default
 from . import reality, hy2, nodes, subscriptions
@@ -766,13 +766,11 @@ def _ensure_publication_security(store: StateStore, data_root: Path | None = Non
     return security
 
 
-def _revoke_publication_changes(store: StateStore, previous: Path | None, directory: Path,
-                                operation: dict | None = None) -> None:
-    """Safety changes survive candidate failure and ordinary configuration recovery."""
-    _ensure_publication_security(store)
+def _publication_revocations(previous: Path | None, directory: Path, operation: dict | None):
+    """Derive the same deny set for activation, recovery and the startup guard."""
     if previous is None or operation is None or operation['kind'] not in (
             'subscription.token.rotate','subscription.alias.retire'):
-        return
+        return [], []
     before = subscriptions.get_profile(json.loads((previous/'config.json').read_text(encoding='utf-8')),
                                        operation['subscription_id'])
     after = subscriptions.get_profile(json.loads((directory/'config.json').read_text(encoding='utf-8')),
@@ -785,9 +783,38 @@ def _revoke_publication_changes(store: StateStore, previous: Path | None, direct
         retired.extend({'host':entry['host'],'path_prefix':entry['path_prefix']}
                        for entry in before['aliases']
                        if (entry['host'],entry['path_prefix']) not in routes)
+    return revoked, retired
+
+
+def _publication_gate(*, closed: bool) -> None:
+    """A reversible read gate for the existing unprivileged publisher.
+
+    Close before recording intent so even a previously passed startup check or
+    an existing listener cannot race the journal/policy write. No second ledger
+    is introduced. A crash before the journal leaves this closed; the original
+    prepared safety plan can be retried without reopening the old routes.
+    """
+    path = ROOT/'publish'
+    if path.is_symlink() or not path.is_dir():
+        raise OperationError('Unsafe publication security directory')
+    path.chmod(0o700 if closed else 0o750)
+    if os.name == 'posix':
+        descriptor = os.open(path,os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _revoke_publication_changes(store: StateStore, previous: Path | None, directory: Path,
+                                operation: dict | None = None) -> None:
+    """Safety changes survive candidate failure and ordinary configuration recovery."""
+    _ensure_publication_security(store)
+    revoked, retired = _publication_revocations(previous,directory,operation)
     if revoked or retired:
         advance_security(ROOT/'publish/security.json',revoked,retired)
         _ensure_publication_security(store)
+        _publication_gate(closed=False)
 
 
 def _publication_nginx_changed(directory: Path, previous: Path | None) -> bool:
@@ -1425,6 +1452,62 @@ def _restore(previous: Path | None, candidate: Path, activation: str = 'full',
                 os.close(fd)
 
 
+def _recovery_activation(store: StateStore, item: dict):
+    """Validate durable recovery inputs before any service or deny-ledger action."""
+    record = store.inspect(item['plan_id'])
+    if record['kind'] != 'deployment' or record['status'] != 'prepared':
+        raise OperationError('Pending activation has an inconsistent plan state')
+    details = item['details']
+    activation = _activation(record['payload'])
+    if _activation(details) != activation:
+        raise OperationError('Recovery activation mode differs from its plan')
+    candidate = _managed_revision(details['candidate'])
+    if candidate.name != record['payload']['revision']:
+        raise OperationError('Recovery candidate differs from its plan')
+    previous = _managed_revision(details['previous']) if details['previous'] else None
+    if 'previous_files' in details:
+        if previous is None:
+            raise OperationError('Runtime recovery is missing its previous revision')
+        _verify_candidate(previous,{'files':details['previous_files']})
+        if 'runtime_units_before' in details:
+            before = json.loads((previous/'config.json').read_text(encoding='utf-8'))
+            after = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
+            if (details['runtime_units_before'] != list(_runtime_units(before,previous))
+                    or details.get('runtime_units_after') != list(_runtime_units(after,candidate))):
+                raise OperationError('Runtime recovery service set differs from its revisions')
+    if details.get('publication_safety_failed'):
+        _verify_candidate(candidate,record['payload'])
+    return record, details, activation, candidate, previous
+
+
+def check_publication_start(store: StateStore) -> dict:
+    """Read-only root service guard; incomplete revocation never opens a listener.
+
+    It does not recover or acquire the operation lock: recover starts the service
+    while holding that lock. The publisher retains its unprivileged snapshot role.
+    """
+    if stat.S_IMODE((ROOT/'publish').stat().st_mode) != 0o750:
+        raise OperationError('Publication read gate is closed; retry the safety plan or recover')
+    security = load_security(ROOT/'publish/security.json')
+    row = store.db.execute("SELECT value FROM metadata WHERE key='publication_security_generation'").fetchone()
+    if row is not None and security['generation'] < int(row[0]):
+        raise OperationError('Publication security generation cannot go backwards')
+    pending = store.pending()
+    if len(pending) > 1:
+        raise OperationError('Multiple pending activations require manual investigation')
+    for item in pending:
+        record, details, _, candidate, previous = _recovery_activation(store,item)
+        operation = record['payload'].get('subscription_operation')
+        if operation and operation['kind'] in ('subscription.token.rotate','subscription.alias.retire'):
+            _verify_candidate(candidate,record['payload'])
+            revoked, retired = _publication_revocations(previous,candidate,operation)
+            if (not {token_digest(token) for token in revoked} <= set(security['revoked_tokens'])
+                    or not {alias_digest(alias['host'],alias['path_prefix']) for alias in retired}
+                    <= set(security['retired_aliases'])):
+                raise OperationError('Unfinished publication revocation; run deployment recover')
+    return {'status':'publication_safe'}
+
+
 def recover(store: StateStore) -> dict:
     """Conservatively undo an interrupted activation; never continue it."""
     with store.exclusive():
@@ -1434,32 +1517,20 @@ def recover(store: StateStore) -> dict:
         if len(pending) != 1:
             raise OperationError('Multiple pending activations require manual investigation')
         item = pending[0]
-        record = store.inspect(item['plan_id'])
-        if record['kind'] != 'deployment' or record['status'] != 'prepared':
-            raise OperationError('Pending activation has an inconsistent plan state')
-        details = item['details']
-        activation = _activation(record['payload'])
-        if _activation(details) != activation:
-            raise OperationError('Recovery activation mode differs from its plan')
-        candidate = _managed_revision(details['candidate'])
-        if candidate.name != record['payload']['revision']:
-            raise OperationError('Recovery candidate differs from its plan')
-        previous = _managed_revision(details['previous']) if details['previous'] else None
-        if 'previous_files' in details:
-            if previous is None:
-                raise OperationError('Runtime recovery is missing its previous revision')
-            _verify_candidate(previous,{'files':details['previous_files']})
-            before = json.loads((previous/'config.json').read_text(encoding='utf-8'))
-            after = json.loads((candidate/'config.json').read_text(encoding='utf-8'))
-            if (details.get('runtime_units_before') != list(_runtime_units(before,previous))
-                    or details.get('runtime_units_after') != list(_runtime_units(after,candidate))):
-                raise OperationError('Runtime recovery service set differs from its revisions')
+        record, details, activation, candidate, previous = _recovery_activation(store,item)
         if details.get('publication_safety_failed'):
-            _verify_candidate(candidate,record['payload'])
-            _revoke_publication_changes(store,previous,candidate,record['payload'].get('subscription_operation'))
+            try:
+                _publication_gate(closed=True)
+                _revoke_publication_changes(store,previous,candidate,record['payload'].get('subscription_operation'))
+            except Exception:
+                # A crash before the original stop may have left the listener up.
+                run(['systemctl','stop','proxyhub-publisher.service'])
+                raise
             run(['systemctl','start','proxyhub-publisher.service'])
             if previous is not None:
-                _wait_publication(previous)
+                # The live snapshot may still be the candidate. Confirm HTTP
+                # readiness before SIGHUP; _restore confirms every old profile.
+                _wait_publication(previous,readiness_only=True)
         if activation in ('reality','hy2','node','runtime') or (candidate/'shared.json').exists():
             _verify_candidate(candidate,record['payload'])
             _ensure_publication_security(store)
@@ -1599,7 +1670,7 @@ def _wait_local_reality_health(config: dict, directory: Path) -> None:
         _wait_reality_health(local,directory)
 
 
-def _publication_health(directory: Path) -> None:
+def _publication_health(directory: Path, *, readiness_only: bool = False) -> None:
     """Check the loaded generation, exact bodies and headers through real GETs.
 
     A successful SIGHUP only schedules a reload. The publisher deliberately
@@ -1623,7 +1694,8 @@ def _publication_health(directory: Path) -> None:
                 raise OperationError('Publisher has not acknowledged the safety generation')
             if response.status != (200 if allowed else 404):
                 raise OperationError('Publisher route or revocation has not been acknowledged')
-            if allowed and response.headers.get_all('X-ProxyHub-Generation',[]) != [bundle['generation']]:
+            if (allowed and not readiness_only
+                    and response.headers.get_all('X-ProxyHub-Generation',[]) != [bundle['generation']]):
                 raise OperationError('Publisher has not acknowledged the expected generation')
             if expected is None or not allowed:
                 if response.headers.get_all('Content-Length',[]) != ['0'] or response.read(1):
@@ -1644,6 +1716,8 @@ def _publication_health(directory: Path) -> None:
             connection.close()
     # This also confirms empty/all-revoked bundles; an empty route loop is not ACK.
     request('proxyhub.internal','/__proxyhub_publication__','HEAD')
+    if readiness_only:
+        return
     for profile in bundle['profiles']:
         for expected in iter_routes(profile):
             allowed = route_allowed(security,expected['host'],expected['path_prefix'],profile['token'])
@@ -1651,11 +1725,14 @@ def _publication_health(directory: Path) -> None:
                 request(expected['host'],expected['path'],method,expected,allowed)
 
 
-def _wait_publication(directory: Path) -> None:
+def _wait_publication(directory: Path, *, readiness_only: bool = False) -> None:
     """Bound retries: at most 15 complete profile/alias sweeps with one-second I/O waits."""
     for attempt in range(15):
         try:
-            _publication_health(directory)
+            if readiness_only:
+                _publication_health(directory,readiness_only=True)
+            else:
+                _publication_health(directory)
             return
         except (OSError, OperationError):
             if attempt == 14:
@@ -1727,19 +1804,33 @@ def apply(store: StateStore, identity: str) -> dict:
         operation = payload.get('subscription_operation')
         safety_change = operation is not None and operation['kind'] in (
             'subscription.token.rotate','subscription.alias.retire')
+        if not safety_change and stat.S_IMODE((ROOT/'publish').stat().st_mode) == 0o700:
+            raise OperationError('Publication read gate is closed; retry the prepared safety plan or recover')
         if safety_change:
+            # This is a recoverable safety intent, including the policy-write
+            # failure and service-stop boundaries. It must precede both actions.
+            details['publication_safety_failed'] = True
+            if previous is not None and 'previous_files' not in details:
+                details['previous_files'] = {path.relative_to(previous).as_posix():digest(path.read_bytes())
+                    for path in previous.rglob('*') if path.is_file()}
+            _publication_gate(closed=True)
+            store.record(identity,'activating',details)
             try:
-                # Revocation is irreversible and precedes the activation journal:
-                # an interrupted journal must never leave the old token live.
+                _recovery_activation(store,{'plan_id':identity,'details':details})
                 _revoke_publication_changes(store,previous,directory,operation)
+                # A previous pre-journal crash may have left the gate closed
+                # and a standard restart refused. Retrying this prepared plan
+                # must also work with a stopped publisher, before any SIGHUP.
+                run(['systemctl','start','proxyhub-publisher.service'])
+                if previous is not None:
+                    _wait_publication(previous,readiness_only=True)
             except Exception:
                 # A failed policy write cannot safely restore the old route.
                 # Stop publication until recover has durably completed denial.
                 run(['systemctl','stop','proxyhub-publisher.service'])
-                details['publication_safety_failed'] = True
-                store.record(identity,'activating',details)
-                raise OperationError('Publication safety persistence failed; publisher is closed until recovery') from None
-        store.record(identity,'activating',details)
+                raise OperationError('Publication safety activation failed; publisher is closed until recovery') from None
+        else:
+            store.record(identity,'activating',details)
         try:
             if not safety_change:
                 _revoke_publication_changes(store,previous,directory)

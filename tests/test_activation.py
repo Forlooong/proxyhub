@@ -319,6 +319,7 @@ def test_renewal_timer_does_not_join_activation_services():
     assert 'ExecStart=/usr/local/bin/proxyhub deployment renew' in definitions['proxyhub-renew.service']
     assert 'ConditionPathExists=/var/lib/proxyhub/current/config.json' in definitions['proxyhub-renew.service']
     assert 'Persistent=true' in definitions['proxyhub-renew.timer']
+    assert 'ExecStartPre=+/usr/local/bin/proxyhub deployment check-publication\n' in definitions['proxyhub-publisher.service']
 
 
 def test_reality_instance_template_is_isolated_from_legacy_activation():

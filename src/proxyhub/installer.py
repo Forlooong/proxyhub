@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 
 from .core import OperationError, atomic_write, run
 
@@ -43,6 +44,7 @@ LockPersonality=yes
             + common.replace('AF_UNIX AF_INET AF_INET6', 'AF_UNIX AF_INET AF_INET6 AF_NETLINK') + '\n[Install]\nWantedBy=multi-user.target\n',
         'proxyhub-publisher.service': header + 'User=proxyhub-pub\nGroup=proxyhub-pub\n'
             'Environment=PYTHONPATH=/opt/proxyhub/app/src\n'
+            'ExecStartPre=+/usr/local/bin/proxyhub deployment check-publication\n'
             'ExecStart=/usr/bin/python3 -m proxyhub.publisher --bundle /var/lib/proxyhub/publish/bundle.json --listen 127.0.0.1 --port 18890\n'
             'ExecReload=/bin/kill -HUP $MAINPID\n' + common + '\n[Install]\nWantedBy=multi-user.target\n',
         'proxyhub-nginx.service': header + 'RuntimeDirectory=proxyhub\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes\n'
@@ -88,13 +90,14 @@ def install() -> dict:
         raise OperationError('Data directory must not be a symlink')
     DATA.mkdir(mode=0o711, exist_ok=True)
     DATA.chmod(0o711)
+    publish_closed = (DATA/'publish').is_dir() and stat.S_IMODE((DATA/'publish').stat().st_mode) == 0o700
     for name in ('revisions', 'plans', 'certificates', 'nginx', 'acme', 'publish'):
         if (DATA/name).is_symlink():
             raise OperationError('Managed data directories must not be symlinks')
         (DATA/name).mkdir(mode=0o700 if name in ('plans', 'certificates') else 0o755, exist_ok=True)
     pub = pwd.getpwnam('proxyhub-pub')
     os.chown(DATA/'publish', 0, pub.pw_gid)
-    (DATA/'publish').chmod(0o750)
+    (DATA/'publish').chmod(0o700 if publish_closed else 0o750)
     from .deployment import _ensure_publication_security
     from .state import StateStore
     store = StateStore(DATA/'plans')

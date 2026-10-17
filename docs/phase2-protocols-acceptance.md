@@ -394,3 +394,147 @@ Linux 相关回归合计 **589 个不同测试、125 项 subtests 通过**。首
 - 本地私有资料：仓库 `.local/phase3a-audit-docs.patch`、`.local/phase3a-gui-status.json`、`.local/phase3a-browser-*-private.log`、`.local/phase3a-browser-safety-preview.log`、`.local/phase3a-qr-private.png`、`.local/phase3a-qr-result.json`、`.local/phase3a-pc-public-results.log`、`.local/phase3a-pc-summary.json`。完整私有配置没有从 VPS 下载到本机；PC 仅用显式 UI 链接和脱敏预期正文哈希/元数据验收。
 
 临时 C/D 订阅、POSIX 临时目录、客户端和回显辅助进程已清理，专用 Edge 已关闭。仅部署并交付现有约 4GB 验收机的共享布局；不部署生产或进入 3b–3d。请独立审计核对提交/部署、SUB-3/SUB-4、原入口保持、失败恢复和原始 RSS，并对 **GUI 门槛仍未完成** 的 3a 作出通过/部分通过/不通过的独立判断；执行自测不得解释为审计已放行。
+
+## 2026-10-18 阶段 3a 独立审计
+
+**结论：部分通过，3a 未放行，不进入 3b–3d。** 审计版本 `0.8.0a1`，完整提交 `3e2eec6d8203228f77385bca38960a73ef3fb66a`。本地 HEAD 与独立读取的 GitHub main 一致，开始时工作区干净。部署、原入口、正常发布/既有恢复路径及所列资源观测通过复核；新增 SUB-4 恢复意图丢失问题与指定 GUI SUB-1 是本阶段阻断，不能仅补 GUI 后宣布完成。执行交付 JSON/压缩记录保持原样，其自测状态不替代本节结论。
+
+### P1：撤销写失败后的停止与恢复日志之间存在中断空档
+
+`src/proxyhub/deployment.py:1734–1740` 在安全策略持久化失败后，先执行 `systemctl stop proxyhub-publisher.service`，然后才记录 `publication_safety_failed` 和 activating journal。若进程在停止完成、日志持久化前退出，磁盘只保留原有效 bundle/旧安全策略，没有 pending，`recover` 无从得知尚未完成的撤销；再次启动发布器即可接受旧令牌。此问题影响共用该分支的令牌轮换/别名退役；本轮实际复现的是令牌轮换。
+
+独立复现没有修改 VPS 或产品源码。复用现有 `tests/test_subscription_activation.py` 的 `environment`、`publication_runtime`、`profile`，使用真实 SQLite、磁盘 bundle/security 和本机真实 HTTP 发布器：
+
+1. 准备原 profile 的令牌轮换计划，令 `advance_security` 抛出受控 `OSError`。
+2. 在产品请求停止发布器的位置实际关闭测试 HTTP server；先用不可捕获于该 `except Exception` 的中断验证，随后另起子进程在同一位置真实 `os._exit(86)`，不执行后面的 `store.record`。
+3. 父进程重新打开磁盘 StateStore，执行原 `recover`；以原磁盘 bundle/security 创建新的 PublisherServer，再发送旧令牌 GET。
+
+两种中断结果一致，真实子进程结果为：
+
+```json
+{"child_exit_code":86,"actual_local_http_server_stopped_before_exit":true,"pending_reopened_from_disk":0,"recover":{"status":"nothing_to_recover"},"old_token_revoked":false,"fresh_publisher_old_token_http":200,"body_matches_old":true}
+```
+
+这是未完成撤销的意图丢失，不能表述成“已成功落盘的撤销记录被回滚”。已有 `after-revocation` 演练在 `_link` 入口退出，脚本先断言 pending 为 1；另一个退出点在 `_publish` 之后，二者都未覆盖此次发现的写失败/停止/日志空档。此前真实 stop 与写失败恢复通过仍有效，但不足以关闭 SUB-4。
+
+最小修正方向：复用现有事务日志、安全状态与服务入口，使可恢复的安全操作意图先于不可逆撤销及服务停止持久化；中断或标准服务重启后，未完成/未确认的撤销不能重新开放旧下载。仅把日志移到 stop 前仍需验证启动边界。恢复须先校验旧/候选 revision 完整性，补齐持久撤销，再启动/确认全部 profile，最后清 pending；持续失败保持拒绝，重复 recover 无动作，不能反向撤销新令牌。令牌轮换与别名退役分别补最小回归，并对新空档做隔离真实退出验证。无需重写发布器、增加第二套事务/生成器或重跑未受影响的协议矩阵。
+
+### 已独立核对的范围
+
+- **提交/部署**：286 项 manifest 与本地实际文件、VPS 文件逐项一致，无缺失、哈希差异或不安全所有权/写权限。34 个直接对应 Git 的应用文件中 33 个字节一致，未改动的 `requirements-panel.lock` 仅 CRLF/LF 差异，归一后相同；全部 Python 应用源码精确一致。三个验证脚本摘要也一致，不将构建产物和依赖误称为 Git 源文件。
+- **定向回归**：独立执行 14 个既有用例/参数场景通过，覆盖跨别名撤销、旧 bundle/重启后拒绝、退役路径、缺失/损坏/倒退安全状态、空 bundle 的真实 ACK、最后 profile 的 GET/HEAD 不一致、全 profile 恢复、旧配置不反向撤销新令牌、写失败恢复与最终旧 revision 完整性守卫。另一个审计新增断言按上述边界变红，并用真实退出再次确认；没有把执行会话整套测试计为独立重跑。
+- **恢复证据**：462 条事务事件中，173 次 ACK 开始对应 139 次失败及 34 次通过，13 个阶段通过记录、两条退出码 86 记录与脚本相符。失败包含异步 reload 的旧 generation、注入的坏 bundle/停止服务及首轮已保留的恢复失败，不能把所有 ACK 失败视作未知网络故障。执行会话保存的启动竞态复现记录为 `ExecMainCode=2/ExecMainStatus=1`；当前产品安全恢复路径先确认真实 HTTP 就绪再 reload，顺序合理，本次未在 VPS 重做该故障。最末完整性守卫与其独立补验窗口可接受，不要求无差别重跑此前 13 阶段；新增 P1 仍须单独修正。
+- **线上终态**：06:14（Asia/Shanghai）在 VPS 只读检查，7 项服务、8 个服务进程、3 个核心；与交付同一 boot，原核心及 Nginx 主 PID 保持。除新增订阅外的原配置、default 路由/正文/凭据、client YAML、全部静态文件与基线一致，当前发布 bundle 与 current 相同，三份订阅/十路由有效，安全代次 8，pending 检查前后均为 0。
+- **实际请求**：现场全 profile ACK 通过；按各路由实际域名/SNI 和可信链，通过固定 loopback TLS 入口执行 20 次 GET/HEAD，正文及元数据均一致；28 条历史已撤销/退役路由的 GET 均为 404，网站 TLS/正文检查通过。这些是本次 VPS 请求，不冒充个人电脑外网或 GUI 验收。
+- **既有客户端/界面证据**：两个 REALITY 的原始 retention 事件各有一次建连和 4,477 次 ping，与汇总一致；未作为本次新长流演练。核对保存的浏览器安全预览和执行记录；独立解码 QR 截图，解码 URL 的 SHA256 与当时界面显式链接摘要一致，没有输出秘密。本次不重复浏览器生命周期，不把执行保存的快照和 PC 结果写成新 GUI 验收。
+
+### RSS 与历史边界
+
+三个 gzip 的压缩/原始 SHA256 和行数均匹配。两个 RSS 窗口逐行重算服务与全部进程合计，无合计差异、PID/start_ticks 重复或采样器误计，OOM 读取无错误；同一 boot 的计数均为 0。
+
+| 观测 | 独立复核结果 |
+| --- | --- |
+| 主窗口 | 11,665 样本，峰值 567,096 KiB = **553.8046875 MiB**；峰值样本完整，阶段为 CLI/浏览器测试订阅清理；服务 cgroup 峰值 395.36 MiB 含瞬态 |
+| 最末完整性守卫窗口 | 1,314 样本，峰值 414,692 KiB = **404.97265625 MiB**；峰值样本完整，只覆盖最终代码的受影响补验 |
+| 缺口 | 分别 326/20 个不完整样本；读取退出 336/20 次、选择阶段退出 62/2 次，均为 exited，无权限/数据错误或 cgroup 错误；最大采样间隔约 0.205187/0.202224 秒 |
+| 起止/保留长流观测 | 交付基线 322.3203125 MiB、最终 321.3828125 MiB；保留长连接及旧 Nginx worker 时 335.94 MiB。−0.9375 MiB 只是短样本差，不是负开销或新额度 |
+| 审计现场 | 三个同口径服务样本均 329,956 KiB = **322.22265625 MiB**，均八进程、无漏读，OOM 仍为 0 |
+
+两个窗口之间没有采样，不能拼接为连续全过程；进程完全生灭于采样间隔内仍可能漏测，峰值不是绝对上界。当前资源观测满足本轮列明预算，不代表正式 PERF-1 或长期漂移通过。共享布局现有负载 ≤325 MiB、阶段 3 累计新增 ≤20 MiB、合计 ≤345 MiB，原空闲 RSS <350 MiB、峰值 <650 MiB、无 OOM 均不变，后续子阶段不重置额度。
+
+旧布局迁移/回退 1,040.12 MiB 超标、1GB 在线迁移与生产推广不放行；本轮未重新迁移。`previous-0.7.2-app.tar` 与既有旧归档保留，当前归档 root `0600`、证据目录 root `0700`，归档存在不代表完整应用降级通过。历史 pending、此前审计单次 HY2 失败和首次公网 HY2 UDP 超时仍未知，首轮保持 9/10；本轮发布器竞态或新 P1 不用于追认历史原因。
+
+### GUI 门槛与下一轮
+
+独立核对 `D:\Clash Verge\clash-verge.exe` 的 ProductVersion/FileVersion 均为 2.5.8。三次 `failed to write kernel assets / OS error 3` 是已保存的 GUI 控制工具初始化失败，不能推断 Clash Verge 应用自身或其代理核心失败。实际核心、GUI 导入及名称/流量/到期/受支持刷新显示仍全部未验证，SUB-1 阻断保留。下一轮先确认可用控制环境；无法自动操作时准备具体人工验收步骤和必要证据，不能拿 CLI、Edge 或 URI 源码顶替。
+
+下一执行增量仅为 **3a 的 P1 修正与指定 GUI 补验**，不增加 3b–3d 范围。改动对应的定向回归、隔离真实中断、当前验收机相关发布/恢复及资源记录完成后，携新提交、部署一致性和实际 GUI 状态再交独立审计。两项阻断未关闭前保持部分通过。本次仅更新既有 README、总方案及本记录，未改产品源码、VPS 配置或服务；审计临时测试目录/进程清理，不保留重复测试产物。
+
+## 2026-10-18 阶段 3a 阻断补验执行交付（0.8.1a1）
+
+本节是 `0.8.1a1` 的执行修正及定向自测记录，**待再次独立审计，不等于阶段 3a 已放行**。上述 `0.8.0a1` 审计的部分通过结论与原始失败保持；本轮只关闭 3a 阻断，不进入 3b–3d。VPS 与 GUI 实测、资源及部署结果见本节后续记录。
+
+### P1 修正与拒绝边界
+
+根因是安全策略写失败后，先停止 publisher、后记录 activating journal；若在停止完成后退出，尚未完成的撤销意图没有持久状态，`recover` 无从补齐。这不是已落盘 tombstone 被配置回退删除。令牌轮换与别名退役现复用同一 StateStore、不可变 revision、发布安全状态及原 apply/recover 链，按以下顺序执行：
+
+1. 先将既有 `/var/lib/proxyhub/publish` 目录权限由 `0750` 关闭为 `0700` 并 fsync，再持久记录安全意图 journal；旧、候选 revision 完整性守卫仍先于不可逆撤销。
+2. 持久写入对应旧令牌或退役别名 tombstone，确认安全代次后才将目录恢复为 `0750`；若发布器此前已停止，也先 start 并确认真实内部 HEAD 就绪，再继续原发布、reload 和全 profile 确认。写失败保持关闭并停止 publisher，pending 不清除；恢复重试同一撤销集合，不反向撤销候选新令牌。
+3. recover 先校验旧、候选输入，再关闭目录、补持久撤销、开放目录并启动 publisher。首次只用内部状态 HEAD 确认 HTTP/安全代次就绪；当进程已加载候选 bundle 时，不要求它先响应旧 generation，避免在发送恢复 reload 前等待错误快照。随后 `_restore` 仍完整检查全部有效 profile/别名的 YAML/raw GET 与 HEAD、正文、元数据及代次，全部确认后才清 pending；内部 readiness 不替代最终确认。
+
+标准 publisher unit 增加 root `ExecStartPre=+/usr/local/bin/proxyhub deployment check-publication`。它通过 StateStore 的只读 SQLite 打开方式检查目录、既有 pending、revision 完整性和对应 tombstone，不获取 apply/recover 的 exclusive 锁，不执行另一套恢复。publisher 本身仍以原低权限账号运行，保持原沙箱，不开放根状态数据库给发布账号。安装器保留已经关闭的 `0700`，普通配置操作也不能绕过关闭状态重新开放入口。
+
+仅移动 journal 并加启动预检仍不足：预检通过后、低权限主进程真正启动前存在 TOCTOU。目录 gate 先于 journal 关闭，使既有 publisher 的每个新请求无法读取安全状态，也使已通过预检的后续启动无法读取 bundle；只有持久撤销完成才重新开放。这一拒绝窗口可能暂时中断**全部订阅的新下载**，不改变节点身份或代理核心。关闭前已经开始并读完安全状态的请求不表述为已被追溯取消。
+
+**gate 关闭与 journal 之间的退出另有明确边界：** 此时可以是 `pending=0`、`recover=nothing_to_recover`，但目录仍关闭，标准启动和普通元数据 apply 均不能放行。必须显式重试原已准备的安全 plan；若 plan 已过期，则按同一安全意图重新准备后 apply。本轮不增加孤立 gate 的另一套恢复链，也不宣称该区间能自动恢复或 `nothing_to_recover` 代表下载已恢复。
+
+### 本地定向验证及证据口径
+
+- 复用 `tests/test_subscription_activation.py` 的真实 SQLite、磁盘 bundle/security、真实本机 HTTP 发布器和子进程；令牌轮换、别名退役的停止后真实 `os._exit(86)` 回归在旧代码各变红一次，共 **2 项旧红**，修正后转绿。补验还覆盖意图落盘后的写前退出、标准启动检查、持续故障与解除、最终 profile 确认失败保留 pending、旧/候选 revision 损坏先行拒绝、旧配置不复活旧令牌、新令牌不误撤销和再次 recover 无服务命令/探针。
+- 本地已执行 **15 个不同测试/参数场景**，为先前 14 个场景加 gate→journal 退出与原安全 plan 重试的新例。针对修改分批验证，记录的绿色批次为 **13 / 8 / 9 / 9**；批次包含重复复测，**不相加为不同测试总数**。未整套重跑原 13 个 VPS 阶段或未受影响的协议矩阵。
+- 新增真实 POSIX 低权限 HTTP 与已通过预检启动边界用例依赖 root/setuid/目录权限；本地 Windows 不具备该执行条件，不以本地权限替身结果代替。其 VPS 实测见本节后续记录。
+- 安装器通过内存路径、pwd、命令、状态和安全初始化替身，实际调用 `install()` 的 3 个定向场景：已有 `0700→0700`、已有 `0750→0750`、首次目录 `→0750`，初始化所见模式同样保持，状态连接关闭且不启动服务。该检查没有写真实系统或执行系统命令，**不是真实 install-services 验收**。私有记录为仓库 `.local/phase3a-blocker-installer-gate-validation.json`，包含实际安装器源码 SHA256。
+- `scripts/accept_subscriptions.py --blocker-only` 复用原 Acceptance、prepare、StateStore、事件、健康确认及最终保持检查；限定现有 A/B 的两类安全操作与两个退出边界。测试别名使用新临时别名并经类型化退役清理，只对额外 A 轮换；原 default、B、节点和核心保留检查沿用原基线。该入口不是第二套产品发布或恢复链，实际执行结果以后续 VPS 记录为准。
+
+原始审计复现、执行首轮故障及私有日志继续保留。历史 pending、此前审计单次 HY2 失败和首次公网 HY2 UDP 超时仍未知，首轮公网保持 9/10；本次 P1、启动竞态或权限 gate 修正不能用于追认这些历史原因。指定 GUI SUB-1、正式 PERF-1、长期漂移、完整应用降级及旧 1GB 拓扑推广的原边界不因本地自测改变。
+
+### 专用 VPS 实测与保留项
+
+- 只在原约 4GB 共享布局验收；两类操作×停止完成/意图落盘后退出的四个场景通过，持续写失败均关闭下载并保留 pending；解除条件后先持久撤销，再就绪/全 profile 确认、回退原配置、清 pending；第二次 recover 无命令/探针。最后 profile 的实际 HEAD 响应被注入为 503 共 60 次（4×15），事务没有提前成功。候选新令牌没有被误撤销。
+- 真实 systemd 延迟点在既有 root 预检已通过、低权限 ExecStart 尚未运行的位置。子进程关闭目录并持久记录意图后真实退出 86；释放延迟后，Python 主进程因读不到 bundle 退出 2，旧下载不可用。额外再以“受影响 A 旧令牌在事前 GET/HEAD 均为 200”为前提单独补验一次，同样通过，避免仅凭已撤销的历史入口判断拒绝。临时 drop-in 删除且 daemon-reload 成功，最终 unit 与安装源码一致。
+- gate→journal 之前真实退出 86 的 VPS 补验通过：pending 为 0、recover 无动作，但标准启动和普通元数据发布仍拒绝；原 prepared plan 原 ID 显式重试，在 publisher 已停止时先 start/真实 HEAD 就绪，再 publish/reload，完成持久撤销和全 profile 确认。该路径需要显式重试，不称为自动恢复。
+- 合计四个基础场景、两个新边界和一个带明确事前可用断言的窄补验。实际有 **8 次退出 86**，包含下述 Type=simple 首轮脚本断言失败的那次，未只计最终成功。VPS root POSIX 单例 **1 passed / 65 deselected**，真实低权限请求为 **200→503→404**；在已通过 root 预检之后关闭目录，新低权限发布器初始化退出 77。后续只修改其无关 HTTP 夹具，三个选中 POSIX 函数的 AST 与当时冻结源码完全一致，未无意义重复执行。
+- 最终三份 profile、十条当前路由的 **20 次可信 TLS GET/HEAD** 通过；仅针对本轮新增历史路由补 **48 次 TLS GET/HEAD=404**。全 profile loopback ACK 另通过，旧网站 TLS/正文、静态文件、原 client YAML 和除新增订阅集合外的全部配置摘要保持。default 与 B 的原链接/令牌保持；A 验收令牌按演练显式轮换，A/B 的其余字段完全保持，临时别名已清理。没有轮换任何节点凭据或新增核心。
+- 两条 REALITY 主窗口长流各 **2,738 次 ping、1 次建连、0 失败/中断/重连**，跨代码更新及主要演练；最末窄窗口只核对原核心/Nginx PID，没有冒称还在保留已经结束的两条测试流。最终 **7 服务、8 服务进程、3 核心**，两 REALITY、共享核心和 Nginx 主 PID 均保持，全部受管服务 active、gate 为 `0750`、pending 为 0。临时客户端、pytest 数据、受控等待及部署包副本已清理，旧归档、unit 和 revision 保留；不代表完整应用降级通过。
+
+### 失败记录与修正
+
+所有失败保留，不能把 82 次失败 ACK 混称为未知网络问题：其中 60 次为明确注入的最终 profile HEAD=503，15 次为受控 stop/start 过程的 HTTP 不可用，7 次为异步 reload 的旧 generation；阶段、事务、用途和耗时可在事件与原始健康日志关联。没有在本轮重新诊断或追认历史 HY2 原因。
+
+本轮验收辅助代码还有以下实际失败，均与产品失败分开：
+
+1. 首次本地扩展回归误要求“重试前 stop”，4 例因测试断言变红；按“持续写失败后 stop”的合同纠正断言，没有为该错误改产品。
+2. 首次长流启动缺少 PYTHONPATH；补正确既有源码路径后启动，原失败日志保留。首次基线脚本导入也使用了错误的已有脚本目录，改用原 `phase3a/` 位置；未重装依赖。
+3. POSIX 夹具的 `mkdir(0750)` 被 `umask 077` 收紧为 0700，守卫正确拒绝；仅在夹具显式 chmod 后单例通过。
+4. 延迟启动的首轮脚本误断言 `systemctl start` 必须非零。当前 Type=simple 可在 Python 打开 bundle 前返回 0，实际进程随后退出 2；现核对真实进程退出和请求拒绝。失败报告、journal、事件及原 traceback 保留，没有用最终通过覆盖。
+5. 私有 TLS 核对器初轮把所有 SNI 发到订阅专属 TLS 监听，被站点别名的主机名校验正确拒绝；随后复用已有 host→TLS listener 映射，可信链/主机名校验不降低。核对器原来还误要求网站别名仅有一份 `nosniff`，实际网站 Nginx 与 publisher 分别添加同值头；只允许该安全头的同值重复，订阅元数据继续逐值一致。一个诊断 HEAD 读取器漏传 method=HEAD 导致 IncompleteRead，也只修核对器。首个 TLS 错误和诊断 HEAD 错误保留于实际工具记录及明确标为摘要的私有资料，未伪称已保存完整原始 traceback。
+
+### RSS 原始记录与边界
+
+全部继续采用 `smaps_rollup.Rss` 合计，递归服务 cgroup、全部相关核心/Mihomo、转换器、路径标记的验收父进程及子孙进程；只排除采样器并另记其 RSS，不改系统参数、不用 PSS、不减少保留入口或全 profile 检查。
+
+| 观察 | 实际结果 |
+| --- | --- |
+| 本轮起止 | 同 boot 的起始 322.22265625 MiB，最终三份八进程服务样本均 **314.05859375 MiB**；本轮差 −8.1640625 MiB |
+| 阶段 3 累计 | 沿原 `0.7.2a1` 的阶段 3 起始 322.3203125 MiB，当前观测差 −8.26171875 MiB。不同预热程度的短样本负差不能解释为负开销、永久零增量或新额度；累计新增 ≤20 MiB、合计 ≤345 MiB 不重置 |
+| 主窗口 | **10,171 样本 / 2,033.9996 秒**，合计峰值 **568.71484375 MiB**，峰值样本完整；服务 cgroup 峰值 **324.9609375 MiB**，包括相关瞬态 |
+| 最末窄窗口 | **408 样本 / 81.3995 秒**，合计峰值 **400.703125 MiB**；单列事前确认 A 有效后的启动竞态及最终检查，未与主窗口拼接为连续采样 |
+| 缺口 | 主窗口 165 个不完整样本、181 次 exited 漏读、48 次选择阶段退出；末窗口分别 18 / 18 / 12。另有服务 cgroup 枚举退出竞态主窗口 2 次、末窗口 0 次，与 PID RSS 漏读分开记录。最大采样间隔分别约 **0.202046 / 0.201210 秒**，原始 PID/角色/RSS/退出与阶段均保留；本地重算与源汇总一致 |
+| OOM | 两窗口均为 boot `ceb5174d-6112-40fc-b405-d3ab61b2a994`，OOM kill **0→0**，无计数读取错误；不跨重启相减 |
+
+观测满足所列预算，不能据此宣布正式 PERF-1。初始内联部署/核对 Python 外层没有显式 argv 路径标记，父进程匹配可能选中，但其完整覆盖未独立确认；主要故障/恢复驱动、unit 进程和子孙有明确选择，最后窄窗口也有路径标记。此限制与采样间隔内完全生灭的进程风险保留，观测峰值不是绝对上界。两个窗口之间没有采样，不用后者追认前者。现有负载 ≤325 MiB、阶段 3 累计新增 ≤20 MiB、合计 ≤345 MiB、原空闲 <350 MiB、峰值 <650 MiB、无 OOM 均不放宽。旧布局迁移/回退 **1,040.12 MiB 超标**、1GB 在线迁移与生产推广不放行；正式 PERF-1、长期漂移及完整应用降级仍未验收。
+
+### GUI SUB-1 仍未验证与人工步骤
+
+本轮 sky 初始化及应用清单成功，原 kernel assets OS error 3 没有重现；清单当时识别 Clash Verge 未运行、无窗口。按应用 ID 启动阻塞 **881.3 秒**后由执行主会话中止；随后只读窗口清单 **2.5 秒**返回，仅见 ChatGPT；通过已知安装路径启动又阻塞 **1,296.4 秒**，同样由主会话中止。没有得到 Clash Verge 窗口，没有 GUI 点击/键盘、订阅导入或主动配置编辑。安装版本 2.5.8 沿用上轮独立文件版本复核；**实际 GUI 版本、运行核心、导入及名称/流量/到期/刷新显示全部未验证**。最终应用是否启动、原配置、系统代理/TUN 状态也未验证，不推断未变化。本轮没有新增 GUI 截图，私有 JSON 是实际工具调用的摘要，不伪称原始截图/日志。
+
+人工补验需保留以下实际证据，不能用 CLI、Edge 或 URI 内容顶替：
+
+1. 先记录 Windows 当前系统代理及原客户端活动订阅/TUN 状态，再从开始菜单手动打开已安装 Clash Verge；若打开自动切换或改开关，立即恢复原值并记录。保留全部用户原配置，不启用新的系统代理或 TUN。
+2. 截图应用“关于/版本”和实际运行的 Mihomo 核心信息；记录 GUI 真正显示的完整版本，磁盘 exe 或 CLI 版本不能替代实际核心。
+3. 在 ProxyHub 面板选择 A，显式复制当前 Mihomo HTTPS 链接，在 Clash Verge“订阅”的 URL 输入框导入；截图实际入口、成功卡片和时间。若同一 URL 已存在，先记录并保留已有条目，不覆盖用户配置；若自动切换活动订阅，恢复原订阅。
+4. 对照 A 名称及手工元数据：upload=1,048,576、download=2,097,153、total=1,073,741,824 字节，到期 Unix=1,794,848,575（Asia/Shanghai 为 2026-11-17 01:02:55），刷新头为 6 小时。记录 GUI 实际流量单位/舍入、到期与时区、更新时间/间隔/按钮；隐藏、不支持或字段缺失均按实际记录，不推断支持自动计量。
+5. 用 GUI 手动刷新 A 并截图前后；仅把本次验收条目的客户端本地名称改为“SUB-1 本地名称核对”，再次刷新，记录是否保留本地名或恢复远程名，再恢复原名称。不改服务器节点凭据。
+6. 以 B 检查缺失字段：B 没有流量 triplet，只有 expire=1,797,440,586（2026-12-17 01:03:06 +08:00）及 12 小时刷新；记录实际是隐藏、空白、零或其他显示。字段不支持仍按真实客户端行为记录。
+7. 最后截图核对活动订阅、全部原条目、系统代理/TUN 与开始时一致。必要证据包括两项版本、导入、A 字段/刷新前后/本地名行为、B 缺失字段及首尾状态。含链接/令牌的截图只放既有私有目录，公开仅脱敏结果。
+
+GUI 阻断仍在，因此本轮保持 **3a 部分交付、等待再次独立审计**，不进入后续阶段。
+
+### 交付文件与证据位置
+
+版本为 `0.8.1a1`，npm 版本字段同步 `0.8.1`；实际完整 SHA、推送及工作区终态由最终交付回执记录，不能在被其自身哈希覆盖的文件中伪填提交 SHA。保留并纳入了本轮开始时三份审计文档的未提交修改，未覆盖原审计段落。
+
+- 公共：[增量汇总](../evidence/subscriptions-blocker-acceptance.json)、[主 RSS 原始 gzip](../evidence/subscriptions-blocker-rss.jsonl.gz)、[末窗口 RSS 原始 gzip](../evidence/subscriptions-blocker-final-rss.jsonl.gz)、[完整追加事件 gzip](../evidence/subscriptions-blocker-events.jsonl.gz)。原 `subscriptions-acceptance.json` 及三份历史压缩记录没有改写。
+- VPS 私有：`/opt/proxyhub/shared-runtime-validation/phase3a-blocker/`，含 baseline、起止采样、两份原始 RSS、stage/events、全部 child/service/journal/ACK 失败、first-failure/report、最末 `final_boundary.py`/日志、POSIX 首次失败及成功日志、POSIX 当时冻结源码与 AST 对照、最终 TLS、保留项、manifest/部署回执、旧 `previous-0.8.0-app.tar`/publisher unit。旧 `phase3a/previous-0.7.2-app.tar` 和此前回退资料保留。
+- 本机私有：仓库 `.local/phase3a-blocker-*.txt/json`，包含旧红、新绿批次、安装器替身检查、GUI 工具摘要、审计文档原差异、最终源码/状态回执；完整交付回执为 `.local/phase3a-blocker-delivery-git-receipt.json`，最终核对后生成。`.local/export_phase3a_blocker.py` 为固定字段脱敏导出工具，未作为产品另一套发布链。
+- 部署 286 个文件与包及实际工作区一致；34 个直接 Git 文件中未改 `requirements-panel.lock` 保留原 CRLF/LF 例外，归一后相同，全部 Python 源码字节一致。最终提交后再次按 Git 对照，不将构建产物/依赖误称源码。

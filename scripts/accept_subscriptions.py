@@ -53,9 +53,49 @@ def crash_child(args):
         record(args.work,state['run_id'],args.crash_point,'injected_process_exit',
                transaction=args.child_plan,exit_code=86)
         os._exit(86)
-    if args.crash_point=='after-revocation':
-        # The ledger is durable before the journal. Stop at _link entry so this
-        # exercise has both durable safety state and an actual pending journal.
+    if args.crash_point=='safety-gate':
+        original_gate=d._publication_gate
+        def gate(*values,**options):
+            original_gate(*values,**options)
+            if options.get('closed'):
+                assert not store.pending()
+                record(args.work,state['run_id'],args.crash_point,'read_gate_closed_before_journal',
+                       transaction=args.child_plan)
+                exit_now()
+        d._publication_gate=gate
+    elif args.crash_point=='safety-intent':
+        def revoke(*values,**options):
+            assert len(store.pending())==1
+            record(args.work,state['run_id'],args.crash_point,'intent_precedes_first_policy_write',
+                   transaction=args.child_plan)
+            exit_now()
+        d._revoke_publication_changes=revoke
+    elif args.crash_point=='safety-stop':
+        original_run=d.run
+        def fail_advance(*values,**options):
+            record(args.work,state['run_id'],args.crash_point,'injected_safety_ledger_write_failure',
+                   transaction=args.child_plan,error_class='OSError')
+            try:
+                raise OSError('Injected publication safety write failure before completed-stop exit')
+            except OSError:
+                with (args.work/('child-'+args.child_plan+'-write-failure.log')).open('a',encoding='utf-8') as stream:
+                    os.chmod(stream.name,0o600)
+                    stream.write(traceback.format_exc())
+                raise
+        def stop(command,**options):
+            result=original_run(command,**options)
+            if command==['systemctl','stop','proxyhub-publisher.service']:
+                active=original_run(['systemctl','show','proxyhub-publisher.service',
+                                     '--property=ActiveState','--value']).strip()
+                assert active=='inactive' and len(store.pending())==1
+                record(args.work,state['run_id'],args.crash_point,'publisher_stop_completed_before_exit',
+                       transaction=args.child_plan,active_state=active)
+                exit_now()
+            return result
+        d.advance_security,d.run=fail_advance,stop
+    elif args.crash_point=='after-revocation':
+        # Stop at _link entry after both the safety intent journal and durable
+        # revocation, before switching the current revision.
         def link(*values,**options):
             assert len(store.pending())==1
             exit_now()
@@ -124,19 +164,20 @@ class Acceptance:
         directory=self.d._current_revision()
         return directory,json.loads((directory/'config.json').read_text(encoding='utf-8'))
 
-    def health(self,directory):
+    def health(self,directory,*,readiness_only=False):
         started=time.monotonic()
-        self.event('publication_ack_started',revision=directory.name)
+        purpose='publisher-readiness' if readiness_only else 'all-profile-confirmation'
+        self.event('publication_ack_started',revision=directory.name,purpose=purpose)
         try:
-            self.original_health(directory)
+            self.original_health(directory,readiness_only=readiness_only)
         except Exception as error:
-            self.event('publication_ack_failed',revision=directory.name,
+            self.event('publication_ack_failed',revision=directory.name,purpose=purpose,
                        error_class=type(error).__name__,elapsed_ms=round((time.monotonic()-started)*1000,3))
             with (self.work/'health-failures.log').open('a',encoding='utf-8') as stream:
                 os.chmod(self.work/'health-failures.log',0o600)
                 stream.write(utc()+' '+self.stage+' '+str(self.transaction)+'\n'+traceback.format_exc()+'\n')
             raise
-        self.event('publication_ack_passed',revision=directory.name,
+        self.event('publication_ack_passed',revision=directory.name,purpose=purpose,
                    elapsed_ms=round((time.monotonic()-started)*1000,3))
 
     def prepare(self,config,operation=None):
@@ -249,6 +290,308 @@ class Acceptance:
         assert len(enabled)>=2, 'Two existing enabled node identities are required'
         self.state.setdefault('selected_nodes',[enabled[0]['id'],enabled[1]['id']])
         self.save()
+
+    def initialize_blockers(self):
+        expected={'A':'2f584df037fae599113b9d5049cfb335',
+                  'B':'b82aaae3ba002bb3638f0e72738e1fbf'}
+        assert self.state['profiles'] in ({},expected), 'Blocker acceptance must reuse the existing profiles'
+        self.state['profiles']=expected
+        self.initialize()
+        assert {item['id'] for item in self.s.normalize(self.active()[1])}=={'default',*expected.values()}
+        self.state['blocker_only']=True
+        self.save()
+
+    def boundary_command(self,label,command):
+        result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=60)
+        log=self.work/(self.stage+'-service.log')
+        with log.open('ab') as stream:
+            log.chmod(0o600)
+            stream.write((utc()+' '+label+' '+json.dumps(command)+'\n').encode())
+            stream.write(result.stdout+b'\n')
+        self.event('real_boundary_command',label=label,exit_code=result.returncode)
+        return result
+
+    def assert_closed(self,bundle):
+        refused=0
+        for _,route in self.routes(bundle):
+            for method in ('GET','HEAD'):
+                try:
+                    status,_,_=self.request(route,method)
+                except (OSError,http.client.HTTPException) as error:
+                    self.event('publication_request_refused',method=method,error_class=type(error).__name__)
+                else:
+                    assert status!=200, 'An unconfirmed safety operation reopened a subscription'
+                    self.event('publication_request_refused',method=method,status=status)
+                refused+=1
+        assert refused
+        self.event('all_subscription_publication_temporarily_closed',requests=refused)
+
+    def cleanup_blocker_aliases(self):
+        identity=self.state['profiles']['A']
+        for alias in self.state.get('blocker_aliases',[]):
+            if any(item['id']==alias for item in self.profile('A')['aliases']):
+                self.change('subscription.alias.retire',{'subscription_id':identity,'alias_id':alias})
+                self.event('temporary_alias_cleaned',alias_id=alias)
+
+    def startup_gate_boundary(self,*,before_journal=False):
+        """The real unit/uid boundary, including a precheck already in flight."""
+        identity=self.state['profiles']['A']
+        previous,config=self.active()
+        historical=self.bundle()
+        changed=self.s.change(config,'subscription.token.rotate',{'subscription_id':identity})
+        plan=self.prepare(changed,{'kind':'subscription.token.rotate','subscription_id':identity})
+        drop=Path('/etc/systemd/system/proxyhub-publisher.service.d/phase3a-blocker.conf')
+        ready,release=self.work/'startup-ready',self.work/'startup-release'
+        starter=None
+        drop_created=False
+        try:
+            if not before_journal:
+                assert not drop.exists() and not ready.exists() and not release.exists()
+                self.boundary_command('stop-before-precheck',['systemctl','stop','proxyhub-publisher.service'])
+                drop.parent.mkdir(exist_ok=True)
+                drop.write_text('[Service]\nTimeoutStartSec=40\nExecStartPre=+/usr/bin/python3 '+
+                    str(Path(__file__).resolve())+' --work '+str(self.work)+' --startup-delay\n')
+                drop_created=True
+                drop.chmod(0o644)
+                assert self.boundary_command('load-controlled-delay',['systemctl','daemon-reload']).returncode==0
+                output=(self.work/'prechecked-start.log').open('ab')
+                starter=subprocess.Popen(['systemctl','start','proxyhub-publisher.service'],stdout=output,stderr=output)
+                output.close()
+                deadline=time.monotonic()+15
+                while not ready.exists():
+                    if starter.poll() is not None or time.monotonic()>deadline:
+                        raise RuntimeError('Standard startup did not reach the post-guard delay')
+                    time.sleep(.05)
+                self.event('standard_start_precheck_passed_before_safety_intent')
+            point='safety-gate' if before_journal else 'safety-intent'
+            log=self.work/(self.stage+'-child.log')
+            with log.open('ab') as stream:
+                log.chmod(0o600)
+                child=subprocess.run([sys.executable,str(Path(__file__).resolve()),'--work',str(self.work),
+                    '--child-plan',plan['plan_id'],'--crash-point',point],stdout=stream,stderr=stream,timeout=30)
+            assert child.returncode==86
+            from proxyhub.state import StateStore
+            self.store.db.close()
+            self.store=StateStore(self.d.ROOT/'plans')
+            assert len(self.store.pending())==(0 if before_journal else 1)
+            assert (self.d.ROOT/'publish').stat().st_mode & 0o777==0o700
+            self.event('startup_gate_child_exited',exit_code=86,pending=len(self.store.pending()),
+                       gate_mode='0700',injection_point=point)
+            if starter:
+                release.touch(mode=0o600)
+                status=starter.wait(timeout=15)
+                # Type=simple reports the spawned Python process as started
+                # before it opens its bundle. Inspect its actual exit and I/O.
+                self.event('prechecked_standard_start_command_completed',exit_code=status)
+                deadline=time.monotonic()+5
+                while True:
+                    state=self.d.run(['systemctl','show','proxyhub-publisher.service',
+                                     '--property=MainPID,ExecMainStatus,ExecMainCode'])
+                    if 'MainPID=0\n' in state and 'ExecMainStatus=2\n' in state:
+                        break
+                    if time.monotonic()>deadline:
+                        raise AssertionError('Prechecked publisher did not fail its unprivileged bundle open')
+                    time.sleep(.05)
+                self.event('prechecked_unprivileged_publisher_startup_rejected',process_exit_code=2)
+            else:
+                assert self.boundary_command('gate-without-journal-start-refused',
+                    ['systemctl','restart','proxyhub-publisher.service']).returncode!=0
+            self.boundary_command('post-gate-service-state',['systemctl','show','proxyhub-publisher.service',
+                '--property=User,Group,ActiveState,SubState,ExecStartPre,ExecMainCode,ExecMainStatus'])
+            self.boundary_command('post-gate-journal',['journalctl','-u','proxyhub-publisher.service',
+                '--no-pager','-n','45','-o','short-iso-precise'])
+            self.assert_closed(historical)
+        finally:
+            try:
+                if starter and starter.poll() is None:
+                    release.touch(mode=0o600)
+                    try:
+                        starter.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        self.boundary_command('stop-timed-out-controlled-start',
+                                              ['systemctl','stop','proxyhub-publisher.service'])
+                        raise
+            finally:
+                if drop_created:
+                    drop.unlink(missing_ok=True)
+                    if not any(drop.parent.iterdir()):
+                        drop.parent.rmdir()
+                    assert self.boundary_command('remove-controlled-delay',['systemctl','daemon-reload']).returncode==0
+                ready.unlink(missing_ok=True)
+                release.unlink(missing_ok=True)
+        if before_journal:
+            assert self.d.recover(self.store)['status']=='nothing_to_recover'
+            metadata=self.prepare(self.s.change(config,'subscription.update',
+                {'subscription_id':identity,'name':self.profile('A')['name']+' gate probe'}))
+            try:
+                self.d.apply(self.store,metadata['plan_id'])
+            except Exception as error:
+                assert 'read gate is closed' in str(error), 'Ordinary publication failed outside its gate guard'
+                self.event('ordinary_publication_rejected_while_gate_closed',error_class=type(error).__name__)
+            else:
+                raise AssertionError('Ordinary publication bypassed the closed gate')
+            assert not self.store.pending()
+            self.transaction=plan['plan_id']
+            self.state['last_plan']=self.transaction
+            self.save()
+            self.mark(self.stage)
+            self.d.apply(self.store,plan['plan_id'])
+            self.event('original_prepared_safety_plan_retried_after_prejournal_exit')
+        else:
+            assert self.d.recover(self.store)['status']=='recovered'
+            self.assert_denied(historical,identity)
+            self.change('subscription.token.rotate',{'subscription_id':identity})
+        assert not self.store.pending()
+        self.d._wait_publication(self.active()[0])
+        self.assert_denied(historical,identity)
+
+    def blocker_case(self,kind,point):
+        from proxyhub.core import OperationError
+        identity=self.state['profiles']['A']
+        if self.token_digest(self.profile('A')['token']) in self.security()['revoked_tokens']:
+            self.change('subscription.token.rotate',{'subscription_id':identity})
+        self.cleanup_blocker_aliases()
+        selected=None
+        if kind=='subscription.alias.retire':
+            aliases={item['id'] for item in self.profile('A')['aliases']}
+            self.change('subscription.alias.add',{'subscription_id':identity,
+                'host':self.profile('A')['host'],
+                'path_prefix':'/phase3a-blocker-'+secrets.token_hex(6)})
+            selected=next(item for item in self.profile('A')['aliases'] if item['id'] not in aliases)
+            self.state.setdefault('blocker_aliases',[]).append(selected['id'])
+            self.save()
+        old_directory,old_config=self.active()
+        historical=self.bundle(old_directory)
+        values={'subscription_id':identity}
+        if selected:
+            values['alias_id']=selected['id']
+        changed=self.s.change(old_config,kind,values)
+        candidate_token=self.s.get_profile(changed,identity)['token']
+        plan=self.prepare(changed,{'kind':kind,'subscription_id':identity})
+        log=self.work/(self.stage+'-child.log')
+        with log.open('ab') as stream:
+            log.chmod(0o600)
+            child=subprocess.run([sys.executable,str(Path(__file__).resolve()),'--work',str(self.work),
+                '--child-plan',plan['plan_id'],'--crash-point',point],
+                stdout=stream,stderr=subprocess.STDOUT,timeout=120)
+        self.event('controlled_child_completed',injection_point=point,exit_code=child.returncode)
+        assert child.returncode==86, 'Controlled child did not reach the required exit boundary'
+        from proxyhub.state import StateStore
+        self.store.db.close()
+        self.store=StateStore(self.d.ROOT/'plans')
+        self.event('state_reopened_from_disk_after_child_exit')
+        pending=self.store.pending()
+        assert len(pending)==1 and pending[0]['plan_id']==plan['plan_id']
+        assert pending[0]['details'].get('publication_safety_failed')
+        private_json(self.work/(self.stage+'-pending.json'),
+                     {'pending':pending,'plan':self.store.inspect(plan['plan_id'])})
+        if selected:
+            from proxyhub.publication import alias_digest
+            assert alias_digest(selected['host'],selected['path_prefix']) not in self.security()['retired_aliases']
+        else:
+            assert self.token_digest(self.profile('A')['token']) not in self.security()['revoked_tokens']
+        checked=self.boundary_command('root-read-only-start-check',
+                                     ['/usr/local/bin/proxyhub','deployment','check-publication'])
+        assert checked.returncode!=0, 'Standard CLI bypassed the unfinished revocation'
+        assert b'(OperationError)' in checked.stdout, 'Start check failed outside its intended safety guard'
+        restarted=self.boundary_command('standard-service-restart',
+                                       ['systemctl','restart','proxyhub-publisher.service'])
+        assert restarted.returncode!=0, 'Standard publisher restart bypassed the unfinished revocation'
+        self.boundary_command('failed-start-state',['systemctl','show','proxyhub-publisher.service',
+            '--property=ActiveState,SubState,Result,ExecStartPre,ExecMainCode,ExecMainStatus'])
+        self.boundary_command('start-guard-journal',['journalctl','-u','proxyhub-publisher.service',
+                                                   '--no-pager','-n','50','-o','short-iso-precise'])
+        self.assert_closed(historical)
+        original_advance,original_run=self.d.advance_security,self.d.run
+        original_health=self.d._publication_health
+        original_connection=http.client.HTTPConnection
+        actions,acks=[],[]
+        def traced_run(command,**options):
+            actions.append(tuple(command))
+            if command[:1]==['systemctl']:
+                self.event('publisher_recovery_service_action',action=command[1],unit=command[2])
+            return original_run(command,**options)
+        def traced_health(directory,*,readiness_only=False):
+            acks.append((directory.name,readiness_only))
+            return original_health(directory,readiness_only=readiness_only)
+        def fail_write(*values,**options):
+            self.event('injected_persistent_safety_write_failure',error_class='OSError')
+            raise OSError('Injected persistent publication safety write failure')
+        self.d.run,self.d._publication_health=traced_run,traced_health
+        try:
+            self.d.advance_security=fail_write
+            try:
+                self.d.recover(self.store)
+            except Exception as error:
+                self.event('persistent_failure_preserved_pending',error_class=type(error).__name__)
+                with (self.work/(self.stage+'-persistent-failure.log')).open('a',encoding='utf-8') as stream:
+                    os.chmod(stream.name,0o600)
+                    stream.write(traceback.format_exc())
+            else:
+                raise AssertionError('Persistent safety failure was accepted')
+            assert len(self.store.pending())==1
+            assert original_run(['systemctl','show','proxyhub-publisher.service',
+                                 '--property=ActiveState','--value']).strip()=='inactive'
+            self.assert_closed(historical)
+            self.d.advance_security=original_advance
+            last_profile,last_route=self.routes(historical)[-1]
+            target=(last_route['host'],last_route['path'],'HEAD')
+            harness=self
+            injected=[]
+            class LastProfileFailure(original_connection):
+                def request(connection,method,path,*values,**options):
+                    connection.probe=(options.get('headers',{}).get('Host'),path,method)
+                    return super().request(method,path,*values,**options)
+                def getresponse(connection):
+                    response=super().getresponse()
+                    if connection.probe==target:
+                        actual=response.status
+                        response.status=503
+                        injected.append(actual)
+                        harness.event('injected_final_profile_ack_failure',profile=last_profile['id'],
+                                      method='HEAD',actual_status=actual,injected_status=503)
+                    return response
+            http.client.HTTPConnection=LastProfileFailure
+            try:
+                self.d.recover(self.store)
+            except OperationError as error:
+                self.event('final_profile_failure_preserved_pending',error_class=type(error).__name__)
+                with (self.work/(self.stage+'-ack-failure.log')).open('a',encoding='utf-8') as stream:
+                    os.chmod(stream.name,0o600)
+                    stream.write(traceback.format_exc())
+            else:
+                raise AssertionError('A failed final profile ACK cleared the transaction')
+            finally:
+                http.client.HTTPConnection=original_connection
+            assert injected and len(self.store.pending())==1
+            ledger=self.security()
+            assert self.token_digest(candidate_token) not in ledger['revoked_tokens']
+            assert self.d.recover(self.store)['status']=='recovered'
+            assert self.security()==ledger and not self.store.pending()
+            assert self.active()[1]==old_config
+            self.d._wait_publication(self.active()[0])
+            before=len(actions),len(acks)
+            assert self.d.recover(self.store)['status']=='nothing_to_recover'
+            assert (len(actions),len(acks))==before, 'Idempotent recover issued commands or probes'
+            self.event('recovery_confirmed_all_profiles',profiles=[item['id'] for item in historical['profiles']],
+                       methods=['GET','HEAD'],idempotent_service_commands=0,idempotent_probes=0,
+                       candidate_token_not_revoked=True,restored_configuration=True)
+            if selected:
+                for _,route in self.routes(historical,identity):
+                    if route['host']==selected['host'] and route['path_prefix']==selected['path_prefix']:
+                        for method in ('GET','HEAD'):
+                            status,_,body=self.request(route,method)
+                            assert status==404 and not body
+                self.cleanup_blocker_aliases()
+            else:
+                self.assert_denied(historical,identity)
+                self.change('subscription.token.rotate',{'subscription_id':identity})
+                assert self.token_digest(candidate_token) not in self.security()['revoked_tokens']
+            self.d._wait_publication(self.active()[0])
+        finally:
+            self.d.advance_security,self.d.run=original_advance,original_run
+            self.d._publication_health=original_health
+            http.client.HTTPConnection=original_connection
 
     def create_profiles(self):
         for label in ('A','B'):
@@ -552,8 +895,11 @@ def main():
     parser.add_argument('--work',type=Path,required=True)
     parser.add_argument('--report',type=Path)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--blocker-only',action='store_true',
+                        help='Only exercise the P1 safety-intent/stop recovery boundaries with existing A/B')
     parser.add_argument('--child-plan')
-    parser.add_argument('--crash-point',choices=['after-revocation','after-publish'])
+    parser.add_argument('--startup-delay',action='store_true')
+    parser.add_argument('--crash-point',choices=['after-revocation','after-publish','safety-stop','safety-intent','safety-gate'])
     args=parser.parse_args()
     if os.name!='posix' or os.geteuid()!=0:
         parser.error('This opt-in acceptance requires the dedicated Linux VPS as root')
@@ -561,6 +907,14 @@ def main():
     if args.work.is_symlink():
         parser.error('Private work directory must not be a symlink')
     args.work.chmod(0o700)
+    if args.startup_delay:
+        (args.work/'startup-ready').touch(mode=0o600)
+        deadline=time.monotonic()+30
+        while not (args.work/'startup-release').exists():
+            if time.monotonic()>deadline:
+                return 75
+            time.sleep(.05)
+        return 0
     if args.child_plan:
         if not args.crash_point:
             parser.error('A child plan requires a controlled crash point')
@@ -579,7 +933,8 @@ def main():
                 atomic_write(first,source.read_bytes(),0o600)
     harness=Acceptance(args)
     result={'schema_version':1,'run_id':harness.state['run_id'],'started_at':utc(),
-            'scope':'3a shared-layout subscription publication only','gui_acceptance':'not_verified',
+            'scope':('3a P1 safety-intent/stop blocker follow-up only' if args.blocker_only
+                     else '3a shared-layout subscription publication only'),'gui_acceptance':'not_verified',
             'protocol_matrix':'not_repeated','rss_measurements':'external_sampler_required'}
     try:
         if args.resume and harness.store.pending():
@@ -587,19 +942,37 @@ def main():
             assert len(pending)==1 and pending[0]['plan_id']==harness.state.get('last_plan')
             harness.mark('resume-known-pending')
             harness.d.recover(harness.store)
-        harness.step('baseline',harness.initialize)
-        harness.step('create-copy-two-profiles',harness.create_profiles)
-        harness.step('disable-enable',harness.lifecycle)
-        harness.step('host-path-alias-retirement-and-restore',harness.aliases)
-        harness.step('concurrent-immutable-publication',harness.concurrent_publication)
-        harness.step('management-stopped-last-snapshot',harness.manager_stopped)
-        harness.step('invalid-publication-rolls-back',harness.failed_publication)
-        harness.step('safety-write-failure-recovery',harness.safety_write_failure)
-        harness.step('persistent-failure-pending-recovery',harness.persistent_failure)
-        harness.step('process-exit-after-revocation',lambda:harness.crash('after-revocation'))
-        harness.step('process-exit-after-publish',lambda:harness.crash('after-publish'))
-        harness.step('old-token-restoration-stays-closed',harness.restore_token)
-        harness.step('final-preservation',harness.finish)
+        if args.blocker_only:
+            harness.step('blocker-baseline',harness.initialize_blockers)
+            for kind in ('subscription.token.rotate','subscription.alias.retire'):
+                for point in ('safety-stop','safety-intent'):
+                    harness.step(kind.rsplit('.',1)[-1]+'-'+point,
+                                 lambda kind=kind,point=point:harness.blocker_case(kind,point))
+            harness.cleanup_blocker_aliases()
+            assert not any(item['id'] in harness.state.get('blocker_aliases',[])
+                           for item in harness.profile('A')['aliases'])
+            harness.step('prechecked-start-read-gate',harness.startup_gate_boundary)
+            harness.step('prejournal-gate-original-plan-retry',
+                         lambda:harness.startup_gate_boundary(before_journal=True))
+        else:
+            harness.step('baseline',harness.initialize)
+            harness.step('create-copy-two-profiles',harness.create_profiles)
+            harness.step('disable-enable',harness.lifecycle)
+            harness.step('host-path-alias-retirement-and-restore',harness.aliases)
+            harness.step('concurrent-immutable-publication',harness.concurrent_publication)
+            harness.step('management-stopped-last-snapshot',harness.manager_stopped)
+            harness.step('invalid-publication-rolls-back',harness.failed_publication)
+            harness.step('safety-write-failure-recovery',harness.safety_write_failure)
+            harness.step('persistent-failure-pending-recovery',harness.persistent_failure)
+            harness.step('process-exit-after-revocation',lambda:harness.crash('after-revocation'))
+            harness.step('process-exit-after-publish',lambda:harness.crash('after-publish'))
+            harness.step('old-token-restoration-stays-closed',harness.restore_token)
+        if args.blocker_only:
+            harness.mark('final-preservation')
+            harness.finish()
+            harness.event('stage_passed')
+        else:
+            harness.step('final-preservation',harness.finish)
         result.update(status='passed',checks=harness.state['checks'],
                       concurrent_requests=harness.state.get('concurrent_requests',0),final=harness.state['final'])
     except BaseException as error:

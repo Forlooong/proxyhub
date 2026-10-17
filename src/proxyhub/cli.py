@@ -130,6 +130,7 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument('--config', required=True, type=Path)
     deploy.add_parser('migrate-runtime', help='Prepare HY2/additional-node shared-runtime migration; group connections reconnect')
     deploy.add_parser('recover', help='Recover an interrupted ProxyHub activation')
+    deploy.add_parser('check-publication', help='Check durable subscription safety before publisher startup')
     renew = deploy.add_parser('renew', help='Renew managed HTTP-01 certificate and activate it if changed')
     apply = modules.add_parser('apply', help='Apply an explicitly prepared plan')
     apply.add_argument('plan_id')
@@ -372,6 +373,13 @@ def execute(args) -> dict:
         finally:
             service.close()
     from .state import StateStore
+    if args.module == 'deployment' and args.operation == 'check-publication':
+        from .deployment import check_publication_start
+        store = StateStore(Path('/var/lib/proxyhub/plans'), read_only=True)
+        try:
+            return check_publication_start(store)
+        finally:
+            store.db.close()
     store = StateStore(Path('/var/lib/proxyhub/plans'))
     if args.module == 'host':
         from .host.ssh import plan_append

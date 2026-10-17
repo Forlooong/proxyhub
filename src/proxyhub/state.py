@@ -13,14 +13,18 @@ from .core import OperationError, canonical, digest
 
 
 class StateStore:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, read_only: bool = False):
         self.root = Path(root)
         if self.root.is_symlink():
             raise OperationError("State directory must not be a symlink")
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not read_only:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.root / "state.sqlite3"
         if self.path.is_symlink():
             raise OperationError("State database must not be a symlink")
+        if read_only:
+            self.db = sqlite3.connect(self.path.absolute().as_uri() + '?mode=ro', uri=True, timeout=10)
+            return
         self.db = sqlite3.connect(self.path, timeout=10)
         if os.name == "posix":
             os.chmod(self.path, 0o600)

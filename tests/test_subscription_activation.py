@@ -3,7 +3,10 @@ from contextlib import nullcontext
 import base64
 import json
 import os
+from pathlib import Path
+import socket
 import stat
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
@@ -42,11 +45,31 @@ def profile(**changes):
     return value
 
 
+def publication_modes(root, monkeypatch):
+    """Windows only emulates chmod/stat; POSIX permission checks stay real."""
+    mode = {'value': 0o750}
+    if os.name != 'posix':
+        stat_path, chmod_path = Path.stat, Path.chmod
+        def directory_stat(path, *args, **kwargs):
+            info = stat_path(path, *args, **kwargs)
+            return os.stat_result((stat.S_IFDIR | mode['value'], *info[1:])) if path == root/'publish' else info
+        def directory_chmod(path, value, *args, **kwargs):
+            result = chmod_path(path, value, *args, **kwargs)
+            if path == root/'publish':
+                mode['value'] = value
+            return result
+        monkeypatch.setattr(Path, 'stat', directory_stat)
+        monkeypatch.setattr(Path, 'chmod', directory_chmod)
+    return mode
+
+
 @pytest.fixture
 def environment(tmp_path, monkeypatch):
     root = tmp_path / 'runtime'
     (root / 'revisions').mkdir(parents=True)
     (root / 'publish').mkdir()
+    publication_mode = publication_modes(root, monkeypatch)
+    (root/'publish').chmod(0o750)
     store = StateStore(tmp_path / 'plans')
     monkeypatch.setattr(store, 'exclusive', nullcontext)
     monkeypatch.setattr(deployment, 'ROOT', root)
@@ -95,7 +118,7 @@ def environment(tmp_path, monkeypatch):
         identity = store.plan('deployment', payload)
         return directory, identity
 
-    yield SimpleNamespace(root=root, store=store, pointer=pointer, calls=calls,
+    yield SimpleNamespace(root=root, store=store, pointer=pointer, calls=calls, publication_mode=publication_mode,
                           previous=previous, revision=revision, plan=plan)
     store.db.close()
 
@@ -475,6 +498,7 @@ def publication_runtime(environment, monkeypatch):
     server = PublisherServer(('127.0.0.1',0),runtime_bundle,env.root/'publish/security.json')
     thread = threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True)
     thread.start()
+    closed = False
     constructor = deployment.http.client.HTTPConnection
     requests = []
     def connection(host,port,**kwargs):
@@ -484,8 +508,21 @@ def publication_runtime(environment, monkeypatch):
         env.calls.append(('publish',directory))
         save_bundle(runtime_bundle,json.loads((directory/'bundle.json').read_text(encoding='utf-8')))
     def run(command,**kwargs):
+        nonlocal server, thread, closed
         env.calls.append(tuple(command))
-        if command==['systemctl','reload','proxyhub-publisher.service']:
+        if command==['systemctl','stop','proxyhub-publisher.service'] and not closed:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            closed = True
+        elif command==['systemctl','start','proxyhub-publisher.service'] and closed:
+            server = PublisherServer(('127.0.0.1',0),runtime_bundle,env.root/'publish/security.json')
+            thread = threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True)
+            thread.start()
+            runtime.server = server
+            closed = False
+        elif command==['systemctl','reload','proxyhub-publisher.service']:
+            assert not closed
             assert server.reload_bundle()
     monkeypatch.setattr(deployment.http.client,'HTTPConnection',connection)
     monkeypatch.setattr(deployment,'_publish',publish)
@@ -507,11 +544,13 @@ def publication_runtime(environment, monkeypatch):
             return response.status,dict(response.getheaders()),response.read()
         finally:
             client.close()
-    yield SimpleNamespace(env=env,server=server,failure=failure,requests=requests,
-                          publish=publish,request=request,runtime_bundle=runtime_bundle)
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=2)
+    runtime = SimpleNamespace(env=env,server=server,failure=failure,requests=requests,
+                              publish=publish,request=request,runtime_bundle=runtime_bundle)
+    yield runtime
+    if not closed:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def multi_profiles():
@@ -719,9 +758,9 @@ def test_injected_security_write_failure_stops_publication_until_recovery_finish
             events.append('publisher-start')
         return original_run(command, **kwargs)
 
-    def checked_health(path):
-        health(path)
-        if fault['health']:
+    def checked_health(path, **kwargs):
+        health(path, **kwargs)
+        if fault['health'] and not kwargs.get('readiness_only'):
             raise OperationError('injected all-profile acknowledgement failure')
 
     monkeypatch.setattr(deployment, 'advance_security', injected_write)
@@ -754,7 +793,8 @@ def test_injected_security_write_failure_stops_publication_until_recovery_finish
     assert deployment.recover(env.store)['status'] == 'nothing_to_recover' and len(env.calls) == before
 
 
-def test_recovery_checks_previous_manifest_before_retrying_publication_safety(environment, monkeypatch):
+@pytest.mark.parametrize('damaged_revision', ['previous', 'candidate'])
+def test_recovery_checks_previous_manifest_before_retrying_publication_safety(environment, monkeypatch, damaged_revision):
     env = environment
     directory, identity = env.plan(profiles=[profile(token='U' * 43)], subscription_operation={
         'kind': 'subscription.token.rotate', 'subscription_id': 'default'})
@@ -764,14 +804,404 @@ def test_recovery_checks_previous_manifest_before_retrying_publication_safety(en
                                   for path in env.previous.rglob('*') if path.is_file()},
                'runtime_units_before': [], 'runtime_units_after': []}
     env.store.record(identity, 'activating', details)
-    damaged = read_config(env.previous)
+    target = env.previous if damaged_revision == 'previous' else directory
+    damaged = read_config(target)
     damaged['subscription']['token'] = 'V' * 43
-    (env.previous/'config.json').write_bytes(canonical(damaged))
+    (target/'config.json').write_bytes(canonical(damaged))
     effects = []
     monkeypatch.setattr(deployment, '_revoke_publication_changes', lambda *args: effects.append('revoke'))
     monkeypatch.setattr(deployment, '_wait_publication', lambda *args: effects.append('acknowledge'))
+    with pytest.raises(OperationError, match='changed after validation'):
+        deployment.check_publication_start(env.store)
     with pytest.raises(OperationError, match='changed after validation'):
         deployment.recover(env.store)
     assert effects == [] and env.calls == []
     assert load_security(env.root/'publish/security.json')['generation'] == 0
     assert len(env.store.pending()) == 1 and env.store.inspect(identity)['status'] == 'prepared'
+
+
+def _exit_after_safety_failure_stop(root, plans, previous, identity, marker, exit_point):
+    """Run in an isolated process: no exception handling or SQLite close at exit."""
+    root, previous = Path(root), Path(previous)
+    deployment.ROOT = root
+    deployment._current_revision = lambda: previous
+    deployment.validate_certificate = lambda *a: {'sha256': 'c' * 64}
+    deployment._certificate_files = lambda *a: {'certificate': 'c', 'key': 'k'}
+    deployment._check_runtime_permissions = lambda *a: None
+    deployment.os.chown = lambda *a: None
+    sys.modules['pwd'] = SimpleNamespace(getpwnam=lambda name: SimpleNamespace(pw_gid=123))
+    store = StateStore(Path(plans))
+    store.exclusive = nullcontext
+    publication_modes(root, pytest.MonkeyPatch())
+    server = PublisherServer(('127.0.0.1', 0), root/'publish/bundle.json', root/'publish/security.json')
+    thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+    thread.start()
+    record = store.record
+
+    def activating(*args):
+        if args[1] == 'activating' and exit_point == 'before-intent':
+            Path(marker).write_text(json.dumps({'publisher_stopped_before_exit': False,
+                'publish_mode': stat.S_IMODE((root/'publish').stat().st_mode)}), encoding='utf-8')
+            os._exit(86)
+        record(*args)
+        if args[1] == 'activating' and exit_point == 'intent-recorded':
+            Path(marker).write_text(json.dumps({'publisher_stopped_before_exit': False,
+                'publish_mode': stat.S_IMODE((root/'publish').stat().st_mode)}), encoding='utf-8')
+            os._exit(86)
+
+    store.record = activating
+
+    def fail_write(*args, **kwargs):
+        raise OSError('injected atomic security write failure')
+
+    def stop(command, **kwargs):
+        assert command == ['systemctl', 'stop', 'proxyhub-publisher.service']
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        try:
+            with socket.create_connection(('127.0.0.1', server.server_port), timeout=.2):
+                raise AssertionError('Publisher listener remained open after stop')
+        except OSError:
+            pass
+        Path(marker).write_text(json.dumps({'publisher_stopped_before_exit': True,
+            'publish_mode': stat.S_IMODE((root/'publish').stat().st_mode)}), encoding='utf-8')
+        os._exit(86)
+
+    deployment.advance_security = fail_write
+    deployment.run = stop
+    deployment.apply(store, identity)
+    raise AssertionError('Expected the actual process exit at the completed-stop boundary')
+
+
+@pytest.mark.parametrize('kind', ['subscription.token.rotate', 'subscription.alias.retire'])
+@pytest.mark.parametrize('exit_point', ['stop-complete', 'intent-recorded'])
+def test_safety_failure_stop_crash_keeps_durable_recovery_intent(environment, monkeypatch, kind, exit_point):
+    env = environment
+    original = profile(aliases=[{'id': 'alternate', 'host': 'sub.example.test', 'path_prefix': '/alternate'}])
+    other = profile(id='second', token='S' * 43, name='Second', path_prefix='/second')
+    replace_profiles(env.previous, [original, other])
+    save_bundle(env.root/'publish/bundle.json', json.loads((env.previous/'bundle.json').read_text()))
+    updated = {**original, **({'token': 'U' * 43} if kind.endswith('rotate') else {'aliases': []})}
+    directory, identity = env.plan(profiles=[updated, other], subscription_operation={
+        'kind': kind, 'subscription_id': 'default'})
+    marker = env.root/'completed-stop.json'
+    result = subprocess.run([sys.executable, '-c',
+        "import runpy,sys; runpy.run_path(sys.argv[1])['_exit_after_safety_failure_stop'](*sys.argv[2:])",
+        str(Path(__file__).resolve()), str(env.root), str(env.store.root), str(env.previous), identity, str(marker), exit_point],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+    assert result.returncode == 86, result.stdout
+    assert json.loads(marker.read_text()) == {'publisher_stopped_before_exit': exit_point == 'stop-complete',
+                                              'publish_mode': 0o700}
+    if os.name != 'posix':
+        env.publication_mode['value'] = 0o700
+    reopened = StateStore(env.store.root)
+    reopened.exclusive = nullcontext
+    server = thread = None
+    commands, requests, events = [], [], []
+    fault = {'write': True, 'ack': False}
+    constructor = deployment.http.client.HTTPConnection
+    advance = deployment.advance_security
+    health = deployment._publication_health
+    handle = PublisherHandler.do_GET
+
+    def close_publisher():
+        nonlocal server, thread
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            server = thread = None
+
+    def start_publisher():
+        nonlocal server, thread
+        server = PublisherServer(('127.0.0.1', 0), env.root/'publish/bundle.json', env.root/'publish/security.json')
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        thread.start()
+
+    def service(command, **kwargs):
+        commands.append(tuple(command))
+        if command == ['systemctl', 'stop', 'proxyhub-publisher.service']:
+            close_publisher()
+            events.append('publisher-stopped')
+        elif command == ['systemctl', 'start', 'proxyhub-publisher.service']:
+            assert deployment.check_publication_start(reopened) == {'status': 'publication_safe'}
+            if server is None:
+                start_publisher()
+            events.append('publisher-started')
+        elif command == ['systemctl', 'reload', 'proxyhub-publisher.service']:
+            assert server.reload_bundle()
+
+    def write_security(*args, **kwargs):
+        events.append('revocation-attempt')
+        if fault['write']:
+            events.append('revocation-failed')
+            raise OSError('injected persistent atomic security write failure')
+        result = advance(*args, **kwargs)
+        events.append('revocation-durable')
+        return result
+
+    def connection(host, port, **kwargs):
+        assert (host, port) == ('127.0.0.1', 18890)
+        return constructor(host, server.server_port, **kwargs)
+
+    def request(handler):
+        requests.append((handler.command, handler.path))
+        return handle(handler)
+
+    def checked_health(path, **kwargs):
+        health(path, **kwargs)
+        if fault['ack'] and not kwargs.get('readiness_only'):
+            raise OperationError('injected all-profile acknowledgement failure')
+
+    monkeypatch.setattr(deployment, 'run', service)
+    monkeypatch.setattr(deployment, 'advance_security', write_security)
+    monkeypatch.setattr(deployment.http.client, 'HTTPConnection', connection)
+    monkeypatch.setattr(deployment, '_publication_health', checked_health)
+    monkeypatch.setattr(PublisherHandler, 'do_GET', request)
+    monkeypatch.setattr(PublisherHandler, 'do_HEAD', request)
+    try:
+        pending = reopened.pending()
+        assert len(pending) == 1, 'Completed stop lost the unfinished revocation intent after actual os._exit(86)'
+        assert pending[0]['plan_id'] == identity
+        assert reopened.inspect(identity)['status'] == 'prepared'
+        assert pending[0]['details']['previous'] == str(env.previous)
+        assert pending[0]['details']['candidate'] == str(directory)
+        assert pending[0]['details']['publication_safety_failed'] is True
+        with pytest.raises(OperationError):
+            deployment.check_publication_start(reopened)
+        assert commands == [] and requests == []
+        assert load_security(env.root/'publish/security.json')['generation'] == 0
+        if exit_point == 'intent-recorded':
+            # Model the independent service which outlives an interrupted CLI.
+            start_publisher()
+        with pytest.raises((OSError, OperationError)):
+            deployment.recover(reopened)
+        assert len(reopened.pending()) == 1 and server is None
+        assert 'publisher-stopped' in events and 'publisher-started' not in events
+        assert events.index('revocation-attempt') < events.index('revocation-failed') < events.index('publisher-stopped')
+        with pytest.raises(OperationError):
+            deployment.check_publication_start(reopened)
+        fault.update(write=False, ack=True)
+        with pytest.raises(OperationError, match='all-profile acknowledgement failure'):
+            deployment.recover(reopened)
+        assert len(reopened.pending()) == 1 and reopened.revision == 0
+        assert events.index('revocation-durable') < events.index('publisher-started')
+        fault['ack'] = False
+        assert deployment.recover(reopened)['status'] == 'recovered'
+        assert not reopened.pending() and env.pointer['current'] == env.previous
+        assert deployment.check_publication_start(reopened) == {'status': 'publication_safe'}
+        for member in build_bundle([original, other], 'old')['profiles']:
+            for route in iter_routes(member):
+                for method in ('GET', 'HEAD'):
+                    assert (method, route['path']) in requests
+                    client = constructor('127.0.0.1', server.server_port, timeout=2)
+                    try:
+                        client.request(method, route['path'], headers={'Host': route['host']})
+                        response = client.getresponse()
+                        allowed = member['id'] == 'second' or (kind.endswith('retire') and route['path_prefix'] == '/sub')
+                        assert response.status == (200 if allowed else 404)
+                        assert response.read() == (route['body'].encode() if allowed and method == 'GET' else b'')
+                    finally:
+                        client.close()
+        assert token_digest(updated['token']) not in load_security(env.root/'publish/security.json')['revoked_tokens']
+        before = (len(commands), len(requests))
+        assert deployment.recover(reopened)['status'] == 'nothing_to_recover'
+        assert before == (len(commands), len(requests))
+    finally:
+        close_publisher()
+        reopened.db.close()
+
+
+def test_safety_recovery_accepts_candidate_loaded_before_rollback(publication_runtime, monkeypatch):
+    runtime = publication_runtime
+    env = runtime.env
+    original, other = multi_profiles()
+    replace_profiles(env.previous, [original, other])
+    runtime.publish(env.previous)
+    assert runtime.server.reload_bundle()
+    updated = {**original, 'token': 'U' * 43}
+    directory, identity = env.plan(profiles=[updated, other], subscription_operation={
+        'kind': 'subscription.token.rotate', 'subscription_id': 'default'})
+
+    class Interrupted(BaseException):
+        pass
+
+    def interrupted_commit(plan_id):
+        assert plan_id == identity
+        assert runtime.server.snapshot.generation == directory.name
+        raise Interrupted()
+
+    monkeypatch.setattr(env.store, 'commit', interrupted_commit)
+    with pytest.raises(Interrupted):
+        deployment.apply(env.store, identity)
+    assert len(env.store.pending()) == 1
+    candidate_route = next(iter_routes(build_bundle([updated], 'candidate')['profiles'][0]))
+    assert runtime.request(candidate_route['host'], candidate_route['path'])[0] == 200
+    runtime.requests.clear()
+    assert deployment.recover(env.store)['status'] == 'recovered'
+    assert env.pointer['current'] == env.previous and not env.store.pending()
+    for member in build_bundle([original, other], 'previous')['profiles']:
+        for route in iter_routes(member):
+            for method in ('GET', 'HEAD'):
+                assert (method, route['path']) in runtime.requests or member['id'] == 'default'
+                assert runtime.request(route['host'], route['path'], method)[0] == (404 if member['id'] == 'default' else 200)
+    assert token_digest(updated['token']) not in load_security(env.root/'publish/security.json')['revoked_tokens']
+    before = (len(env.calls), len(runtime.requests))
+    assert deployment.recover(env.store)['status'] == 'nothing_to_recover'
+    assert before == (len(env.calls), len(runtime.requests))
+
+
+def test_gate_before_intent_crash_requires_retrying_original_safety_plan(publication_runtime, monkeypatch):
+    runtime = publication_runtime
+    env = runtime.env
+    original, other = multi_profiles()
+    replace_profiles(env.previous, [original, other])
+    runtime.publish(env.previous)
+    assert runtime.server.reload_bundle()
+    updated = {**original, 'token': 'U' * 43}
+    directory, identity = env.plan(profiles=[updated, other], subscription_operation={
+        'kind': 'subscription.token.rotate', 'subscription_id': 'default'})
+    _, metadata_identity = env.plan('c', profiles=[{**original, 'name': 'Metadata only'}, other])
+    marker = env.root/'before-intent.json'
+    result = subprocess.run([sys.executable, '-c',
+        "import runpy,sys; runpy.run_path(sys.argv[1])['_exit_after_safety_failure_stop'](*sys.argv[2:])",
+        str(Path(__file__).resolve()), str(env.root), str(env.store.root), str(env.previous), identity,
+        str(marker), 'before-intent'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+    assert result.returncode == 86, result.stdout
+    assert json.loads(marker.read_text()) == {'publisher_stopped_before_exit': False, 'publish_mode': 0o700}
+    if os.name != 'posix':
+        env.publication_mode['value'] = 0o700
+    reopened = StateStore(env.store.root)
+    reopened.exclusive = nullcontext
+    health = deployment._publication_health
+    def checked_health(path, **kwargs):
+        health(path, **kwargs)
+        if kwargs.get('readiness_only'):
+            env.calls.append(('publication-ready', path))
+    monkeypatch.setattr(deployment, '_publication_health', checked_health)
+    try:
+        assert reopened.pending() == []
+        before = (len(env.calls), len(runtime.requests))
+        with pytest.raises(OperationError, match='gate is closed'):
+            deployment.check_publication_start(reopened)
+        assert deployment.recover(reopened)['status'] == 'nothing_to_recover'
+        with pytest.raises(OperationError, match='gate is closed'):
+            deployment.apply(reopened, metadata_identity)
+        assert not reopened.pending() and before == (len(env.calls), len(runtime.requests))
+        assert stat.S_IMODE((env.root/'publish').stat().st_mode) == 0o700
+        old_port = runtime.server.server_port
+        deployment.run(['systemctl', 'stop', 'proxyhub-publisher.service'])
+        with pytest.raises(OSError):
+            socket.create_connection(('127.0.0.1', old_port), timeout=.2)
+        env.calls.clear()
+        runtime.requests.clear()
+        assert deployment.apply(reopened, identity)['status'] == 'applied'
+        assert (env.calls.index(('systemctl', 'start', 'proxyhub-publisher.service'))
+                < env.calls.index(('publication-ready', env.previous))
+                < env.calls.index(('publish', directory))
+                < env.calls.index(('systemctl', 'reload', 'proxyhub-publisher.service')))
+        assert not reopened.pending() and env.pointer['current'] == directory
+        assert stat.S_IMODE((env.root/'publish').stat().st_mode) == 0o750
+        assert deployment.check_publication_start(reopened) == {'status': 'publication_safe'}
+        for member in build_bundle([updated, other], 'candidate')['profiles']:
+            for route in iter_routes(member):
+                assert ('GET', route['path']) in runtime.requests and ('HEAD', route['path']) in runtime.requests
+        old_route = next(iter_routes(build_bundle([original], 'old')['profiles'][0]))
+        assert runtime.request(old_route['host'], old_route['path'])[0] == 404
+        assert token_digest(updated['token']) not in load_security(env.root/'publish/security.json')['revoked_tokens']
+    finally:
+        reopened.db.close()
+
+
+def _run_unprivileged_publisher(directory_fd, uid, gid, port):
+    os.setgroups([])
+    os.setgid(int(gid))
+    os.setuid(int(uid))
+    directory = Path('/proc/self/fd')/str(directory_fd)
+    try:
+        server = PublisherServer(('127.0.0.1', int(port)), directory/'bundle.json', directory/'security.json')
+    except PermissionError:
+        os._exit(77)
+    print(json.dumps({'uid': os.geteuid(), 'gid': os.getegid()}), flush=True)
+    server.serve_forever(poll_interval=.01)
+
+
+@pytest.mark.skipif(os.name != 'posix' or not hasattr(os, 'geteuid') or os.geteuid() != 0,
+                    reason='Requires root and real POSIX uid/directory permissions')
+def test_read_gate_blocks_real_unprivileged_requests_and_prechecked_startup(tmp_path, monkeypatch):
+    import pwd
+    import time
+    account = pwd.getpwnam('nobody')
+    root = tmp_path/'runtime'
+    publish = root/'publish'
+    publish.mkdir(parents=True, mode=0o750)
+    os.chown(publish, 0, account.pw_gid)
+    publish.chmod(0o750)
+    profiles = multi_profiles()
+    save_bundle(publish/'bundle.json', build_bundle(profiles, 'previous'))
+    save_security(publish/'security.json', {'schema_version': 1, 'generation': 0,
+                                          'revoked_tokens': [], 'retired_aliases': []})
+    for name in ('bundle.json', 'security.json'):
+        os.chown(publish/name, 0, account.pw_gid)
+        (publish/name).chmod(0o640)
+    monkeypatch.setattr(deployment, 'ROOT', root)
+    store = StateStore(tmp_path/'plans')
+    directory_fd = os.open(publish, os.O_RDONLY | os.O_DIRECTORY)
+    process = None
+    constructor = deployment.http.client.HTTPConnection
+    route = next(iter_routes(build_bundle([profiles[0]], 'previous')['profiles'][0]))
+
+    def launch():
+        with socket.socket() as available:
+            available.bind(('127.0.0.1', 0))
+            port = available.getsockname()[1]
+        child = subprocess.Popen([sys.executable, '-c',
+            "import runpy,sys; runpy.run_path(sys.argv[1])['_run_unprivileged_publisher'](*sys.argv[2:])",
+            str(Path(__file__).resolve()), str(directory_fd), str(account.pw_uid), str(account.pw_gid), str(port)],
+            pass_fds=(directory_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return child, port
+
+    def request(port, method):
+        client = constructor('127.0.0.1', port, timeout=.3)
+        try:
+            client.request(method, route['path'], headers={'Host': route['host']})
+            response = client.getresponse()
+            return response.status, response.read()
+        finally:
+            client.close()
+
+    try:
+        # A directory fd avoids pytest's private ancestor modes without weakening
+        # them. The final publish directory still enforces real uid permissions.
+        assert deployment.check_publication_start(store) == {'status': 'publication_safe'}
+        process, port = launch()
+        deadline = time.monotonic()+5
+        while True:
+            assert process.poll() is None, process.stderr.read()
+            try:
+                assert request(port, 'GET') == (200, route['body'].encode())
+                break
+            except (OSError, deployment.http.client.HTTPException):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.02)
+        assert json.loads(process.stdout.readline()) == {'uid': account.pw_uid, 'gid': account.pw_gid}
+        deployment._publication_gate(closed=True)
+        assert stat.S_IMODE(publish.stat().st_mode) == 0o700
+        for method in ('GET', 'HEAD'):
+            assert request(port, method) == (503, b'')
+        # Simulate ExecStart after its root precheck passed but the gate closed.
+        prechecked, _ = launch()
+        stdout, stderr = prechecked.communicate(timeout=5)
+        assert prechecked.returncode == 77, (stdout, stderr)
+        advance_security(publish/'security.json', tokens=[profiles[0]['token']])
+        deployment._publication_gate(closed=False)
+        for method in ('GET', 'HEAD'):
+            assert request(port, method) == (404, b'')
+    finally:
+        if process is not None:
+            process.terminate()
+            process.communicate(timeout=5)
+        os.close(directory_fd)
+        store.db.close()
