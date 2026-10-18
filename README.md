@@ -2,7 +2,7 @@
 
 独立、模块化的 VPS 与代理服务管理项目。提供命令行和管理面板，再逐步加入规则管理与更多协议。
 
-当前版本为 `0.8.1a1`：本轮只补阶段 3a 的独立审计阻断，保留原 `default` 链接/令牌、A/B 稳定身份、两个独立 REALITY、HY2/七节点共享组、网站和原命令。上轮 `0.8.0a1` [独立审计仍为部分通过、3a 未放行](docs/phase2-protocols-acceptance.md#2026-10-18-阶段-3a-独立审计)。本轮以既有发布目录读取闸门、先持久化安全意图、只读启动守卫及原恢复链补齐 P1，完成受影响自测与专用 VPS 边界验证，等待再次独立审计；指定 GUI SUB-1 仍未验证，不进入 3b–3d。GUI 控制初始化已成功，但两次原生启动调用阻塞，不能据此认定客户端或实际核心故障。详见[补验记录](docs/phase2-protocols-acceptance.md)和[增量证据](evidence/subscriptions-blocker-acceptance.json)。
+当前版本为 `0.8.2a1`（npm `0.8.2`）。`0.8.1a1` [独立审计仍为部分通过、3a 未放行](docs/phase2-protocols-acceptance.md#phase3a-blocker-audit-081)。本轮仅补跨计划 P1：现有 activating journal 先持久绑定原安全计划，再关闭读取闸门；原 pending 阻止无关安全计划及普通发布，无归属关闭状态明确拒绝并要求调查。执行补验待再次独立审计；指定 GUI SUB-1 仍未验证，不进入 3b–3d。保留原 default/B 链接令牌、A/B 身份、两个独立 REALITY、HY2/七节点共享组、网站和原命令。详见[本轮记录](docs/phase2-protocols-acceptance.md#phase3a-owner-execution-082)及[增量证据](evidence/subscriptions-owner-acceptance.json)。
 
 `0.7.2a1` 的资源调整已于 2026-10-18 [独立审计通过限定增量](docs/phase2-protocols-acceptance.md#2026-10-18-资源调整补验独立审计)，范围为现有约 4GB 专用验收机、当前负载及共享布局；恢复稳定性阻断关闭。1GB 旧布局迁移、正式 PERF-1 和生产发行均不在放行范围。`0.7.1a1` 当时部分通过的历史结论及 `0.7.0a1` 协议功能验收/限制继续保留，见[能力矩阵](docs/superpowers/specs/2026-10-14-proxyhub-design.md#6-proxy-与-rules)。
 
@@ -38,11 +38,16 @@
 | `0.7.1a1` 固定共享运行组 | 独立审计部分通过：284 个应用文件一致，7 项服务/8 个进程/3 个核心，配置、证书、网站和订阅保持；审计短时 RSS 306.16 MiB，认证检查后 310.37 MiB。首轮恢复 pending 的原因未关闭，本次另观察到单次 HY2 健康探针失败；[审计结论及补验条件](docs/phase2-protocols-acceptance.md#2026-10-17-固定共享运行组独立审计)，本阶段未放行 |
 | `0.7.2a1` 资源调整阻断补验 | 限定范围独立通过：修正回归、284 文件/四脚本一致、恢复原始记录及 4,539 个 RSS 样本已核对；现场 RSS 320.74–322.31 MiB，无 pending。个人电脑 HY2 独立单包 UDP 3/3 通过，首轮历史超时原因仍未知；[审计结论与限制](docs/phase2-protocols-acceptance.md#2026-10-18-资源调整补验独立审计)。1GB 旧布局迁移不放行，正式 PERF-1 未验收 |
 | `0.8.0a1` 阶段 3a | 独立审计部分通过、未放行：286 文件一致；14 项定向检查通过，线上 20 次 TLS GET/HEAD 与 28 条历史拒绝路由核对通过，两个 RSS 窗口复算一致。新增真实退出复现暴露撤销写失败分支的恢复日志空档，指定 GUI 亦未验证；[审计结论与补验条件](docs/phase2-protocols-acceptance.md#2026-10-18-阶段-3a-独立审计) |
-| `0.8.1a1` 3a 阻断补验 | P1 执行定向验证完成、待独立复核；原停止/日志空档、已通过预检后的启动竞态、闸门先于日志的显式重试均有证据。指定 GUI 导入/实际核心及字段显示未验证，阶段继续部分交付；[记录及人工步骤](docs/phase2-protocols-acceptance.md)、[原始采样索引](evidence/subscriptions-blocker-acceptance.json) |
+| `0.8.1a1` 3a 阻断补验 | 独立审计部分通过、未放行：286 文件、20 次可信 TLS GET/HEAD、48 次历史拒绝及两窗口 RSS 已复核；13 个既有本地定向场景和 1 个 VPS POSIX 单例通过。新增真实退出回归在本地及 VPS 隔离环境均暴露跨安全计划误开闸，P1 保留；GUI 仍未验收。[结论、复现及下一轮条件](docs/phase2-protocols-acceptance.md#phase3a-blocker-audit-081) |
+| `0.8.2a1` 3a 跨计划补验 | 执行定向补验待独立复核；原安全意图先持久绑定，关闸后无关计划不得解除；无 pending 的旧孤立闸门转人工调查。GUI SUB-1 与客户端首尾状态仍未验证；[记录](docs/phase2-protocols-acceptance.md#phase3a-owner-execution-082)、[原始采样索引](evidence/subscriptions-owner-acceptance.json) |
 
 当前受管代理仅启用 IPv4，公网 IPv6 未验证。Trojan H2 明确拒绝，VLESS/VMess H2 的 UDP 未通过锁定 Mihomo 验收，不计为支持。旧布局 RSS 基线 772.26 MiB 及 `0.7.1a1` 报告的 316.45 MiB 短时常驻样本、579.79 MiB 迁移后峰值继续保留；其中 579.79 MiB 缺少逐样本记录，尚不能独立复算，PSS 不能替代 RSS 门槛。
 
 `0.7.2a1` 资源补验可复算记录共 4,539 个样本：最终 8 个服务进程短时空闲 RSS **320.23 MiB**；共享布局固定探针 100 轮阶段观测峰值 **531.46 MiB**，最后一次再迁移到共享布局后的峰值 **521.06 MiB**，包含旧布局迁移/回退的窗口峰值 **1,040.12 MiB**，同 boot OOM 0→0。全部相关候选核心、转换器、Mihomo 和验证辅助进程计入峰值，仅排除采样器；有 292 个不完整样本，观测峰值不是绝对上界。旧布局迁移窗口明确超过 650 MiB，不能声称全过程达标。原 RSS <350 MiB、峰值 <650 MiB、无 OOM 指标和共享布局现有负载 ≤325 MiB 工作预算均不放宽；阶段 3 累计新增常驻预算 ≤20 MiB、合计工作预算 ≤345 MiB，后续子阶段不重置额度，本轮资源记录见[3a 证据](evidence/subscriptions-acceptance.json)。历史首轮 pending、此前审计单次 HY2 失败及个人电脑首个 HY2 UDP 超时原因仍未知，公网首轮保持 9/10；后续成功不追认历史修复。正式 1 核 1GB、5 订阅/500 节点 PERF-1、长期漂移及指定 GUI 完整 SUB-1 均未验证。历史详情见[执行补验与原始证据](docs/phase2-protocols-acceptance.md#2026-10-18-资源调整阻断补验执行交付)。
+
+`0.8.1a1` 审计现场三份八进程服务 RSS 均 **314.05859375 MiB**；主/末窗口分别 **10,171 / 408** 样本，观测峰值 **568.71484375 / 400.703125 MiB**，复算与 VPS 原始文件一致，同 boot OOM 增量 0。两个窗口不连续，分别有 165 / 18 个不完整样本；初始内联部署/核对父进程是否完整入选仍未知，不能据此宣称全过程峰值 <650 MiB。短样本负差不是新增额度；所有预算及 1GB 旧布局迁移限制保持，见[本轮独立审计](docs/phase2-protocols-acceptance.md#phase3a-blocker-audit-081)。
+
+`0.8.2a1` 本轮服务 RSS 为 **315.453125→318.76171875 MiB**，受影响窗口 1,903 样本、观测峰值 **450.43359375 MiB**；99 个不完整样本、退出漏读及原始记录均保留，部署/核对父进程明确纳入。原 0.7.2a1 阶段 3 基线与累计额度不重置，观测峰值不等于全过程绝对上界。见[本轮证据](evidence/subscriptions-owner-acceptance.json)；GUI 仍未验证，执行结果待独立审计。
 
 ## 开始使用
 
@@ -108,7 +113,7 @@ TCP 80 用于 HTTP-01 和 HTTPS 跳转。升级须运行 `proxyhub install-servi
 
 ## 后续阶段
 
-阶段 2 历史功能范围及 `0.7.2a1` 资源调整的限定放行保留。`0.8.0a1` 的 3a 独立审计部分通过；`0.8.1a1` 已完成撤销写失败/停止/中断与标准启动边界的执行补验，待再次独立复核，指定 GUI 仍阻断。不继续 3b–3d。阶段 3 累计新增常驻预算 ≤20 MiB、合计工作预算 ≤345 MiB，原空闲 RSS <350 MiB、刷新峰值 <650 MiB、无 OOM 指标不变。具体范围与离开条件见[总方案 10.2](docs/superpowers/specs/2026-10-14-proxyhub-design.md#102-阶段-2-结果与阶段-3-执行顺序)，完整 Host 初始化、SSH 防失联、CLI 帮助契约与发行验收仍按总方案承接。
+阶段 2 历史功能范围及 `0.7.2a1` 资源调整的限定放行保留。`0.8.0a1` 的 3a 独立审计部分通过；`0.8.1a1` 独立审计发现跨计划误开闸；`0.8.2a1` 已执行原意图绑定修正及定向补验，待再次独立复核，指定 GUI 仍阻断。不继续 3b–3d。阶段 3 累计新增常驻预算 ≤20 MiB、合计工作预算 ≤345 MiB，原空闲 RSS <350 MiB、刷新峰值 <650 MiB、无 OOM 指标不变。具体范围与离开条件见[总方案 10.2](docs/superpowers/specs/2026-10-14-proxyhub-design.md#102-阶段-2-结果与阶段-3-执行顺序)，完整 Host 初始化、SSH 防失联、CLI 帮助契约与发行验收仍按总方案承接。
 
 MRS 规则流水线、外部订阅源、共享流量账户、自动采集与周期重置尚未交付。当前默认 sing-box 包不含 V2Ray API，因此没有把手工额度显示标为自动计量；当前 `reset_day/reset_at` 也不会触发自动重置。
 

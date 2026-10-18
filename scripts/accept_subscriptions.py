@@ -53,14 +53,28 @@ def crash_child(args):
         record(args.work,state['run_id'],args.crash_point,'injected_process_exit',
                transaction=args.child_plan,exit_code=86)
         os._exit(86)
-    if args.crash_point=='safety-gate':
+    store=StateStore(d.ROOT/'plans')
+    if args.crash_point=='before-gate':
+        original_record=store.record
+        def activating(identity,stage,details):
+            original_record(identity,stage,details)
+            if stage=='activating':
+                pending=store.pending()
+                assert len(pending)==1 and pending[0]['plan_id']==args.child_plan
+                assert (d.ROOT/'publish').stat().st_mode & 0o777==0o750
+                record(args.work,state['run_id'],args.crash_point,'durable_safety_intent_before_read_gate',
+                       transaction=args.child_plan,pending=1,gate_mode='0750')
+                exit_now()
+        store.record=activating
+    elif args.crash_point=='safety-gate':
         original_gate=d._publication_gate
         def gate(*values,**options):
             original_gate(*values,**options)
             if options.get('closed'):
-                assert not store.pending()
-                record(args.work,state['run_id'],args.crash_point,'read_gate_closed_before_journal',
-                       transaction=args.child_plan)
+                pending=store.pending()
+                assert len(pending)==1 and pending[0]['plan_id']==args.child_plan
+                record(args.work,state['run_id'],args.crash_point,'read_gate_closed_after_durable_intent',
+                       transaction=args.child_plan,pending=1,gate_mode='0700')
                 exit_now()
         d._publication_gate=gate
     elif args.crash_point=='safety-intent':
@@ -106,7 +120,6 @@ def crash_child(args):
             original(*values,**options)
             exit_now()
         d._publish=publish
-    store=StateStore(d.ROOT/'plans')
     try:
         d.apply(store,args.child_plan)
     finally:
@@ -333,7 +346,7 @@ class Acceptance:
                 self.change('subscription.alias.retire',{'subscription_id':identity,'alias_id':alias})
                 self.event('temporary_alias_cleaned',alias_id=alias)
 
-    def startup_gate_boundary(self,*,before_journal=False):
+    def startup_gate_boundary(self,*,gate_closed=False):
         """The real unit/uid boundary, including a precheck already in flight."""
         identity=self.state['profiles']['A']
         previous,config=self.active()
@@ -345,7 +358,7 @@ class Acceptance:
         starter=None
         drop_created=False
         try:
-            if not before_journal:
+            if not gate_closed:
                 assert not drop.exists() and not ready.exists() and not release.exists()
                 self.boundary_command('stop-before-precheck',['systemctl','stop','proxyhub-publisher.service'])
                 drop.parent.mkdir(exist_ok=True)
@@ -363,7 +376,7 @@ class Acceptance:
                         raise RuntimeError('Standard startup did not reach the post-guard delay')
                     time.sleep(.05)
                 self.event('standard_start_precheck_passed_before_safety_intent')
-            point='safety-gate' if before_journal else 'safety-intent'
+            point='safety-gate' if gate_closed else 'safety-intent'
             log=self.work/(self.stage+'-child.log')
             with log.open('ab') as stream:
                 log.chmod(0o600)
@@ -373,7 +386,8 @@ class Acceptance:
             from proxyhub.state import StateStore
             self.store.db.close()
             self.store=StateStore(self.d.ROOT/'plans')
-            assert len(self.store.pending())==(0 if before_journal else 1)
+            pending=self.store.pending()
+            assert len(pending)==1 and pending[0]['plan_id']==plan['plan_id']
             assert (self.d.ROOT/'publish').stat().st_mode & 0o777==0o700
             self.event('startup_gate_child_exited',exit_code=86,pending=len(self.store.pending()),
                        gate_mode='0700',injection_point=point)
@@ -394,7 +408,7 @@ class Acceptance:
                     time.sleep(.05)
                 self.event('prechecked_unprivileged_publisher_startup_rejected',process_exit_code=2)
             else:
-                assert self.boundary_command('gate-without-journal-start-refused',
+                assert self.boundary_command('owned-closed-gate-start-refused',
                     ['systemctl','restart','proxyhub-publisher.service']).returncode!=0
             self.boundary_command('post-gate-service-state',['systemctl','show','proxyhub-publisher.service',
                 '--property=User,Group,ActiveState,SubState,ExecStartPre,ExecMainCode,ExecMainStatus'])
@@ -419,28 +433,9 @@ class Acceptance:
                     assert self.boundary_command('remove-controlled-delay',['systemctl','daemon-reload']).returncode==0
                 ready.unlink(missing_ok=True)
                 release.unlink(missing_ok=True)
-        if before_journal:
-            assert self.d.recover(self.store)['status']=='nothing_to_recover'
-            metadata=self.prepare(self.s.change(config,'subscription.update',
-                {'subscription_id':identity,'name':self.profile('A')['name']+' gate probe'}))
-            try:
-                self.d.apply(self.store,metadata['plan_id'])
-            except Exception as error:
-                assert 'read gate is closed' in str(error), 'Ordinary publication failed outside its gate guard'
-                self.event('ordinary_publication_rejected_while_gate_closed',error_class=type(error).__name__)
-            else:
-                raise AssertionError('Ordinary publication bypassed the closed gate')
-            assert not self.store.pending()
-            self.transaction=plan['plan_id']
-            self.state['last_plan']=self.transaction
-            self.save()
-            self.mark(self.stage)
-            self.d.apply(self.store,plan['plan_id'])
-            self.event('original_prepared_safety_plan_retried_after_prejournal_exit')
-        else:
-            assert self.d.recover(self.store)['status']=='recovered'
-            self.assert_denied(historical,identity)
-            self.change('subscription.token.rotate',{'subscription_id':identity})
+        assert self.d.recover(self.store)['status']=='recovered'
+        self.assert_denied(historical,identity)
+        self.change('subscription.token.rotate',{'subscription_id':identity})
         assert not self.store.pending()
         self.d._wait_publication(self.active()[0])
         self.assert_denied(historical,identity)
@@ -485,6 +480,24 @@ class Acceptance:
         assert pending[0]['details'].get('publication_safety_failed')
         private_json(self.work/(self.stage+'-pending.json'),
                      {'pending':pending,'plan':self.store.inspect(plan['plan_id'])})
+        mode=(self.d.ROOT/'publish').stat().st_mode & 0o777
+        assert mode==(0o750 if point=='before-gate' else 0o700)
+        self.event('durable_intent_owns_read_gate',gate_mode=f'{mode:04o}',pending=1,
+                   injection_point=point)
+        if point=='before-gate':
+            # The journal binds recovery, but the existing publisher has not
+            # entered its refusal window until the read gate actually closes.
+            for profile,route in self.routes(historical):
+                for method in ('GET','HEAD'):
+                    try:
+                        status,headers,body=self.request(route,method)
+                    except (OSError,http.client.HTTPException) as error:
+                        self.event('pre_gate_existing_listener_observation',profile=profile['id'],
+                                   method=method,error_class=type(error).__name__)
+                    else:
+                        self.event('pre_gate_existing_listener_observation',profile=profile['id'],
+                                   method=method,status=status,body_bytes=len(body),
+                                   generation=headers.get('X-ProxyHub-Generation'))
         if selected:
             from proxyhub.publication import alias_digest
             assert alias_digest(selected['host'],selected['path_prefix']) not in self.security()['retired_aliases']
@@ -895,11 +908,15 @@ def main():
     parser.add_argument('--work',type=Path,required=True)
     parser.add_argument('--report',type=Path)
     parser.add_argument('--resume',action='store_true')
-    parser.add_argument('--blocker-only',action='store_true',
-                        help='Only exercise the P1 safety-intent/stop recovery boundaries with existing A/B')
+    scope=parser.add_mutually_exclusive_group()
+    scope.add_argument('--blocker-only',action='store_true',
+                       help='Only exercise the P1 safety-intent/stop recovery boundaries with existing A/B')
+    scope.add_argument('--owner-only',action='store_true',
+                       help='Only exercise durable safety-intent/read-gate ownership with existing A/B')
     parser.add_argument('--child-plan')
     parser.add_argument('--startup-delay',action='store_true')
-    parser.add_argument('--crash-point',choices=['after-revocation','after-publish','safety-stop','safety-intent','safety-gate'])
+    parser.add_argument('--crash-point',choices=['after-revocation','after-publish','safety-stop','safety-intent',
+                                               'before-gate','safety-gate'])
     args=parser.parse_args()
     if os.name!='posix' or os.geteuid()!=0:
         parser.error('This opt-in acceptance requires the dedicated Linux VPS as root')
@@ -933,7 +950,8 @@ def main():
                 atomic_write(first,source.read_bytes(),0o600)
     harness=Acceptance(args)
     result={'schema_version':1,'run_id':harness.state['run_id'],'started_at':utc(),
-            'scope':('3a P1 safety-intent/stop blocker follow-up only' if args.blocker_only
+            'scope':('3a P1 durable-intent/read-gate ownership follow-up only' if args.owner_only
+                     else '3a P1 safety-intent/stop blocker follow-up only' if args.blocker_only
                      else '3a shared-layout subscription publication only'),'gui_acceptance':'not_verified',
             'protocol_matrix':'not_repeated','rss_measurements':'external_sampler_required'}
     try:
@@ -942,18 +960,19 @@ def main():
             assert len(pending)==1 and pending[0]['plan_id']==harness.state.get('last_plan')
             harness.mark('resume-known-pending')
             harness.d.recover(harness.store)
-        if args.blocker_only:
-            harness.step('blocker-baseline',harness.initialize_blockers)
+        if args.blocker_only or args.owner_only:
+            harness.step('owner-baseline' if args.owner_only else 'blocker-baseline',harness.initialize_blockers)
             for kind in ('subscription.token.rotate','subscription.alias.retire'):
-                for point in ('safety-stop','safety-intent'):
+                for point in (('before-gate','safety-gate') if args.owner_only else ('safety-stop','safety-intent')):
                     harness.step(kind.rsplit('.',1)[-1]+'-'+point,
                                  lambda kind=kind,point=point:harness.blocker_case(kind,point))
             harness.cleanup_blocker_aliases()
             assert not any(item['id'] in harness.state.get('blocker_aliases',[])
                            for item in harness.profile('A')['aliases'])
             harness.step('prechecked-start-read-gate',harness.startup_gate_boundary)
-            harness.step('prejournal-gate-original-plan-retry',
-                         lambda:harness.startup_gate_boundary(before_journal=True))
+            if args.blocker_only:
+                harness.step('closed-gate-owned-recovery',
+                             lambda:harness.startup_gate_boundary(gate_closed=True))
         else:
             harness.step('baseline',harness.initialize)
             harness.step('create-copy-two-profiles',harness.create_profiles)
@@ -967,7 +986,7 @@ def main():
             harness.step('process-exit-after-revocation',lambda:harness.crash('after-revocation'))
             harness.step('process-exit-after-publish',lambda:harness.crash('after-publish'))
             harness.step('old-token-restoration-stays-closed',harness.restore_token)
-        if args.blocker_only:
+        if args.blocker_only or args.owner_only:
             harness.mark('final-preservation')
             harness.finish()
             harness.event('stage_passed')

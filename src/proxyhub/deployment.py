@@ -789,10 +789,9 @@ def _publication_revocations(previous: Path | None, directory: Path, operation: 
 def _publication_gate(*, closed: bool) -> None:
     """A reversible read gate for the existing unprivileged publisher.
 
-    Close before recording intent so even a previously passed startup check or
-    an existing listener cannot race the journal/policy write. No second ledger
-    is introduced. A crash before the journal leaves this closed; the original
-    prepared safety plan can be retried without reopening the old routes.
+    The existing activation journal must own the operation before this closes.
+    A previously passed startup check and existing listeners cannot bypass the
+    closed gate. An interrupted owner is resumed only through normal recovery.
     """
     path = ROOT/'publish'
     if path.is_symlink() or not path.is_dir():
@@ -1487,7 +1486,7 @@ def check_publication_start(store: StateStore) -> dict:
     while holding that lock. The publisher retains its unprivileged snapshot role.
     """
     if stat.S_IMODE((ROOT/'publish').stat().st_mode) != 0o750:
-        raise OperationError('Publication read gate is closed; retry the safety plan or recover')
+        raise OperationError('Publication read gate is closed; run recovery or investigate its owner')
     security = load_security(ROOT/'publish/security.json')
     row = store.db.execute("SELECT value FROM metadata WHERE key='publication_security_generation'").fetchone()
     if row is not None and security['generation'] < int(row[0]):
@@ -1513,14 +1512,23 @@ def recover(store: StateStore) -> dict:
     with store.exclusive():
         pending = store.pending()
         if not pending:
+            if stat.S_IMODE((ROOT/'publish').stat().st_mode) != 0o750:
+                raise OperationError('Publication read gate has no pending owner; manual investigation required')
             return {'status': 'nothing_to_recover'}
         if len(pending) != 1:
             raise OperationError('Multiple pending activations require manual investigation')
         item = pending[0]
+        if item['details'].get('publication_safety_failed'):
+            # Reversible denial also protects a journal-before-gate crash whose
+            # revisions were subsequently damaged. Verify before revoking.
+            try:
+                _publication_gate(closed=True)
+            except Exception:
+                run(['systemctl','stop','proxyhub-publisher.service'])
+                raise
         record, details, activation, candidate, previous = _recovery_activation(store,item)
         if details.get('publication_safety_failed'):
             try:
-                _publication_gate(closed=True)
                 _revoke_publication_changes(store,previous,candidate,record['payload'].get('subscription_operation'))
             except Exception:
                 # A crash before the original stop may have left the listener up.
@@ -1804,8 +1812,8 @@ def apply(store: StateStore, identity: str) -> dict:
         operation = payload.get('subscription_operation')
         safety_change = operation is not None and operation['kind'] in (
             'subscription.token.rotate','subscription.alias.retire')
-        if not safety_change and stat.S_IMODE((ROOT/'publish').stat().st_mode) == 0o700:
-            raise OperationError('Publication read gate is closed; retry the prepared safety plan or recover')
+        if stat.S_IMODE((ROOT/'publish').stat().st_mode) != 0o750:
+            raise OperationError('Publication read gate is closed; run recovery or investigate its owner')
         if safety_change:
             # This is a recoverable safety intent, including the policy-write
             # failure and service-stop boundaries. It must precede both actions.
@@ -1813,14 +1821,13 @@ def apply(store: StateStore, identity: str) -> dict:
             if previous is not None and 'previous_files' not in details:
                 details['previous_files'] = {path.relative_to(previous).as_posix():digest(path.read_bytes())
                     for path in previous.rglob('*') if path.is_file()}
-            _publication_gate(closed=True)
             store.record(identity,'activating',details)
             try:
+                _publication_gate(closed=True)
                 _recovery_activation(store,{'plan_id':identity,'details':details})
                 _revoke_publication_changes(store,previous,directory,operation)
-                # A previous pre-journal crash may have left the gate closed
-                # and a standard restart refused. Retrying this prepared plan
-                # must also work with a stopped publisher, before any SIGHUP.
+                # The publisher may have been stopped; confirm readiness before
+                # SIGHUP. Only this journal's durable revocation opens its gate.
                 run(['systemctl','start','proxyhub-publisher.service'])
                 if previous is not None:
                     _wait_publication(previous,readiness_only=True)
